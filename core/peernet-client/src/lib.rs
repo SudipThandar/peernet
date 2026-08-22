@@ -69,7 +69,7 @@ pub struct TunnelClient {
 
 impl TunnelClient {
     /// Connects and completes the Hello/HelloAck handshake.
-    pub async fn connect(opts: ClientOptions<'_>) -> Result<Self, String> {
+    pub async fn connect(opts: ClientOptions) -> Result<Self, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let verifier =
@@ -119,7 +119,7 @@ impl TunnelClient {
         Ok(client)
     }
 
-    async fn handshake(&mut self, opts: &ClientOptions<'_>) -> Result<(), String> {
+    async fn handshake(&mut self, opts: &ClientOptions) -> Result<(), String> {
         let (mut tx, mut rx) = self
             .conn
             .open_bi()
