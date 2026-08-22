@@ -54,13 +54,14 @@ jobs:
 
       - name: Build Rust core (.so for all ABIs)
         if: hashFiles('core/Cargo.toml') != ''
+        working-directory: core
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          mkdir -p app/src/main/jniLibs
+          mkdir -p ../app/src/main/jniLibs
           cargo ndk \
             -t arm64-v8a -t armeabi-v7a -t x86_64 \
             --platform 26 \
-            -o app/src/main/jniLibs \
+            -o ../app/src/main/jniLibs \
             build --release
 
       - name: Grant execute permission to gradlew
