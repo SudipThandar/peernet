@@ -157,6 +157,22 @@ class WifiDirectManager @Inject constructor(
         }
     }
 
+    /** Renames this phone's Wi-Fi Direct identity (e.g. "PeerNet-4A3F"). */
+    @SuppressLint("MissingPermission")
+    fun setDeviceName(name: String) {
+        val mgr = manager ?: return
+        val ch = channel ?: return
+        mgr.setDeviceName(ch, name, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Timber.i("Wi-Fi Direct device name set to %s", name)
+            }
+
+            override fun onFailure(reason: Int) {
+                Timber.w("setDeviceName failed: %d", reason)
+            }
+        })
+    }
+
     /** Client-side leave: drops the Wi-Fi Direct connection to the host. */
     fun leaveCurrentGroup() {
         val mgr = manager ?: return

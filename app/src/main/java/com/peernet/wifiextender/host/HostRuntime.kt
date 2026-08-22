@@ -47,6 +47,9 @@ class HostRuntime @Inject constructor(
     fun canStart(): Boolean = Permissions.missing(context).isEmpty()
 
     fun startSharing() {
+        // Brand the Wi-Fi Direct identity so clients see "PeerNet-xxxx",
+        // not the owner's personal device name.
+        wifiDirect.setDeviceName("PeerNet-${HostIdentity.shortId(context)}")
         wifiDirect.startHosting()
     }
 
