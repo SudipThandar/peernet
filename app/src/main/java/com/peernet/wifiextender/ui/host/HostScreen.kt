@@ -92,7 +92,21 @@ fun HostScreen(
         }
 
         when (state.hostState) {
-            HostState.IDLE -> StatusCard("Idle", "Not sharing yet. Tap Start Sharing below.")
+            HostState.IDLE -> {
+                StatusCard("Idle", "Not sharing yet. Tap Start Sharing below.")
+                Button(
+                    onClick = {
+                        if (missingPerms.isNotEmpty()) {
+                            permissionLauncher.launch(Permissions.runtimePermissions().toTypedArray())
+                        } else {
+                            viewModel.startSharing()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Start Sharing")
+                }
+            }
 
             HostState.CREATING_GROUP -> Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
@@ -145,6 +159,12 @@ fun HostScreen(
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(state.error ?: "Something went wrong.", color = MaterialTheme.colorScheme.onErrorContainer)
                     }
+                }
+                Button(
+                    onClick = viewModel::startSharing,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Try Again")
                 }
             }
         }
