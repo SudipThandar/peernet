@@ -22,6 +22,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,6 +31,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import com.peernet.wifiextender.ui.host.HostState
 import com.peernet.wifiextender.util.Permissions
 
@@ -67,9 +70,11 @@ fun HomeScreen(
     LaunchedEffect(Unit) {
         homeViewModel.startObserving()
         hostViewModel.onScreenShown()
-        clientViewModel.startObserving() // auto-detect + auto-connect on open
         missingPerms = Permissions.missing(context)
+        // No auto-search: scanning happens only when the user taps CONNECT.
     }
+
+    val scope = rememberCoroutineScope()
 
     Column(
         modifier = modifier
@@ -133,22 +138,27 @@ fun HomeScreen(
         // ---- CONNECT / DISCONNECT ----
         OutlinedButton(
             onClick = {
-                if (linkedHost != null) {
-                    clientViewModel.disconnect()
-                } else {
-                    clientViewModel.connectNow()
+                when {
+                    // Client disconnect
+                    linkedHost != null && !isHosting -> clientViewModel.disconnect()
+                    // Host tapping CONNECT: stop sharing first, then search as client
+                    isHosting -> scope.launch {
+                        hostViewModel.stopSharing()
+                        delay(2_500) // let the Wi-Fi Direct group tear down before scanning
+                        clientViewModel.connectNow()
+                    }
+                    else -> clientViewModel.connectNow()
                 }
             },
             modifier = Modifier
                 .fillMaxWidth(0.85f)
                 .height(56.dp),
-            enabled = !client.discovering && client.connectingTo == null
+            enabled = !client.searching
         ) {
             Text(
                 text = when {
-                    client.discovering -> "SEARCHING…"
-                    client.connectingTo != null -> "CONNECTING…"
-                    linkedHost != null -> "DISCONNECT"
+                    client.searching -> "SEARCHING…"
+                    linkedHost != null && !isHosting -> "DISCONNECT"
                     else -> "CONNECT"
                 },
                 style = MaterialTheme.typography.titleMedium

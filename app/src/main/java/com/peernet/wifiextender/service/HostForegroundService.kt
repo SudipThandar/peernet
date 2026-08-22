@@ -47,14 +47,15 @@ class HostForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                hostRuntime.stopSharing()
+                // Remove the bar immediately, then tear down hosting.
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                runCatching { hostRuntime.stopSharing() }
                 stopSelf()
                 return START_NOT_STICKY
             }
             else -> startAsForeground()
         }
-        // Restart with null intent if killed (Section 18.1: restart if killed).
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startAsForeground() {
@@ -72,10 +73,15 @@ class HostForegroundService : Service() {
 
     private fun observeState() {
         scope.launch {
+            var lastSsid: String? = null
             wifiDirect.state.collect { s ->
-                val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
-                nm.notify(NOTIFICATION_ID, buildNotification(s.ssid))
+                if (s.ssid != lastSsid) {
+                    lastSsid = s.ssid
+                    val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+                    nm.notify(NOTIFICATION_ID, buildNotification(s.ssid))
+                }
                 if (!s.hosting && !s.creating) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
             }
