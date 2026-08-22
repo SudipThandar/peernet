@@ -1,120 +1,59 @@
 package com.peernet.wifiextender.ui.navigation
 
-import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.res.stringResource
-import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
-import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import com.peernet.wifiextender.R
-import com.peernet.wifiextender.ui.client.ClientScreen
 import com.peernet.wifiextender.ui.home.HomeScreen
-import com.peernet.wifiextender.ui.host.HostScreen
-import com.peernet.wifiextender.ui.onboarding.OnboardingScreen
 import com.peernet.wifiextender.ui.settings.SettingsScreen
 
 object Routes {
-    const val ONBOARDING = "onboarding"
-    const val HOME = "home"
-    const val HOST = "host"
-    const val CLIENT = "client"
+    const val MAIN = "main"
     const val SETTINGS = "settings"
 }
 
-private data class BottomNavItem(
-    val route: String,
-    @StringRes val labelRes: Int,
-    val icon: ImageVector
-)
-
-private val bottomNavItems = listOf(
-    BottomNavItem(Routes.HOME, R.string.nav_home, Icons.Filled.Home),
-    BottomNavItem(Routes.HOST, R.string.nav_host, Icons.Filled.Router),
-    BottomNavItem(Routes.CLIENT, R.string.nav_client, Icons.Filled.Wifi),
-    BottomNavItem(Routes.SETTINGS, R.string.nav_settings, Icons.Filled.Settings)
-)
-
+/**
+ * NetShare-style single-screen layout: one main screen with one primary
+ * action, plus a settings page. All PeerNet functionality lives on Main.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PeerNetRoot() {
     val navController = rememberNavController()
-    val backStackEntry by navController.currentBackStackEntryAsState()
-    val currentDestination = backStackEntry?.destination
 
-    val showBottomBar = currentDestination?.route != Routes.ONBOARDING
-
-    Scaffold(
-        bottomBar = {
-            if (showBottomBar) {
-                NavigationBar {
-                    bottomNavItems.forEach { item ->
-                        val selected = currentDestination?.hierarchy?.any {
-                            it.route == item.route
-                        } == true
-                        NavigationBarItem(
-                            selected = selected,
-                            onClick = {
-                                // Deterministic tab switching: pop back to Home,
-                                // inclusive only when Home itself was tapped.
-                                navController.navigate(item.route) {
-                                    popUpTo(Routes.HOME) {
-                                        inclusive = item.route == Routes.HOME
-                                    }
-                                    launchSingleTop = true
-                                }
-                            },
-                            icon = { Icon(item.icon, contentDescription = null) },
-                            label = { Text(stringResource(item.labelRes)) }
+    NavHost(navController = navController, startDestination = Routes.MAIN) {
+        composable(Routes.MAIN) {
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        title = { Text("PeerNet") },
+                        actions = {
+                            IconButton(onClick = { navController.navigate(Routes.SETTINGS) }) {
+                                Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                            }
+                        },
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface
                         )
-                    }
+                    )
                 }
+            ) { innerPadding ->
+                HomeScreen(modifier = Modifier.padding(innerPadding))
             }
         }
-    ) { innerPadding ->
-        NavHost(
-            navController = navController,
-            startDestination = Routes.HOME,
-            modifier = Modifier.padding(innerPadding)
-        ) {
-            composable(Routes.ONBOARDING) {
-                OnboardingScreen(
-                    onDone = {
-                        navController.navigate(Routes.HOME) {
-                            popUpTo(Routes.ONBOARDING) { inclusive = true }
-                        }
-                    }
-                )
-            }
-            composable(Routes.HOME) {
-                HomeScreen(
-                    onOpenHost = { navController.navigate(Routes.HOST) },
-                    onOpenClient = { navController.navigate(Routes.CLIENT) }
-                )
-            }
-            composable(Routes.HOST) {
-                HostScreen()
-            }
-            composable(Routes.CLIENT) {
-                ClientScreen()
-            }
-            composable(Routes.SETTINGS) {
-                SettingsScreen()
-            }
+        composable(Routes.SETTINGS) {
+            SettingsScreen(onBack = { navController.popBackStack() })
         }
     }
 }
