@@ -28,7 +28,8 @@ use crate::SessionManager;
 pub struct HostServer {
     endpoint: Endpoint,
     local_addr: SocketAddr,
-    identity: HostIdentity,
+    certificate: peernet_core::cert::Certificate,
+    fingerprint_hex: String,
     sessions: Arc<SessionManager>,
     stats: Arc<TunnelStats>,
     shutdown_tx: watch::Sender<bool>,
@@ -37,14 +38,15 @@ pub struct HostServer {
 impl HostServer {
     /// Binds on `addr`. Use port 0 to let the OS pick (loopback tests).
     pub fn bind(addr: SocketAddr, device_name: &str) -> Result<Self, String> {
-        let identity = generate_self_signed(device_name)?;
+        let HostIdentity { certificate, private_key, fingerprint_hex } =
+            generate_self_signed(device_name)?;
 
         // Install the ring crypto provider once per process.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let mut tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![identity.certificate.clone()], identity.private_key.clone())
+            .with_single_cert(vec![certificate], private_key)
             .map_err(|e| format!("tls cert setup failed: {e}"))?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
         tls.max_early_data_size = u32::MAX; // 0-RTT tolerant
@@ -72,7 +74,8 @@ impl HostServer {
         Ok(Self {
             endpoint,
             local_addr,
-            identity,
+            certificate,
+            fingerprint_hex,
             sessions: Arc::new(SessionManager::new()),
             stats: Arc::new(TunnelStats::default()),
             shutdown_tx,
@@ -85,11 +88,11 @@ impl HostServer {
 
     /// SHA-256 (hex) of this host's DER certificate — goes into QR/TXT records.
     pub fn fingerprint_hex(&self) -> &str {
-        &self.identity.fingerprint_hex
+        &self.fingerprint_hex
     }
 
     pub fn certificate_der(&self) -> &[u8] {
-        self.identity.certificate.as_ref()
+        self.certificate.as_ref()
     }
 
     pub fn sessions(&self) -> Arc<SessionManager> {
@@ -122,7 +125,7 @@ impl HostServer {
                             let stats = self.stats.clone();
                             let shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
-                                match incoming.into_connection() {
+                                match incoming.accept() {
                                     Ok(conn) => handle_connection(conn, sessions, stats, shutdown).await,
                                     Err(_) => {}
                                 }
@@ -225,7 +228,7 @@ async fn handle_connection(
                 }
             }
             MessageKind::Bye => break,
-            HelloAck | StatsResponse => {} // never sent by clients
+            MessageKind::HelloAck | MessageKind::StatsResponse => {} // never sent by clients
         }
     }
 
