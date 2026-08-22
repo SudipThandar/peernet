@@ -55,18 +55,27 @@ fun HomeScreen(
             }
         }
 
-        Button(
-            onClick = onOpenHost,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Start Sharing")
+        if (state.isHosting) {
+            Button(
+                onClick = onOpenHost,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Open Host Screen")
+            }
+        } else {
+            Button(
+                onClick = onOpenHost,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Start Sharing")
+            }
         }
 
         Button(
             onClick = onOpenClient,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Connect to Host")
+            Text("Discover Hosts")
         }
     }
 }

@@ -18,6 +18,7 @@ import javax.inject.Inject
 
 data class HomeUiState(
     val mode: String = "Idle",
+    val isHosting: Boolean = false,
     val internetAvailable: Boolean = false,
     val wifiState: String = "Unknown"
 )
@@ -66,9 +67,10 @@ class HomeViewModel @Inject constructor(
         _uiState.value = HomeUiState(
             mode = when {
                 wifiDirect.state.value.creating -> "Creating network…"
-                hosting -> "Sharing internet"
+                hosting -> "Sharing"
                 else -> "Idle"
             },
+            isHosting = hosting,
             internetAvailable = internet,
             wifiState = wifi
         )
