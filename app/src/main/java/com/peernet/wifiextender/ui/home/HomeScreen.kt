@@ -76,10 +76,11 @@ fun HomeScreen(
         Spacer(Modifier.height(8.dp))
 
         // ---- Status ----
+        val linkedHost = client.connectedHost
         val (statusText, statusColor) = when {
             host.hostState == HostState.CREATING_GROUP -> "Creating network…" to Color.Gray
             host.hostState == HostState.READY -> "Sharing internet" to Color(0xFF2E7D32)
-            client.connectedHost != null -> "Connected to ${client.connectedHost.name}" to Color(0xFF2E7D32)
+            linkedHost != null -> "Connected to ${linkedHost.name}" to Color(0xFF2E7D32)
             host.hostState == HostState.ERROR -> "Error" to MaterialTheme.colorScheme.error
             else -> "Ready" to Color.Gray
         }
@@ -88,7 +89,7 @@ fun HomeScreen(
         Text(
             text = buildString {
                 append(if (home.internetAvailable) "Internet: connected" else "Internet: not connected")
-                if (client.connectedHost != null) append("  •  via ${client.connectedHost.name}")
+                if (linkedHost != null) append("  •  via ${linkedHost.name}")
             },
             style = MaterialTheme.typography.bodyMedium,
             color = Color.Gray
@@ -100,7 +101,7 @@ fun HomeScreen(
         val isHosting = host.hostState == HostState.READY || host.hostState == HostState.CREATING_GROUP
         val (buttonLabel, buttonAction) = when {
             isHosting -> "STOP SHARING" to { hostViewModel.stopSharing() }
-            client.connectedHost != null -> "DISCONNECT" to { clientViewModel.disconnect() }
+            linkedHost != null -> "DISCONNECT" to { clientViewModel.disconnect() }
             else -> "START SHARING" to {
                 if (missingPerms.isNotEmpty()) {
                     permissionLauncher.launch(Permissions.runtimePermissions().toTypedArray())
@@ -125,7 +126,7 @@ fun HomeScreen(
         }
 
         // ---- Secondary: find hosts (only when idle) ----
-        if (!isHosting && client.connectedHost == null) {
+        if (!isHosting && linkedHost == null) {
             OutlinedButton(
                 onClick = { clientViewModel.searchNearbyNetworks(); clientViewModel.refreshHosts() },
                 modifier = Modifier.fillMaxWidth(0.85f),
@@ -183,7 +184,8 @@ fun HomeScreen(
 
         // ---- Discovered hosts on joined/shared network ----
         client.discoveredHosts.forEach { h ->
-            val linked = client.connectedHost != null && client.connectedHost.hostId == h.hostId
+            val linked = linkedHost != null && linkedHost.hostId != null &&
+                linkedHost.hostId == h.hostId
             Card(modifier = Modifier.fillMaxWidth()) {
                 Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
