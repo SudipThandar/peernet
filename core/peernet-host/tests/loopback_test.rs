@@ -16,10 +16,7 @@ async fn spawn_host(device: &str) -> HostServer {
     server
 }
 
-fn client_opts<'a>(
-    server: &HostServer,
-    name: &'a str,
-) -> ClientOptions<'a> {
+fn client_opts(server: &HostServer, name: &str) -> ClientOptions {
     let mut opts = ClientOptions::new(
         server.local_addr(),
         "localhost",
@@ -75,7 +72,7 @@ async fn concurrent_sessions() {
 
     let mut clients = Vec::new();
     for i in 0..10 {
-        let opts = client_opts(&server, Box::leak(format!("client-{i}").into_boxed_str()));
+        let opts = client_opts(&server, &format!("client-{i}"));
         clients.push(TunnelClient::connect(opts).await.expect("connect"));
     }
 
@@ -100,7 +97,7 @@ async fn concurrent_sessions() {
 async fn fingerprint_mismatch_is_rejected() {
     let server = spawn_host("pin-host").await;
     let mut opts = client_opts(&server, "impostor-client");
-    opts.expected_fingerprint_hex = &"00".repeat(32);
+    opts.expected_fingerprint_hex = "00".repeat(32);
     let result = TunnelClient::connect(opts).await;
     assert!(result.is_err(), "wrong fingerprint must fail the handshake");
 }
