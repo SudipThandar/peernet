@@ -25,6 +25,7 @@ use tokio::sync::watch;
 
 use crate::SessionManager;
 
+#[derive(Clone)]
 pub struct HostServer {
     endpoint: Endpoint,
     local_addr: SocketAddr,
@@ -117,6 +118,7 @@ impl HostServer {
 
     /// Accept loop. Runs until [`shutdown`](Self::shutdown) is called.
     pub async fn run(&self) {
+        let endpoint = self.endpoint.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
             tokio::select! {

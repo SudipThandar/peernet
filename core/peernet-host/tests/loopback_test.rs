@@ -12,7 +12,10 @@ use peernet_host::HostServer;
 async fn spawn_host(device: &str) -> HostServer {
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = HostServer::bind(addr, device).expect("host bind");
-    tokio::spawn(server.run());
+    tokio::spawn({
+        let server = server.clone();
+        async move { server.run().await }
+    });
     server
 }
 
