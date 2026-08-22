@@ -114,10 +114,11 @@ class WifiDirectManager @Inject constructor(
     }
 
     fun stopHosting() {
-        val mgr = manager
+        val mgr = manager ?: return
         val ch = channel ?: return
         Timber.i("Stopping Wi-Fi Direct hosting")
         pendingCreate = false
+        @Suppress("DEPRECATION")
         mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() = clearGroupState()
             override fun onFailure(reason: Int) = clearGroupState()
@@ -150,7 +151,7 @@ class WifiDirectManager @Inject constructor(
 
     @SuppressLint("MissingPermission")
     fun refreshGroupInfo() {
-        val mgr = manager
+        val mgr = manager ?: return
         val ch = channel ?: return
         mgr.requestGroupInfo(ch) { group ->
             if (group == null) {
@@ -208,7 +209,6 @@ class WifiDirectManager @Inject constructor(
     private fun reasonText(reason: Int) = when (reason) {
         WifiP2pManager.BUSY -> "system busy"
         WifiP2pManager.ERROR -> "internal error"
-        WifiP2pManager.UNSUPPORTED -> "not supported"
         WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct unsupported"
         else -> "unknown ($reason)"
     }
