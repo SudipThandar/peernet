@@ -63,6 +63,9 @@ pub struct TunnelClient {
     conn: Connection,
     session_cell: Cell<u64>,
     state: Arc<watch::Sender<ClientState>>,
+    /// Must stay alive: dropping all receivers closes the watch channel and
+    /// makes every subsequent send() fail silently.
+    _state_rx: Arc<watch::Receiver<ClientState>>,
     stats: Arc<TunnelStats>,
     keepalive_handle: tokio::task::JoinHandle<()>,
 }
@@ -105,12 +108,13 @@ impl TunnelClient {
             .await
             .map_err(|e| format!("handshake failed: {e}"))?;
 
-        let (state_tx, _) = watch::channel(ClientState::Connecting);
+        let (state_tx, state_rx) = watch::channel(ClientState::Connecting);
         let mut client = Self {
             endpoint,
             conn,
             session_cell: Cell::new(0),
             state: Arc::new(state_tx),
+            _state_rx: Arc::new(state_rx),
             stats: Arc::new(TunnelStats::default()),
             keepalive_handle: tokio::spawn(async {}),
         };
@@ -176,7 +180,7 @@ impl TunnelClient {
     }
 
     pub fn state(&self) -> ClientState {
-        *self.state.borrow()
+        *self._state_rx.borrow()
     }
 
     pub fn stats_snapshot(&self) -> peernet_core::StatsSnapshot {
