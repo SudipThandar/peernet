@@ -9,10 +9,9 @@
 //! unreliable-datagram echo path (replaced by real relays in Milestone 5),
 //! and session bookkeeping through [`SessionManager`].
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use peernet_core::cert::{generate_self_signed, HostIdentity};
 use peernet_core::{SessionId, TunnelStats};
@@ -179,21 +178,53 @@ async fn handle_connection(
         });
     }
 
-    // Control stream: the first bidirectional stream a client opens.
-    let (mut tx, mut rx) = match conn.accept_bi().await {
-        Ok(streams) => streams,
-        Err(_) => return,
-    };
-
-    let mut session_id: u64 = 0;
-    let mut last_seen: HashMap<u64, Instant> = HashMap::new();
+    // Every bidirectional stream is serviced independently: the client opens
+    // a fresh stream per request (control, data, stats, heartbeats), so the
+    // server must keep accepting them for the life of the connection.
+    let session_id: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
 
     loop {
-        let frame = tokio::select! {
+        let streams = tokio::select! {
             _ = shutdown.changed() => break,
+            streams = conn.accept_bi() => match streams {
+                Ok(s) => s,
+                Err(_) => break,
+            },
+        };
+        let (tx, rx) = streams;
+        tokio::spawn(service_stream(
+            tx,
+            rx,
+            conn.clone(),
+            sessions.clone(),
+            stats.clone(),
+            session_id.clone(),
+            shutdown.clone(),
+        ));
+    }
+
+    let id = *session_id.lock().unwrap_or_else(|p| p.into_inner());
+    if id != 0 {
+        sessions.disconnect(id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn service_stream(
+    mut tx: quinn::SendStream,
+    mut rx: quinn::RecvStream,
+    _conn: Connection,
+    sessions: Arc<SessionManager>,
+    stats: Arc<TunnelStats>,
+    session_id: Arc<Mutex<u64>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let frame = tokio::select! {
+            _ = shutdown.changed() => return,
             frame = read_frame(&mut rx) => match frame {
                 Ok(msg) => msg,
-                Err(_) => break,
+                Err(_) => return,
             },
         };
 
@@ -201,24 +232,24 @@ async fn handle_connection(
 
         match frame.kind {
             MessageKind::Hello => {
-                if session_id == 0 {
-                    session_id = SessionId::generate().as_u128() as u64;
-                    let name = String::from_utf8_lossy(&frame.payload).to_string();
-                    sessions.register(session_id, name, unix_now());
-                    last_seen.insert(session_id, Instant::now());
-                }
-                let ack = PeerMessage::new(MessageKind::HelloAck, session_id, Vec::new());
+                let assigned = {
+                    let mut guard = session_id.lock().unwrap_or_else(|p| p.into_inner());
+                    if *guard == 0 {
+                        *guard = SessionId::generate().as_u128() as u64;
+                        let name = String::from_utf8_lossy(&frame.payload).to_string();
+                        sessions.register(*guard, name, unix_now());
+                    }
+                    *guard
+                };
+                let ack = PeerMessage::new(MessageKind::HelloAck, assigned, Vec::new());
                 if write_frame(&mut tx, &ack).await.is_err() {
-                    break;
+                    return;
                 }
             }
             MessageKind::KeepAlive => {
-                if session_id != 0 {
-                    last_seen.insert(session_id, Instant::now());
-                }
                 let ack = PeerMessage::new(MessageKind::KeepAlive, frame.session_id, Vec::new());
                 if write_frame(&mut tx, &ack).await.is_err() {
-                    break;
+                    return;
                 }
             }
             MessageKind::StatsRequest => {
@@ -226,7 +257,7 @@ async fn handle_connection(
                 let payload = bincode::serialize(&snapshot).unwrap_or_default();
                 let reply = PeerMessage::new(MessageKind::StatsResponse, frame.session_id, payload);
                 if write_frame(&mut tx, &reply).await.is_err() {
-                    break;
+                    return;
                 }
             }
             MessageKind::Data => {
@@ -234,16 +265,12 @@ async fn handle_connection(
                 // Echo for the loopback harness; replaced by real relays in M5.
                 let echo = PeerMessage::new(MessageKind::Data, frame.session_id, frame.payload);
                 if write_frame(&mut tx, &echo).await.is_err() {
-                    break;
+                    return;
                 }
             }
-            MessageKind::Bye => break,
+            MessageKind::Bye => return,
             MessageKind::HelloAck | MessageKind::StatsResponse => {} // never sent by clients
         }
-    }
-
-    if session_id != 0 {
-        sessions.disconnect(session_id);
     }
 }
 
