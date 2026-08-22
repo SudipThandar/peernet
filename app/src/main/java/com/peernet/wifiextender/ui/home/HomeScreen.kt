@@ -27,7 +27,10 @@ fun HomeScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
-    LaunchedEffect(Unit) { viewModel.refresh() }
+    LaunchedEffect(Unit) { viewModel.startObserving() }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose { viewModel.stopObserving() }
+    }
 
     Column(
         modifier = Modifier

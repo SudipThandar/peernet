@@ -1,16 +1,20 @@
 package com.peernet.wifiextender.ui.host
 
+import android.content.Context
+import android.os.Build
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.peernet.wifiextender.discovery.NsdHostAdvertiser
 import com.peernet.wifiextender.util.Permissions
 import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
-import android.content.Context
-import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 enum class HostState {
@@ -36,6 +40,9 @@ class HostViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context
 ) : ViewModel() {
 
+    private val advertiser = NsdHostAdvertiser(appContext)
+    private var advertisingJob: Job? = null
+
     val uiState: StateFlow<HostUiState> = wifiDirect.state.map { s ->
         when {
             s.error != null -> HostUiState(hostState = HostState.ERROR, error = s.error)
@@ -51,6 +58,19 @@ class HostViewModel @Inject constructor(
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HostUiState())
 
+    init {
+        // Advertise on mDNS while hosting; stop when the group goes away.
+        advertisingJob = viewModelScope.launch {
+            wifiDirect.state.collect { s ->
+                if (s.hosting && s.ssid != null) {
+                    advertiser.register(displayName = "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                } else if (!s.hosting && !s.creating) {
+                    advertiser.unregister()
+                }
+            }
+        }
+    }
+
     fun onScreenShown() {
         wifiDirect.initialize()
     }
@@ -61,6 +81,12 @@ class HostViewModel @Inject constructor(
     }
 
     fun stopSharing() {
+        advertiser.unregister()
         wifiDirect.stopHosting()
+    }
+
+    override fun onCleared() {
+        advertiser.unregister()
+        super.onCleared()
     }
 }
