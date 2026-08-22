@@ -136,8 +136,9 @@ class WifiDirectManager @Inject constructor(
         val mgr = manager ?: return
         val ch = channel ?: return
         _state.update { it.copy(error = null) }
-        @Suppress("DEPRECATION")
-        val config = WifiP2pConfig().apply { deviceAddress = deviceAddress }
+        val config = WifiP2pConfig.Builder()
+            .setDeviceAddress(android.net.MacAddress.fromString(deviceAddress))
+            .build()
         mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {}
             override fun onFailure(reason: Int) {
