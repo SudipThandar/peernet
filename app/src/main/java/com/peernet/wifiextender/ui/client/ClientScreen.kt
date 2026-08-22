@@ -54,10 +54,7 @@ fun ClientScreen(
                     }
                     Text(state.status)
                     Button(
-                        onClick = {
-                            viewModel.refreshHosts()
-                            // Disconnect semantics: forget the link; next scan rebuilds state.
-                        },
+                        onClick = viewModel::disconnect,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("Disconnect")

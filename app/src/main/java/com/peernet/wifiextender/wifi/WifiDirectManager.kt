@@ -135,15 +135,36 @@ class WifiDirectManager @Inject constructor(
     fun connectToPeer(deviceAddress: String) {
         val mgr = manager ?: return
         val ch = channel ?: return
+        val mac = deviceAddress.trim().uppercase()
+        if (!MAC_REGEX.matches(mac)) {
+            _state.update { it.copy(error = "Invalid device address, cannot join.") }
+            return
+        }
         _state.update { it.copy(error = null) }
-        val config = WifiP2pConfig.Builder()
-            .setDeviceAddress(android.net.MacAddress.fromString(deviceAddress))
-            .build()
-        mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
+        try {
+            val config = WifiP2pConfig.Builder()
+                .setDeviceAddress(android.net.MacAddress.fromString(mac))
+                .build()
+            mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {}
+                override fun onFailure(reason: Int) {
+                    _state.update { it.copy(error = "Join failed: ${reasonText(reason)}") }
+                }
+            })
+        } catch (t: Throwable) {
+            Timber.w(t, "connectToPeer threw")
+            _state.update { it.copy(error = "Join failed unexpectedly. Please retry.") }
+        }
+    }
+
+    /** Client-side leave: drops the Wi-Fi Direct connection to the host. */
+    fun leaveCurrentGroup() {
+        val mgr = manager ?: return
+        val ch = channel ?: return
+        @Suppress("DEPRECATION")
+        mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {}
-            override fun onFailure(reason: Int) {
-                _state.update { it.copy(error = "Join failed: ${reasonText(reason)}") }
-            }
+            override fun onFailure(reason: Int) {}
         })
     }
 
@@ -277,5 +298,6 @@ class WifiDirectManager @Inject constructor(
 
     companion object {
         private const val TAG = "WifiDirectManager"
+        private val MAC_REGEX = Regex("^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
     }
 }

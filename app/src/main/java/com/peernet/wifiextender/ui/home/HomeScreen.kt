@@ -62,6 +62,25 @@ fun HomeScreen(
             ) {
                 Text("Open Host Screen")
             }
+        } else if (state.linkedHostName != null) {
+            Card(
+                colors = androidx.compose.material3.CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    "Connected to ${state.linkedHostName}",
+                    modifier = Modifier.padding(16.dp),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+            Button(
+                onClick = onOpenClient,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Open Client Screen")
+            }
         } else {
             Button(
                 onClick = onOpenHost,
@@ -69,13 +88,12 @@ fun HomeScreen(
             ) {
                 Text("Start Sharing")
             }
-        }
-
-        Button(
-            onClick = onOpenClient,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Discover Hosts")
+            Button(
+                onClick = onOpenClient,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Discover Hosts")
+            }
         }
     }
 }

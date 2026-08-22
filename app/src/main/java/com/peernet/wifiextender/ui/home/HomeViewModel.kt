@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.peernet.wifiextender.client.ClientLinkManager
 import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -19,6 +20,7 @@ import javax.inject.Inject
 data class HomeUiState(
     val mode: String = "Idle",
     val isHosting: Boolean = false,
+    val linkedHostName: String? = null,
     val internetAvailable: Boolean = false,
     val wifiState: String = "Unknown"
 )
@@ -26,7 +28,8 @@ data class HomeUiState(
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val wifiDirect: WifiDirectManager
+    private val wifiDirect: WifiDirectManager,
+    private val linkManager: ClientLinkManager
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -51,7 +54,9 @@ class HomeViewModel @Inject constructor(
     }
 
     private fun refreshOnce() {
-        val hosting = wifiDirect.state.value.hosting || wifiDirect.state.value.creating
+        val s = wifiDirect.state.value
+        val hosting = s.hosting || s.creating
+        val linkedHost = linkManager.linkedHost.value
 
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
@@ -66,11 +71,13 @@ class HomeViewModel @Inject constructor(
 
         _uiState.value = HomeUiState(
             mode = when {
-                wifiDirect.state.value.creating -> "Creating network…"
+                s.creating -> "Creating network…"
                 hosting -> "Sharing"
+                linkedHost != null -> "Connected to host"
                 else -> "Idle"
             },
             isHosting = hosting,
+            linkedHostName = linkedHost?.name,
             internetAvailable = internet,
             wifiState = wifi
         )

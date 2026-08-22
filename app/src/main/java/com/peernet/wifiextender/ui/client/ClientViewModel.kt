@@ -1,8 +1,9 @@
-package com.peernet.wifiextender.ui.client
+﻿package com.peernet.wifiextender.ui.client
 
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.peernet.wifiextender.client.ClientLinkManager
 import com.peernet.wifiextender.discovery.DiscoveredHost
 import com.peernet.wifiextender.discovery.NsdClientDiscovery
 import com.peernet.wifiextender.wifi.WifiDirectManager
@@ -45,7 +46,8 @@ data class ClientUiState(
 @HiltViewModel
 class ClientViewModel @Inject constructor(
     @ApplicationContext context: Context,
-    private val wifiDirect: WifiDirectManager
+    private val wifiDirect: WifiDirectManager,
+    private val linkManager: ClientLinkManager
 ) : ViewModel() {
 
     private val discovery = NsdClientDiscovery(context)
@@ -61,6 +63,12 @@ class ClientViewModel @Inject constructor(
         _uiState.update { it.copy(savedHostIds = loadSavedHostIds()) }
         wifiDirect.initialize()
 
+        // Restore link state if a previous session linked (process restart keeps prefs,
+        // live link re-verifies on next scan via auto-reconnect).
+        linkManager.linkedHost.value?.let { host ->
+            _uiState.update { it.copy(connectedHost = host, status = "Linked to ${host.name}.") }
+        }
+
         // React to P2P join events: once we land on the host's network, scan for it.
         viewModelScope.launch(Dispatchers.Default) {
             var wasJoined = false
@@ -71,6 +79,10 @@ class ClientViewModel @Inject constructor(
                         joinedToHostAddress = s.joinedGroupOwnerAddress,
                         nearbyPeers = s.peers.map { p -> PeerNetwork(p.deviceName ?: p.deviceAddress, p.deviceAddress) }
                     )
+                }
+                if (!s.joinedAsClient && wasJoined && _uiState.value.connectedHost != null) {
+                    // Host group vanished while linked.
+                    unlink("Host network disconnected.")
                 }
                 if (s.joinedAsClient && !wasJoined) {
                     delay(2_000) // let DHCP settle on the P2P interface
@@ -87,7 +99,7 @@ class ClientViewModel @Inject constructor(
     fun searchNearbyNetworks() {
         wifiDirect.initialize()
         wifiDirect.startPeerDiscovery()
-        _uiState.update { it.copy(status = "Searching for nearby PeerNet networks…") }
+        _uiState.update { it.copy(status = "Searching for nearby PeerNet networksâ€¦") }
         viewModelScope.launch(Dispatchers.Default) {
             delay(6_000)
             wifiDirect.stopPeerDiscovery()
@@ -98,7 +110,7 @@ class ClientViewModel @Inject constructor(
 
     fun joinPeer(address: String) {
         wifiDirect.connectToPeer(address)
-        _uiState.update { it.copy(status = "Joining host network…") }
+        _uiState.update { it.copy(status = "Joining host networkâ€¦") }
     }
 
     // ---------- Discovery ----------
@@ -128,11 +140,12 @@ class ClientViewModel @Inject constructor(
             _uiState.update {
                 it.copy(
                     discovering = true,
-                    status = if (it.connectedHost == null) "Searching for PeerNet hosts nearby…" else it.status
+                    status = if (it.connectedHost == null) "Searching for PeerNet hosts nearbyâ€¦" else it.status
                 )
             }
             val hosts = discovery.discoverOnce()
             val savedIds = loadSavedHostIds()
+            val hadConnected = _uiState.value.connectedHost
 
             _uiState.update { prev ->
                 val stillConnected = prev.connectedHost?.let { c -> hosts.any { it.hostId == c.hostId } }
@@ -143,7 +156,7 @@ class ClientViewModel @Inject constructor(
                     discovering = false,
                     status = when {
                         prev.connectingTo != null -> prev.status
-                        stillConnected == false -> "Lost connection to host. Searching…"
+                        stillConnected == false -> "Lost connection to host. Searchingâ€¦"
                         hosts.isEmpty() && prev.joinedToHostAddress != null ->
                             "On a PeerNet network but no host answered. Is the other phone still sharing?"
                         hosts.isEmpty() ->
@@ -152,6 +165,10 @@ class ClientViewModel @Inject constructor(
                         else -> prev.status
                     }
                 )
+            }
+
+            if (hadConnected != null && _uiState.value.connectedHost == null) {
+                linkManager.setLinked(null)
             }
 
             // Auto-reconnect to a known/paired host (FR-CLIENT-006).
@@ -171,7 +188,7 @@ class ClientViewModel @Inject constructor(
         _uiState.update {
             it.copy(
                 connectingTo = host.name,
-                status = "${if (auto) "Auto-connecting" else "Connecting"} to ${host.name}…"
+                status = "${if (auto) "Auto-connecting" else "Connecting"} to ${host.name}â€¦"
             )
         }
 
@@ -180,6 +197,7 @@ class ClientViewModel @Inject constructor(
 
             if (reachable) {
                 saveProfile(host)
+                linkManager.setLinked(host)
                 _uiState.update {
                     it.copy(
                         connectingTo = null,
@@ -211,6 +229,24 @@ class ClientViewModel @Inject constructor(
         }.getOrElse {
             Timber.d("Probe failed for %s: %s", host.name, it.message)
             false
+        }
+    }
+
+    // ---------- Disconnect ----------
+
+    /** Drops the link and leaves the host's Wi-Fi Direct group. */
+    fun disconnect() {
+        unlink("Disconnected.")
+        wifiDirect.leaveCurrentGroup()
+    }
+
+    private fun unlink(message: String) {
+        linkManager.setLinked(null)
+        _uiState.update {
+            it.copy(
+                connectedHost = null,
+                status = message
+            )
         }
     }
 
