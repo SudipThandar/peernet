@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.peernet.wifiextender.client.ClientLinkManager
+import com.peernet.wifiextender.core.RustCoreBridge
 import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -22,14 +23,16 @@ data class HomeUiState(
     val isHosting: Boolean = false,
     val linkedHostName: String? = null,
     val internetAvailable: Boolean = false,
-    val wifiState: String = "Unknown"
+    val wifiState: String = "Unknown",
+    val engineVersion: String? = null
 )
 
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val wifiDirect: WifiDirectManager,
-    private val linkManager: ClientLinkManager
+    private val linkManager: ClientLinkManager,
+    private val rustCore: RustCoreBridge
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -79,7 +82,8 @@ class HomeViewModel @Inject constructor(
             isHosting = hosting,
             linkedHostName = linkedHost?.name,
             internetAvailable = internet,
-            wifiState = wifi
+            wifiState = wifi,
+            engineVersion = rustCore.version()
         )
     }
 }

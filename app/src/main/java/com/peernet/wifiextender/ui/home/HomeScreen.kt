@@ -110,6 +110,14 @@ fun HomeScreen(
             color = Color.Gray
         )
 
+        home.engineVersion?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFF9E9E9E)
+            )
+        }
+
         Spacer(Modifier.height(32.dp))
 
         // ---- SHARE ----
