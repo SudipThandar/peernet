@@ -46,7 +46,10 @@ impl HostServer {
 
         let mut tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![certificate], private_key)
+            .with_single_cert(
+                vec![certificate],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(private_key),
+            )
             .map_err(|e| format!("tls cert setup failed: {e}"))?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
         tls.max_early_data_size = u32::MAX; // 0-RTT tolerant
@@ -126,7 +129,12 @@ impl HostServer {
                             let shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 match incoming.accept() {
-                                    Ok(conn) => handle_connection(conn, sessions, stats, shutdown).await,
+                                    Ok(connecting) => match connecting.await {
+                                        Ok(conn) => {
+                                            handle_connection(conn, sessions, stats, shutdown).await
+                                        }
+                                        Err(_) => {}
+                                    },
                                     Err(_) => {}
                                 }
                             });
