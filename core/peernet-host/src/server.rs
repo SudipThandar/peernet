@@ -47,7 +47,7 @@ impl HostServer {
         let mut tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![certificate],
+                vec![certificate.clone()],
                 rustls::pki_types::PrivateKeyDer::Pkcs8(private_key),
             )
             .map_err(|e| format!("tls cert setup failed: {e}"))?;
