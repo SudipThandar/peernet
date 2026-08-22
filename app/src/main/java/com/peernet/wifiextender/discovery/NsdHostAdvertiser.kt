@@ -25,14 +25,7 @@ class NsdHostAdvertiser(context: Context) {
     private var registrationListener: NsdManager.RegistrationListener? = null
     private val registered = AtomicBoolean(false)
 
-    /** Persistent host ID survives reinstalls of settings but not app data clears. */
-    private fun hostId(): String {
-        val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        return prefs.getString(KEY_HOST_ID, null)
-            ?: UUID.randomUUID().toString().replace("-", "").take(16).also {
-                prefs.edit().putString(KEY_HOST_ID, it).apply()
-            }
-    }
+    private fun hostId(): String = HostIdentity.id(appContext)
 
     fun register(
         displayName: String,
@@ -94,7 +87,5 @@ class NsdHostAdvertiser(context: Context) {
     companion object {
         const val SERVICE_TYPE = "_peernet._udp."
         const val PNTP_PORT = 4433
-        private const val PREFS = "peernet_host_identity"
-        private const val KEY_HOST_ID = "host_id"
     }
 }

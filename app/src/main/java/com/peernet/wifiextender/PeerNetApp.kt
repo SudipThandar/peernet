@@ -4,11 +4,16 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import com.peernet.wifiextender.host.HostRuntime
 import dagger.hilt.android.HiltAndroidApp
 import timber.log.Timber
+import javax.inject.Inject
 
 @HiltAndroidApp
 class PeerNetApp : Application() {
+
+    @Inject
+    lateinit var hostRuntime: HostRuntime
 
     override fun onCreate() {
         super.onCreate()

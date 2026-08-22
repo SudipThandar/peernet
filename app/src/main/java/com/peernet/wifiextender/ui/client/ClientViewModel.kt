@@ -158,7 +158,9 @@ class ClientViewModel @Inject constructor(
             Socket().use { s ->
                 s.soTimeout = 3_000
                 s.connect(InetSocketAddress(host.address, host.port), 3_000)
-                true
+                val banner = s.getInputStream().bufferedReader().readLine() ?: ""
+                Timber.d("Probe banner from %s: %s", host.name, banner)
+                banner.startsWith(com.peernet.wifiextender.wifi.LinkServer.BANNER_PREFIX)
             }
         }.getOrElse {
             Timber.d("Probe failed for %s: %s", host.name, it.message)
