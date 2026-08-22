@@ -1,8 +1,8 @@
-//! Host-side session bookkeeping.
-//!
-//! Pure state management for connected clients — no I/O here yet.
-//! The QUIC listener (later milestone) will call into `SessionManager`
-//! as connections come and go.
+//! Host-side session bookkeeping and PNTP QUIC server.
+
+pub mod server;
+
+pub use server::HostServer;
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -1,5 +1,9 @@
 //! Shared engine services: session identity, stats counters, config.
 
+pub mod cert;
+
+use serde::{Deserialize, Serialize};
+
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,7 +39,7 @@ impl fmt::Display for SessionId {
 }
 
 /// Snapshot of the tunnel counters at a point in time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub bytes_up: u64,
     pub bytes_down: u64,
