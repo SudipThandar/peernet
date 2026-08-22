@@ -1,0 +1,35 @@
+<resources>
+    <string name="app_name">PeerNet</string>
+
+    <!-- Navigation -->
+    <string name="nav_home">Home</string>
+    <string name="nav_host">Host</string>
+    <string name="nav_client">Client</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Home -->
+    <string name="home_title">PeerNet – WiFi Extender</string>
+    <string name="home_status_idle">Idle</string>
+    <string name="home_start_hosting">Start Sharing</string>
+    <string name="home_connect_client">Connect to Host</string>
+
+    <!-- Host -->
+    <string name="host_title">Host Mode</string>
+    <string name="host_not_started">Not sharing yet.</string>
+
+    <!-- Client -->
+    <string name="client_title">Client Mode</string>
+    <string name="client_not_connected">Not connected to any host.</string>
+    <string name="client_scan_qr">Scan QR Code</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+
+    <string name="channel_host_name">Hosting status</string>
+    <string name="channel_host_description">Shows while this phone is sharing its internet connection</string>
+
+    <!-- Onboarding -->
+    <string name="onboarding_title">Welcome to PeerNet</string>
+    <string name="onboarding_body">PeerNet shares your phone\'s internet with nearby devices over a local Wi-Fi Direct network.\n\nAll traffic stays local between your devices. No cloud relay. No data collection by default.</string>
+    <string name="onboarding_continue">Continue</string>
+</resources>

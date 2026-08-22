@@ -1,0 +1,19 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+
+# Rust / cargo (Milestone 2+)
+core/target/
+**/*.rs.bk
+
+# Local env
+*.keystore
+!debug.keystore
+keystore.properties

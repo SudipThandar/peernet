@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple wifi arcs + node mark -->
+    <group
+        android:scaleX="2.4"
+        android:scaleY="2.4"
+        android:translateX="24.5"
+        android:translateY="24.5">
+        <path
+            android:pathData="M12,21 L3,10 C8,6 16,6 21,10 Z"
+            android:fillColor="#FFFFFFFF" />
+        <path
+            android:pathData="M12,4 A14,14 0 0,0 2.5,7.7 L4.6,10.2 A11,11 0 0,1 19.4,10.2 L21.5,7.7 A14,14 0 0,0 12,4 Z"
+            android:fillColor="#B3FFFFFF"
+            android:fillAlpha="0.9" />
+        <path
+            android:pathData="M12,9.5 m-2.2,0 a2.2,2.2 0 1,1 4.4,0 a2.2,2.2 0 1,1 -4.4,0"
+            android:fillColor="#0B57D0" />
+    </group>
+</vector>
