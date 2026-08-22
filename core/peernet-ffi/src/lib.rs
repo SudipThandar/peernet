@@ -43,9 +43,9 @@ fn create_string<'local>(env: JNIEnv<'local>, value: &str) -> JString<'local> {
         Some(s) => s,
         None => match env.new_string("") {
             Ok(s) => s,
-            // Last resort: nothing sane left; dropping the JString handle is
-            // still safer than panicking into JNI.
-            Err(_) => unsafe { JString::from_raw(0) },
+            // Last resort: nothing sane left; a null handle is still safer
+            // than panicking into JNI.
+            Err(_) => unsafe { JString::from_raw(std::ptr::null_mut()) },
         },
     }
 }
