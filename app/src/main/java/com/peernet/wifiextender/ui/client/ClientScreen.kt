@@ -85,11 +85,49 @@ fun ClientScreen(
         }
 
         OutlinedButton(
+            onClick = viewModel::searchNearbyNetworks,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Search Nearby Networks")
+        }
+
+        OutlinedButton(
             onClick = viewModel::refreshHosts,
             modifier = Modifier.fillMaxWidth(),
             enabled = !state.discovering
         ) {
-            Text(if (state.discovering) "Searching…" else "Refresh / Discover Hosts")
+            Text(if (state.discovering) "Searching…" else "Refresh")
+        }
+
+        if (state.joinedToHostAddress != null) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "Joined host network (${state.joinedToHostAddress})",
+                    modifier = Modifier.padding(16.dp)
+                )
+            }
+        }
+
+        if (state.nearbyPeers.isNotEmpty()) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Nearby networks", style = MaterialTheme.typography.bodyLarge)
+                    state.nearbyPeers.forEach { peer ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(peer.name, style = MaterialTheme.typography.bodyLarge)
+                                Text(peer.address ?: "", style = MaterialTheme.typography.labelMedium)
+                            }
+                            Button(onClick = { peer.address?.let(viewModel::joinPeer) }) {
+                                Text("Join")
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         state.discoveredHosts.forEach { host ->

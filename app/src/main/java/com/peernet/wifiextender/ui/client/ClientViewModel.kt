@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.peernet.wifiextender.discovery.DiscoveredHost
 import com.peernet.wifiextender.discovery.NsdClientDiscovery
+import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -25,18 +26,26 @@ import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 
+data class PeerNetwork(
+    val name: String,
+    val address: String?
+)
+
 data class ClientUiState(
     val status: String = "Not connected to any host.",
     val discovering: Boolean = false,
     val connectingTo: String? = null,
     val connectedHost: DiscoveredHost? = null,
     val discoveredHosts: List<DiscoveredHost> = emptyList(),
-    val savedHostIds: Set<String> = emptySet()
+    val savedHostIds: Set<String> = emptySet(),
+    val nearbyPeers: List<PeerNetwork> = emptyList(),
+    val joinedToHostAddress: String? = null
 )
 
 @HiltViewModel
 class ClientViewModel @Inject constructor(
-    @ApplicationContext context: Context
+    @ApplicationContext context: Context,
+    private val wifiDirect: WifiDirectManager
 ) : ViewModel() {
 
     private val discovery = NsdClientDiscovery(context)
@@ -50,11 +59,50 @@ class ClientViewModel @Inject constructor(
 
     init {
         _uiState.update { it.copy(savedHostIds = loadSavedHostIds()) }
+        wifiDirect.initialize()
+
+        // React to P2P join events: once we land on the host's network, scan for it.
+        viewModelScope.launch(Dispatchers.Default) {
+            var wasJoined = false
+            while (true) {
+                val s = wifiDirect.state.value
+                _uiState.update {
+                    it.copy(
+                        joinedToHostAddress = s.joinedGroupOwnerAddress,
+                        nearbyPeers = s.peers.map { p -> PeerNetwork(p.deviceName ?: p.deviceAddress, p.deviceAddress) }
+                    )
+                }
+                if (s.joinedAsClient && !wasJoined) {
+                    delay(2_000) // let DHCP settle on the P2P interface
+                    scan()
+                }
+                wasJoined = s.joinedAsClient
+                delay(1_000)
+            }
+        }
+    }
+
+    // ---------- Wi-Fi Direct join ----------
+
+    fun searchNearbyNetworks() {
+        wifiDirect.initialize()
+        wifiDirect.startPeerDiscovery()
+        _uiState.update { it.copy(status = "Searching for nearby PeerNet networks…") }
+        viewModelScope.launch(Dispatchers.Default) {
+            delay(6_000)
+            wifiDirect.stopPeerDiscovery()
+            // Also run mDNS in parallel for hosts reachable via any shared LAN.
+            scan()
+        }
+    }
+
+    fun joinPeer(address: String) {
+        wifiDirect.connectToPeer(address)
+        _uiState.update { it.copy(status = "Joining host network…") }
     }
 
     // ---------- Discovery ----------
 
-    /** Background rescan loop while the Client screen is open (spec 15.3: every 30s). */
     fun startObserving() {
         if (observeJob != null) return
         observeJob = viewModelScope.launch(Dispatchers.Default) {
@@ -70,7 +118,6 @@ class ClientViewModel @Inject constructor(
         observeJob = null
     }
 
-    /** Manual refresh — always rebuilds the list, so hosts that stopped sharing disappear. */
     fun refreshHosts() {
         viewModelScope.launch(Dispatchers.Default) { scan() }
     }
@@ -89,16 +136,19 @@ class ClientViewModel @Inject constructor(
 
             _uiState.update { prev ->
                 val stillConnected = prev.connectedHost?.let { c -> hosts.any { it.hostId == c.hostId } }
-                copy(
-                    prev,
-                    hosts = hosts,
+                prev.copy(
+                    discoveredHosts = hosts,
                     savedHostIds = savedIds,
                     connectedHost = if (stillConnected == true) prev.connectedHost else null,
                     discovering = false,
                     status = when {
                         prev.connectingTo != null -> prev.status
                         stillConnected == false -> "Lost connection to host. Searching…"
-                        hosts.isEmpty() -> if (savedIds.isNotEmpty()) "No PeerNet hosts found nearby." else "No PeerNet hosts found. Start sharing on the other phone first."
+                        hosts.isEmpty() && prev.joinedToHostAddress != null ->
+                            "On a PeerNet network but no host answered. Is the other phone still sharing?"
+                        hosts.isEmpty() ->
+                            if (savedIds.isNotEmpty()) "No PeerNet hosts found nearby."
+                            else "No hosts found. Tap 'Search Nearby Networks' to find and join one."
                         else -> prev.status
                     }
                 )
@@ -116,10 +166,6 @@ class ClientViewModel @Inject constructor(
 
     // ---------- Connect ----------
 
-    /**
-     * Links with a discovered host and verifies reachability.
-     * Full internet forwarding activates once the PNTP tunnel engine ships (M5–M7).
-     */
     fun connect(host: DiscoveredHost, auto: Boolean = false) {
         if (_uiState.value.connectingTo != null || host.address == null) return
         _uiState.update {
@@ -146,7 +192,7 @@ class ClientViewModel @Inject constructor(
                 _uiState.update {
                     it.copy(
                         connectingTo = null,
-                        status = "Could not reach ${host.name}. Make sure you are connected to its Wi-Fi Direct network."
+                        status = "Could not reach ${host.name}. Join its Wi-Fi Direct network first."
                     )
                 }
             }
@@ -202,21 +248,5 @@ class ClientViewModel @Inject constructor(
     companion object {
         private const val PREFS = "peernet_client_profiles"
         private const val KEY_PROFILES = "profiles"
-
-        private fun copy(
-            prev: ClientUiState,
-            hosts: List<DiscoveredHost>,
-            savedHostIds: Set<String>,
-            connectedHost: DiscoveredHost?,
-            discovering: Boolean,
-            status: String
-        ) = ClientUiState(
-            status = status,
-            discovering = discovering,
-            connectingTo = prev.connectingTo,
-            connectedHost = connectedHost,
-            discoveredHosts = hosts,
-            savedHostIds = savedHostIds
-        )
     }
 }

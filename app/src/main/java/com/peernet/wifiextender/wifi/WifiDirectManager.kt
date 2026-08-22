@@ -5,6 +5,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
@@ -34,7 +36,11 @@ data class WifiDirectState(
     val passphrase: String? = null,
     val passphraseAvailable: Boolean = true,
     val groupOwnerAddress: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    // Client side
+    val peers: List<WifiP2pDevice> = emptyList(),
+    val joinedAsClient: Boolean = false,
+    val joinedGroupOwnerAddress: String? = null
 )
 
 @Singleton
@@ -67,6 +73,7 @@ class WifiDirectManager @Inject constructor(
                     }
                 }
                 WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> refreshGroupInfo()
+                WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> refreshPeers()
             }
         }
     }
@@ -81,6 +88,7 @@ class WifiDirectManager @Inject constructor(
             val filter = IntentFilter().apply {
                 addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
                 addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
+                addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -90,6 +98,52 @@ class WifiDirectManager @Inject constructor(
             }
             receiverRegistered = true
         }
+    }
+
+    // ---------- Client side: peer discovery & join ----------
+
+    @SuppressLint("MissingPermission")
+    fun startPeerDiscovery() {
+        val mgr = manager ?: return
+        val ch = channel ?: return
+        _state.update { it.copy(error = null) }
+        mgr.discoverPeers(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {}
+            override fun onFailure(reason: Int) {
+                _state.update {
+                    it.copy(error = "Could not search nearby: ${reasonText(reason)}. Location services must be ON.")
+                }
+            }
+        })
+    }
+
+    fun stopPeerDiscovery() {
+        val mgr = manager ?: return
+        val ch = channel ?: return
+        runCatching { mgr.stopPeerDiscovery(ch, null) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshPeers() {
+        val mgr = manager ?: return
+        val ch = channel ?: return
+        mgr.requestPeers(ch) { peers ->
+            _state.update { it.copy(peers = peers.deviceList.toList()) }
+        }
+    }
+
+    fun connectToPeer(deviceAddress: String) {
+        val mgr = manager ?: return
+        val ch = channel ?: return
+        _state.update { it.copy(error = null) }
+        @Suppress("DEPRECATION")
+        val config = WifiP2pConfig().apply { deviceAddress = deviceAddress }
+        mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {}
+            override fun onFailure(reason: Int) {
+                _state.update { it.copy(error = "Join failed: ${reasonText(reason)}") }
+            }
+        })
     }
 
     /**
@@ -170,8 +224,15 @@ class WifiDirectManager @Inject constructor(
                 )
             }
             mgr.requestConnectionInfo(ch) { info ->
+                val formed = info?.groupFormed == true
+                val owner = info?.groupOwnerAddress?.hostAddress
+                val isGo = info?.isGroupOwner == true
                 _state.update {
-                    it.copy(groupOwnerAddress = info?.groupOwnerAddress?.hostAddress)
+                    it.copy(
+                        groupOwnerAddress = if (formed && isGo) owner else it.groupOwnerAddress,
+                        joinedAsClient = formed && !isGo,
+                        joinedGroupOwnerAddress = if (formed && !isGo) owner else null
+                    )
                 }
             }
         }
