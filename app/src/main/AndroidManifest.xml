@@ -49,8 +49,16 @@
             </intent-filter>
         </activity>
 
-        <!-- HostForegroundService (specialUse) and PeerNetVpnService are registered
-             in their respective milestones (M5/M6/M10) together with their code. -->
+        <!-- Host foreground service (Section 10.4): keeps sharing alive while
+             the app is backgrounded or cleared, Android 14+ specialUse declared. -->
+        <service
+            android:name=".service.HostForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the local Wi-Fi Direct sharing network alive so nearby paired devices can bridge to this phone's internet connection." />
+        </service>
 
     </application>
 

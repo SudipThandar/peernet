@@ -50,6 +50,16 @@ class HostRuntime @Inject constructor(
         // Brand the Wi-Fi Direct identity so clients see "PeerNet-xxxx",
         // not the owner's personal device name.
         wifiDirect.setDeviceName("PeerNet-${HostIdentity.shortId(context)}")
+
+        // Foreground service keeps hosting alive when the app is backgrounded
+        // or swiped away (Section 18.1). Must be started before/with hosting.
+        val intent = android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+
         wifiDirect.startHosting()
     }
 
@@ -57,5 +67,6 @@ class HostRuntime @Inject constructor(
         linkServer.stop()
         advertiser.unregister()
         wifiDirect.stopHosting()
+        context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java))
     }
 }

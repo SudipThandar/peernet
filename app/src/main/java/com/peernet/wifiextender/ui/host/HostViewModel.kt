@@ -29,7 +29,8 @@ data class HostUiState(
 
 @HiltViewModel
 class HostViewModel @Inject constructor(
-    private val wifiDirect: WifiDirectManager
+    private val wifiDirect: WifiDirectManager,
+    private val hostRuntime: com.peernet.wifiextender.host.HostRuntime
 ) : ViewModel() {
 
     val uiState: StateFlow<HostUiState> = wifiDirect.state.map { s ->
@@ -52,11 +53,10 @@ class HostViewModel @Inject constructor(
     }
 
     fun startSharing() {
-        // Permission check + runtime start live in HostRuntime (app lifetime).
-        wifiDirect.startHosting()
+        hostRuntime.startSharing()
     }
 
     fun stopSharing() {
-        wifiDirect.stopHosting()
+        hostRuntime.stopSharing()
     }
 }
