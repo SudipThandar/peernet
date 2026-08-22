@@ -238,6 +238,7 @@ async fn service_stream(
                         *guard = SessionId::generate().as_u128() as u64;
                         let name = String::from_utf8_lossy(&frame.payload).to_string();
                         sessions.register(*guard, name, unix_now());
+                        stats.session_started();
                     }
                     *guard
                 };

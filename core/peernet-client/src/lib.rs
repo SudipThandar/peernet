@@ -154,10 +154,18 @@ impl TunnelClient {
         self.keepalive_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let Ok(streams) = conn.open_bi().await else { break };
-                let (mut tx, mut rx) = streams;
+                let streams = conn.open_bi().await;
+                let (mut tx, mut rx) = match streams {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // Connection is gone (host died / link dropped).
+                        let _ = state.send(ClientState::Backoff);
+                        break;
+                    }
+                };
                 let beat = PeerMessage::new(MessageKind::KeepAlive, 0, Vec::new());
                 if write_frame(&mut tx, &beat).await.is_err() {
+                    let _ = state.send(ClientState::Backoff);
                     break;
                 }
                 match tokio::time::timeout(response_timeout, read_frame(&mut rx)).await {
