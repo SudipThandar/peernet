@@ -134,6 +134,21 @@ class ClientViewModel @Inject constructor(
         viewModelScope.launch(Dispatchers.Default) { scan() }
     }
 
+    /** Manual CONNECT button: scan the current network and link to any host found. */
+    fun connectNow() {
+        viewModelScope.launch(Dispatchers.Default) {
+            scan()
+            if (_uiState.value.connectedHost == null && _uiState.value.connectingTo == null) {
+                _uiState.update {
+                    it.copy(
+                        status = "No PeerNet host on this network. Join its Wi-Fi Direct network " +
+                            "(Settings > Wi-Fi) with the password shown on the host phone, then tap Connect."
+                    )
+                }
+            }
+        }
+    }
+
     private suspend fun scan() {
         if (!scanning.compareAndSet(false, true)) return
         try {
@@ -171,9 +186,10 @@ class ClientViewModel @Inject constructor(
                 linkManager.setLinked(null)
             }
 
-            // Auto-reconnect to a known/paired host (FR-CLIENT-006).
+            // Auto-connect: link to any host found on this network (FR-CLIENT-006).
             if (_uiState.value.connectedHost == null && _uiState.value.connectingTo == null) {
                 val known = hosts.firstOrNull { it.hostId != null && it.hostId in savedIds }
+                    ?: hosts.firstOrNull()
                 if (known != null) connect(known, auto = true)
             }
         } finally {

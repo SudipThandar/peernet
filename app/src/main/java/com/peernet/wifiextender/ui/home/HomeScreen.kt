@@ -34,8 +34,12 @@ import com.peernet.wifiextender.ui.host.HostState
 import com.peernet.wifiextender.util.Permissions
 
 /**
- * NetShare-style single screen: one status area, one big action button,
- * everything else secondary. All PeerNet functionality, zero tab confusion.
+ * Two buttons. That's the whole app:
+ *  SHARE   – share this phone's internet (host)
+ *  CONNECT – link to a host whose Wi-Fi Direct network you joined (client)
+ *
+ * Flow: join DIRECT-xx in phone settings with its password, open PeerNet,
+ * it detects and links automatically.
  */
 @Composable
 fun HomeScreen(
@@ -63,6 +67,7 @@ fun HomeScreen(
     LaunchedEffect(Unit) {
         homeViewModel.startObserving()
         hostViewModel.onScreenShown()
+        clientViewModel.startObserving() // auto-detect + auto-connect on open
         missingPerms = Permissions.missing(context)
     }
 
@@ -73,46 +78,46 @@ fun HomeScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(24.dp))
 
         // ---- Status ----
         val linkedHost = client.connectedHost
-        val (statusText, statusColor) = when {
-            host.hostState == HostState.CREATING_GROUP -> "Creating network…" to Color.Gray
-            host.hostState == HostState.READY -> "Sharing internet" to Color(0xFF2E7D32)
-            linkedHost != null -> "Connected to ${linkedHost.name}" to Color(0xFF2E7D32)
-            host.hostState == HostState.ERROR -> "Error" to MaterialTheme.colorScheme.error
-            else -> "Ready" to Color.Gray
+        val isHosting = host.hostState == HostState.READY || host.hostState == HostState.CREATING_GROUP
+
+        val statusText = when {
+            host.hostState == HostState.ERROR -> "Error"
+            host.hostState == HostState.READY -> "Sharing internet"
+            host.hostState == HostState.CREATING_GROUP -> "Creating network…"
+            linkedHost != null -> "Connected to ${linkedHost.name}"
+            else -> "Ready"
         }
+        val statusColor = when {
+            host.hostState == HostState.ERROR -> MaterialTheme.colorScheme.error
+            host.hostState == HostState.READY || linkedHost != null -> Color(0xFF2E7D32)
+            else -> Color.Gray
+        }
+
         Text(statusText, style = MaterialTheme.typography.headlineMedium, color = statusColor)
 
         Text(
-            text = buildString {
-                append(if (home.internetAvailable) "Internet: connected" else "Internet: not connected")
-                if (linkedHost != null) append("  •  via ${linkedHost.name}")
-            },
+            text = if (home.internetAvailable) "Internet: connected" else "Internet: not connected",
             style = MaterialTheme.typography.bodyMedium,
             color = Color.Gray
         )
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(32.dp))
 
-        // ---- One big primary button ----
-        val isHosting = host.hostState == HostState.READY || host.hostState == HostState.CREATING_GROUP
-        val (buttonLabel, buttonAction) = when {
-            isHosting -> "STOP SHARING" to { hostViewModel.stopSharing() }
-            linkedHost != null -> "DISCONNECT" to { clientViewModel.disconnect() }
-            else -> "START SHARING" to {
-                if (missingPerms.isNotEmpty()) {
+        // ---- SHARE ----
+        Button(
+            onClick = {
+                if (isHosting) {
+                    hostViewModel.stopSharing()
+                } else if (missingPerms.isNotEmpty()) {
                     permissionLauncher.launch(Permissions.runtimePermissions().toTypedArray())
                 } else {
                     hostViewModel.startSharing()
                 }
-            }
-        }
-
-        Button(
-            onClick = buttonAction,
+            },
             modifier = Modifier
                 .fillMaxWidth(0.85f)
                 .height(56.dp),
@@ -122,18 +127,42 @@ fun HomeScreen(
                 ButtonDefaults.buttonColors()
             }
         ) {
-            Text(buttonLabel, style = MaterialTheme.typography.titleMedium)
+            Text(if (isHosting) "STOP SHARING" else "SHARE", style = MaterialTheme.typography.titleMedium)
         }
 
-        // ---- Secondary: find hosts (only when idle) ----
-        if (!isHosting && linkedHost == null) {
-            OutlinedButton(
-                onClick = { clientViewModel.searchNearbyNetworks(); clientViewModel.refreshHosts() },
-                modifier = Modifier.fillMaxWidth(0.85f),
-                enabled = !client.discovering
-            ) {
-                Text(if (client.discovering) "SEARCHING…" else "FIND HOSTS")
-            }
+        // ---- CONNECT / DISCONNECT ----
+        OutlinedButton(
+            onClick = {
+                if (linkedHost != null) {
+                    clientViewModel.disconnect()
+                } else {
+                    clientViewModel.connectNow()
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth(0.85f)
+                .height(56.dp),
+            enabled = !client.discovering && client.connectingTo == null
+        ) {
+            Text(
+                text = when {
+                    client.discovering -> "SEARCHING…"
+                    client.connectingTo != null -> "CONNECTING…"
+                    linkedHost != null -> "DISCONNECT"
+                    else -> "CONNECT"
+                },
+                style = MaterialTheme.typography.titleMedium
+            )
+        }
+
+        // ---- Client result line (no lists) ----
+        if (client.status.isNotBlank()) {
+            Text(
+                client.status,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray,
+                modifier = Modifier.padding(top = 8.dp)
+            )
         }
 
         // ---- Errors ----
@@ -143,58 +172,13 @@ fun HomeScreen(
             }
         }
 
-        // ---- Sharing details (NetShare-style info card) ----
+        // ---- Sharing details (password needed for manual join) ----
         if (host.hostState == HostState.READY) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     InfoRow("Network", host.ssid ?: "—")
-                    if (host.passphraseAvailable) {
-                        InfoRow("Password", host.passphrase ?: "—")
-                    } else {
-                        InfoRow("Password", "unavailable — join via Wi-Fi settings")
-                    }
+                    InfoRow("Password", host.passphrase ?: "unavailable — see Wi-Fi settings")
                     InfoRow("Address", host.groupOwnerAddress ?: "acquiring…")
-                    InfoRow("Clients", "${host.connectedClients}")
-                }
-            }
-        }
-
-        // ---- Nearby networks (join directly) ----
-        if (client.nearbyPeers.isNotEmpty()) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Nearby hosts", style = MaterialTheme.typography.titleSmall)
-                    client.nearbyPeers.forEach { peer ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(peer.name)
-                                Text(peer.address ?: "", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
-                            }
-                            OutlinedButton(onClick = { peer.address?.let(clientViewModel::joinPeer) }) {
-                                Text("Join")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // ---- Discovered hosts on joined/shared network ----
-        client.discoveredHosts.forEach { h ->
-            val linked = linkedHost != null && linkedHost.hostId != null &&
-                linkedHost.hostId == h.hostId
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(h.name)
-                        Text(h.address ?: "", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
-                    }
-                    Button(onClick = { clientViewModel.connect(h) }, enabled = !linked) {
-                        Text(if (linked) "LINKED" else "Connect")
-                    }
                 }
             }
         }
