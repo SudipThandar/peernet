@@ -47,13 +47,13 @@ class NsdHostAdvertiser(context: Context) {
             serviceName = "PeerNet-${hid.takeLast(4)}"
             serviceType = SERVICE_TYPE
             setPort(port)
-            setTextRecord("v", "1")
-            setTextRecord("hid", hid)
-            setTextRecord("name", displayName)
-            setTextRecord("port", port.toString())
-            if (fingerprint.isNotEmpty()) setTextRecord("fp", fingerprint)
-            setTextRecord("mode", mode)
-            setTextRecord("cap", "quic,udp,rtc")
+            setAttribute("v", "1")
+            setAttribute("hid", hid)
+            setAttribute("name", displayName)
+            setAttribute("port", port.toString())
+            if (fingerprint.isNotEmpty()) setAttribute("fp", fingerprint)
+            setAttribute("mode", mode)
+            setAttribute("cap", "quic,udp,rtc")
         }
 
         val listener = object : NsdManager.RegistrationListener {
