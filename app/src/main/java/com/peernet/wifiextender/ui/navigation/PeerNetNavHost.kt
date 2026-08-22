@@ -18,7 +18,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
 import androidx.navigation.NavDestination.Companion.hierarchy
-import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -70,12 +69,13 @@ fun PeerNetRoot() {
                         NavigationBarItem(
                             selected = selected,
                             onClick = {
+                                // Deterministic tab switching: pop back to Home,
+                                // inclusive only when Home itself was tapped.
                                 navController.navigate(item.route) {
-                                    popUpTo(navController.graph.findStartDestination().id) {
-                                        saveState = true
+                                    popUpTo(Routes.HOME) {
+                                        inclusive = item.route == Routes.HOME
                                     }
                                     launchSingleTop = true
-                                    restoreState = true
                                 }
                             },
                             icon = { Icon(item.icon, contentDescription = null) },

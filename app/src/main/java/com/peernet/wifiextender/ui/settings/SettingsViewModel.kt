@@ -5,6 +5,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import javax.inject.Inject
 
 data class SettingsUiState(
@@ -19,6 +20,11 @@ class SettingsViewModel @Inject constructor() : ViewModel() {
     val uiState: StateFlow<SettingsUiState> = _uiState.asStateFlow()
 
     fun setNotificationsEnabled(enabled: Boolean) {
-        // Milestone 10: persist via DataStore.
+        _uiState.update { it.copy(notificationsEnabled = enabled) }
+        // Milestone 10: persist via DataStore + link to system notification settings.
+    }
+
+    fun toggleDeveloperOptions() {
+        _uiState.update { it.copy(developerOptionsEnabled = !it.developerOptionsEnabled) }
     }
 }

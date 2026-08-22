@@ -2,6 +2,7 @@ package com.peernet.wifiextender.ui.home
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -10,8 +11,10 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -24,25 +27,28 @@ fun HomeScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
+    LaunchedEffect(Unit) { viewModel.refresh() }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Text(
-            text = "PeerNet",
-            style = MaterialTheme.typography.titleLarge
-        )
+        Text(text = "PeerNet", style = MaterialTheme.typography.titleLarge)
 
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text("Status: ${state.mode}", style = MaterialTheme.typography.bodyLarge)
-                Text("Internet: ${if (state.internetAvailable) "Connected" else "Not connected"}")
-                Text("Wi-Fi: ${state.wifiState}")
+                StatusRow("Status", state.mode)
+                StatusRow(
+                    "Internet",
+                    if (state.internetAvailable) "Connected" else "Not connected",
+                    valueColor = if (state.internetAvailable) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
+                )
+                StatusRow("Wi-Fi", state.wifiState)
             }
         }
 
@@ -59,5 +65,13 @@ fun HomeScreen(
         ) {
             Text("Connect to Host")
         }
+    }
+}
+
+@Composable
+private fun StatusRow(label: String, value: String, valueColor: Color = Color.Unspecified) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = Color.Gray)
+        Text(value, color = valueColor)
     }
 }
