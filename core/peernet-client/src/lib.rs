@@ -29,28 +29,29 @@ pub enum ClientState {
 }
 
 /// Spec-aligned defaults, overridable for tests.
-pub struct ClientOptions<'a> {
+#[derive(Clone)]
+pub struct ClientOptions {
     pub server_addr: SocketAddr,
-    pub server_name: &'a str,
+    pub server_name: String,
     /// Lowercase hex SHA-256 of the host's DER certificate (QR/TXT).
-    pub expected_fingerprint_hex: &'a str,
-    pub device_name: &'a str,
+    pub expected_fingerprint_hex: String,
+    pub device_name: String,
     pub keepalive_interval: Duration,
     pub response_timeout: Duration,
 }
 
-impl<'a> ClientOptions<'a> {
+impl ClientOptions {
     pub fn new(
         server_addr: SocketAddr,
-        server_name: &'a str,
-        expected_fingerprint_hex: &'a str,
-        device_name: &'a str,
+        server_name: impl Into<String>,
+        expected_fingerprint_hex: impl Into<String>,
+        device_name: impl Into<String>,
     ) -> Self {
         Self {
             server_addr,
-            server_name,
-            expected_fingerprint_hex,
-            device_name,
+            server_name: server_name.into(),
+            expected_fingerprint_hex: expected_fingerprint_hex.into(),
+            device_name: device_name.into(),
             keepalive_interval: Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
             response_timeout: Duration::from_secs(IDLE_TIMEOUT_SECS),
         }
@@ -72,7 +73,7 @@ impl TunnelClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let verifier =
-            Arc::new(PinnedCertVerifier::from_hex(opts.expected_fingerprint_hex)?);
+            Arc::new(PinnedCertVerifier::from_hex(&opts.expected_fingerprint_hex)?);
 
         let mut tls = rustls::ClientConfig::builder()
             .dangerous()
@@ -99,7 +100,7 @@ impl TunnelClient {
         endpoint.set_default_client_config(client_config);
 
         let conn = endpoint
-            .connect(opts.server_addr, opts.server_name)
+            .connect(opts.server_addr, opts.server_name.as_str())
             .map_err(|e| format!("connect failed: {e}"))?
             .await
             .map_err(|e| format!("handshake failed: {e}"))?;
