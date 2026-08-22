@@ -221,14 +221,20 @@ class WifiDirectManager @Inject constructor(
     }
 
     fun stopHosting() {
-        val mgr = manager ?: return
-        val ch = channel ?: return
         Timber.i("Stopping Wi-Fi Direct hosting")
         pendingCreate = false
+
+        // Optimistic immediate reset: UI and services must react instantly even
+        // if the platform removeGroup callback never arrives (OEM quirk guard).
+        clearGroupState()
+
+        val mgr = manager
+        val ch = channel
+        if (mgr == null || ch == null) return
         @Suppress("DEPRECATION")
         mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() = clearGroupState()
-            override fun onFailure(reason: Int) = clearGroupState()
+            override fun onSuccess() {}
+            override fun onFailure(reason: Int) {}
         })
     }
 

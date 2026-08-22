@@ -60,6 +60,12 @@
                 android:value="Keeps the local Wi-Fi Direct sharing network alive so nearby paired devices can bridge to this phone's internet connection." />
         </service>
 
+        <!-- Notification Stop action: manifest receiver so delivery never
+             depends on process state or OEM service-intent quirks. -->
+        <receiver
+            android:name=".service.HostNotificationActionReceiver"
+            android:exported="false" />
+
     </application>
 
 </manifest>

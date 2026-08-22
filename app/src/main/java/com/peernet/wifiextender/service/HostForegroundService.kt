@@ -96,10 +96,10 @@ class HostForegroundService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val stopIntent = PendingIntent.getService(
+        val stopIntent = PendingIntent.getBroadcast(
             this,
             1,
-            Intent(this, HostForegroundService::class.java).setAction(ACTION_STOP),
+            Intent(this, HostNotificationActionReceiver::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
