@@ -55,11 +55,12 @@ impl HostServer {
 
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)));
-        transport.max_idle_timeout(Some(quinn::IdleTimeout::from_fixed(Duration::from_secs(
-            IDLE_TIMEOUT_SECS,
-        ))));
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(IDLE_TIMEOUT_SECS))
+                .map_err(|e| format!("idle timeout invalid: {e}"))?,
+        ));
         transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_BYTES));
-        transport.datagram_send_buffer_size(Some(DATAGRAM_BUFFER_BYTES));
+        transport.datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES);
         server_config.transport_config(Arc::new(transport));
 
         let endpoint =

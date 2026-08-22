@@ -17,6 +17,7 @@ use peernet_proto::{
 };
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName};
+use tokio::sync::watch;
 
 /// Mirrors the Kotlin client lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,32 +82,30 @@ impl TunnelClient {
 
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
             .map_err(|e| format!("quinn client config failed: {e}"))?;
-        let mut client_config = quinn::ClientConfig::with_crypto(Arc::new(quic_config));
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
 
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)));
-        transport.max_idle_timeout(Some(quinn::IdleTimeout::from_fixed(Duration::from_secs(
-            IDLE_TIMEOUT_SECS,
-        ))));
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(IDLE_TIMEOUT_SECS))
+                .map_err(|e| format!("idle timeout invalid: {e}"))?,
+        ));
         transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_BYTES));
-        transport.datagram_send_buffer_size(Some(DATAGRAM_BUFFER_BYTES));
+        transport.datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES);
         client_config.transport_config(Arc::new(transport));
 
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| format!("client bind failed: {e}"))?;
         endpoint.set_default_client_config(client_config);
 
-        let server_name = ServerName::try_from(opts.server_name.to_string())
-            .map_err(|_| "invalid server name")?;
-
         let conn = endpoint
-            .connect(server_name, opts.server_addr)
+            .connect(opts.server_addr, opts.server_name)
             .map_err(|e| format!("connect failed: {e}"))?
             .await
             .map_err(|e| format!("handshake failed: {e}"))?;
 
         let (state_tx, _) = watch::channel(ClientState::Connecting);
-        let client = Self {
+        let mut client = Self {
             endpoint,
             conn,
             session_cell: Cell::new(0),
@@ -115,11 +114,11 @@ impl TunnelClient {
             keepalive_handle: tokio::spawn(async {}),
         };
 
-        client.handshake(opts).await?;
+        client.handshake(&opts).await?;
         Ok(client)
     }
 
-    async fn handshake(&self, opts: &ClientOptions<'_>) -> Result<(), String> {
+    async fn handshake(&mut self, opts: &ClientOptions<'_>) -> Result<(), String> {
         let (mut tx, mut rx) = self
             .conn
             .open_bi()
