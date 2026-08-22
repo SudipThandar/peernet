@@ -93,8 +93,9 @@ fun ClientScreen(
         }
 
         state.discoveredHosts.forEach { host ->
-            val isConnected = state.connectedHost?.hostId != null &&
-                state.connectedHost.hostId == host.hostId
+            val connected = state.connectedHost
+            val isConnected = connected != null && connected.hostId != null &&
+                connected.hostId == host.hostId
             val isSaved = host.hostId != null && host.hostId in state.savedHostIds
 
             Card(modifier = Modifier.fillMaxWidth()) {
