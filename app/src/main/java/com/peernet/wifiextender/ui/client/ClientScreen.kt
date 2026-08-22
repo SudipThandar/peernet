@@ -6,13 +6,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -25,6 +29,11 @@ fun ClientScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
+    LaunchedEffect(Unit) { viewModel.startObserving() }
+    DisposableEffect(Unit) {
+        onDispose { viewModel.stopObserving() }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -33,9 +42,33 @@ fun ClientScreen(
     ) {
         Text(text = "Client Mode", style = MaterialTheme.typography.titleLarge)
 
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(state.status, style = MaterialTheme.typography.bodyLarge)
+        if (state.connectedHost != null) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        AssistChip(onClick = {}, label = { Text("LINKED") })
+                        Text(state.connectedHost?.name ?: "", style = MaterialTheme.typography.bodyLarge)
+                    }
+                    Text(state.status)
+                    Button(
+                        onClick = {
+                            viewModel.refreshHosts()
+                            // Disconnect semantics: forget the link; next scan rebuilds state.
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Disconnect")
+                    }
+                }
+            }
+        } else {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(state.status, style = MaterialTheme.typography.bodyLarge)
+                }
             }
         }
 
@@ -52,22 +85,41 @@ fun ClientScreen(
         }
 
         OutlinedButton(
-            onClick = viewModel::discoverHosts,
+            onClick = viewModel::refreshHosts,
             modifier = Modifier.fillMaxWidth(),
             enabled = !state.discovering
         ) {
-            Text(if (state.discovering) "Searching…" else "Discover Hosts")
+            Text(if (state.discovering) "Searching…" else "Refresh / Discover Hosts")
         }
 
         state.discoveredHosts.forEach { host ->
+            val isConnected = state.connectedHost?.hostId != null &&
+                state.connectedHost.hostId == host.hostId
+            val isSaved = host.hostId != null && host.hostId in state.savedHostIds
+
             Card(modifier = Modifier.fillMaxWidth()) {
-                Row(modifier = Modifier.padding(16.dp)) {
+                Row(modifier = Modifier.padding(16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(host.name, style = MaterialTheme.typography.bodyLarge)
-                        Text(host.address ?: "address pending", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            buildString {
+                                append(host.address ?: "address pending")
+                                if (isSaved) append("  • saved")
+                            },
+                            style = MaterialTheme.typography.labelMedium
+                        )
                     }
-                    Button(onClick = { /* tunnel connect arrives in Milestone 7 */ }, enabled = false) {
-                        Text("Connect")
+                    Button(
+                        onClick = { viewModel.connect(host) },
+                        enabled = !isConnected && state.connectingTo == null && host.address != null
+                    ) {
+                        Text(
+                            when {
+                                isConnected -> "Linked"
+                                state.connectingTo == host.name -> "…"
+                                else -> "Connect"
+                            }
+                        )
                     }
                 }
             }

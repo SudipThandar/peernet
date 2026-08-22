@@ -14,12 +14,12 @@ import kotlin.coroutines.resume
 data class DiscoveredHost(
     val name: String,
     val port: Int,
-    val address: String?
+    val address: String?,
+    val hostId: String?
 )
 
 /**
- * Client-side mDNS discovery (spec Sections 15.2/15.3).
- * Scans for `_peernet._udp` services advertised by hosts.
+ * Client-side mDNS/Bonjour discovery (spec Sections 15.2/15.3).
  */
 class NsdClientDiscovery(context: Context) {
 
@@ -55,10 +55,14 @@ class NsdClientDiscovery(context: Context) {
             override fun onServiceResolved(info: NsdServiceInfo?) {
                 info ?: return
                 Timber.d("NSD resolved host: %s", info.serviceName)
+                @Suppress("DEPRECATION")
+                val attrs = info.attributes
+                val hid = attrs["hid"]?.toString(Charsets.UTF_8)
                 found[info.serviceName] = DiscoveredHost(
                     name = info.serviceName,
                     port = info.port,
-                    address = info.host?.hostAddress
+                    address = info.host?.hostAddress,
+                    hostId = hid
                 )
                 if (found.size >= MAX_HOSTS) finish()
             }
