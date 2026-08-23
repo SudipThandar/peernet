@@ -521,6 +521,7 @@ mod tests {
         pkt_in_tx: Option<mpsc::Sender<Vec<u8>>>,
         pkt_out_rx: mpsc::Receiver<Vec<u8>>,
         up_tx: Option<mpsc::Sender<FromUpstream>>,
+        stack_handle: Option<std::thread::JoinHandle<()>>,
         bridge: Bridge,
         started: Instant,
     }
@@ -531,6 +532,7 @@ mod tests {
             let (to_up_tx, to_up_rx) = mpsc::channel::<ToUpstream>();
             let (stack, pkt_in_tx, up_tx) =
                 TcpStack::channels(pkt_out_tx, to_up_tx);
+            let stack_thread = std::thread::spawn(move || stack.run());
 
             let seen_open = Arc::new(Mutex::new(Vec::new()));
             let seen_eof = Arc::new(Mutex::new(Vec::new()));
@@ -585,6 +587,7 @@ mod tests {
                 pkt_in_tx: Some(pkt_in_tx),
                 pkt_out_rx,
                 up_tx: Some(up_tx),
+                stack_handle: Some(stack_thread),
                 bridge: Bridge {
                     seen_open,
                     seen_eof,
@@ -695,7 +698,9 @@ mod tests {
             // Dropping senders terminates the stack loop and the bridge.
             self.pkt_in_tx.take();
             self.up_tx.take();
-            std::thread::sleep(Duration::from_millis(30));
+            if let Some(h) = self.stack_handle.take() {
+                let _ = h.join();
+            }
             while self.pkt_out_rx.try_recv().is_ok() {}
         }
     }
