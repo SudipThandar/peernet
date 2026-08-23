@@ -169,12 +169,12 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunPacketCo
 pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
     'local,
 >(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     port: jint,
     device_name: JString<'local>,
 ) -> JString<'local> {
-    let name = get_string(env, &device_name);
+    let name = get_string(&mut env, &device_name);
     let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_some() {
         return create_string(env, "");
@@ -238,20 +238,20 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_hostSession
 pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel<
     'local,
 >(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     server_addr: JString<'local>,
     fingerprint_hex: JString<'local>,
     device_name: JString<'local>,
 ) -> jboolean {
-    let addr = get_string(env, &server_addr);
-    let fp = get_string(env, &fingerprint_hex);
-    let name = get_string(env, &device_name);
+    let addr = get_string(&mut env, &server_addr);
+    let fp = get_string(&mut env, &fingerprint_hex);
+    let name = get_string(&mut env, &device_name);
 
     let Ok(parsed) = SocketAddr::from_str(&addr) else {
         return 0;
     };
-    if !CLIENT_STARTING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) {
+    if CLIENT_STARTING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return 0;
     }
 
@@ -439,7 +439,7 @@ fn create_string<'local>(env: JNIEnv<'local>, value: &str) -> JString<'local> {
     }
 }
 
-fn get_string<'local>(env: JNIEnv<'local>, value: &JString<'local>) -> String {
+fn get_string(env: &mut JNIEnv, value: &JString) -> String {
     env.get_string(value)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
