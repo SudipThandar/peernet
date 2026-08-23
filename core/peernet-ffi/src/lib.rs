@@ -155,7 +155,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
             Ok(g) => g,
             Err(_) => break,
         };
-        let result = guard.try_io_mut(|inner| inner.get_mut().read(&mut buf));
+        let result = guard.try_io(|inner| inner.get_mut().read(&mut buf));
         match result {
             Ok(Ok(0)) => break, // EOF: interface closed
             Ok(Ok(n)) => {

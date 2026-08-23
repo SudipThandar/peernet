@@ -86,10 +86,10 @@ class PeerNetVpnService : VpnService() {
 
         val pfd: ParcelFileDescriptor = builder.establish() ?: return -1
         return try {
-            val fdObj: java.io.FileDescriptor = pfd.fileDescriptor
-            val protected: Boolean =
-                runCatching { this@PeerNetVpnService.protect(fdObj) }.getOrDefault(false)
-            if (!protected) {
+            // protect(int) before ownership transfer — routing-loop guard.
+            val currentFd: Int = pfd.fd
+            val ok: Boolean = protect(currentFd)
+            if (!ok) {
                 Timber.w("protect(fd) failed — aborting tunnel to avoid routing loops")
                 runCatching { pfd.close() }
                 return -1
