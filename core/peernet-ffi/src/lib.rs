@@ -31,10 +31,11 @@ use peernet_tcp::{FlowKey, FromUpstream, TcpStack, ToUpstream};
 use tokio::io::unix::AsyncFd;
 use std::io::{Read as _, Write as _};
 
-/// Dedicated engine runtime â€” JNI has no ambient tokio context.
+/// Dedicated engine runtime — JNI has no ambient tokio context.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
+        init_logging();
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_io()
@@ -42,6 +43,20 @@ fn runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("tokio runtime")
     })
+}
+
+/// Logcat bridge so on-device failures are diagnosable via
+/// `adb logcat -s PeerNet`. No-op outside Android.
+fn init_logging() {
+    #[cfg(target_os = "android")]
+    {
+        let _ = android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Info)
+                .with_tag("PeerNet"),
+        );
+        log::info!("engine logging online ({} v{})", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    }
 }
 
 // ---------- TUN capture state ----------
@@ -334,6 +349,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel
                     return;
                 }
                 let client = std::sync::Arc::new(client);
+                crate::jni_log(&format!("[client] QUIC connected gen={gen}"));
                 *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(client.clone());
                 CLIENT_STARTING.store(false, Ordering::SeqCst);
                 // Reverse path: rebuild relay datagrams into TUN packets
@@ -750,6 +766,7 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
 //
 /// Spawns the whole termination pipeline for this tunnel generation.
 pub fn spawn_tcp_termination(client: std::sync::Arc<TunnelClient>, gen: u64) {
+    crate::jni_log("[tcp] termination engine starting");
     let (pkt_out_tx, pkt_out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (to_up_tx, to_up_rx) = std::sync::mpsc::channel::<ToUpstream>();
     let (stack, pkt_in_tx, up_tx) = TcpStack::channels(pkt_out_tx, to_up_tx);
@@ -807,7 +824,8 @@ async fn run_tcp_relays(
                 let dst_ip = Ipv4Addr::from(flow.dst_ip);
                 let (mut tx, rx) = match client.connection().open_bi().await {
                     Ok(pair) => pair,
-                    Err(_) => {
+                    Err(e) => {
+                        crate::jni_log(&format!("[tcp] open_bi failed for flow {flow:?}: {e}"));
                         let _ = from_up.send(FromUpstream::Eof { flow });
                         continue;
                     }
@@ -823,9 +841,14 @@ async fn run_tcp_relays(
                     .encode(),
                 );
                 if write_frame(&mut tx, &frame).await.is_err() {
+                    crate::jni_log("[tcp] relay header send failed");
                     let _ = from_up.send(FromUpstream::Eof { flow });
                     continue;
                 }
+                crate::jni_log(&format!(
+                    "[tcp] relay open -> {}:{} (local port {})",
+                    dst_ip, flow.dst_port, flow.src_port
+                ));
                 // Internet -> phone reader half.
                 let fu = from_up.clone();
                 tokio::spawn(async move {
@@ -964,10 +987,9 @@ const _: Option<JValue> = None;
 
 /// Android logcat bridge used by the capture task.
 pub(crate) fn jni_log(message: &str) {
-    // Simple stdout logging is invisible on-device; route through Timber via
-    // Kotlin instead is overkill here, so use the NDK-style logcat write.
-    // For M6 we accept stderr-in-tests / silent-on-device behavior and rely on
-    // packet counters surfaced through tunPacketCount().
+    #[cfg(target_os = "android")]
+    log::info!("{}", message);
+    #[cfg(not(target_os = "android"))]
     let _ = message;
 }
 

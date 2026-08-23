@@ -102,8 +102,16 @@ fun HomeScreen(
                     h.fingerprint ?: ""
                 )
             }
+            // Pin QUIC sockets to the link's network (P2P Wi-Fi is usually
+            // "no internet" and would otherwise lose the default route to
+            // cellular, where the host is unreachable).
+            clientViewModel.linkedNetwork()?.let {
+                putExtra(
+                    com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_NETWORK,
+                    it
+                )
+            }
         }
-
     val vpnLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->

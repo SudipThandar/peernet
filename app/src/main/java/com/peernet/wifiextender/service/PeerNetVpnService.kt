@@ -53,9 +53,12 @@ class PeerNetVpnService : VpnService() {
         // or re-start while capturing) reconnects to the right host.
         intent?.getStringExtra(EXTRA_HOST_ADDR)?.let { hostAddr = it }
         intent?.getStringExtra(EXTRA_HOST_FP)?.let { hostFp = it }
+        readUnderlyingNetwork(intent)?.let { underlying = it }
 
         if (tunFd != -1) {
-            // Already capturing.
+            // Already capturing; just refresh socket pinning in case the
+            // network changed while we stayed up.
+            pinSocketsToUnderlying()
             return START_STICKY
         }
 
@@ -83,9 +86,36 @@ class PeerNetVpnService : VpnService() {
         }
 
         connectEngine()
+        pinSocketsToUnderlying()
 
         Timber.i("TUN capture started (fd=%d mtu=%d)", fd, MTU)
         return START_STICKY
+    }
+
+    @Volatile private var underlying: android.net.Network? = null
+
+    private fun readUnderlyingNetwork(intent: Intent?): android.net.Network? = try {
+        intent?.let {
+            androidx.core.content.IntentCompat.getParcelableExtra(
+                it, EXTRA_NETWORK, android.net.Network::class.java
+            )
+        }
+    } catch (t: Throwable) {
+        Timber.w(t, "underlying network extra unreadable")
+        null
+    }
+
+    /**
+     * Pins the tunnel's protected sockets onto the link network. Without
+     * this, Android routes them via the DEFAULT network — and a P2P Wi-Fi
+     * marked "no internet" loses that role to cellular, where the host's
+     * private address does not exist (handshake times out forever).
+     */
+    private fun pinSocketsToUnderlying() {
+        val net = underlying ?: return
+        runCatching { setUnderlyingNetworks(arrayOf(net)) }
+            .onFailure { Timber.w(it, "setUnderlyingNetworks failed") }
+            .onSuccess { Timber.i("Tunnel pinned to network %s", net) }
     }
 
     /**
@@ -174,6 +204,7 @@ class PeerNetVpnService : VpnService() {
         const val ACTION_STOP = "com.peernet.wifiextender.action.STOP_VPN"
         const val EXTRA_HOST_ADDR = "host_addr"
         const val EXTRA_HOST_FP = "host_fp"
+        const val EXTRA_NETWORK = "host_network"
         const val SESSION = "PeerNet"
         const val MTU = 1280
         const val VPN_ADDRESS = "10.215.17.2"

@@ -1,5 +1,6 @@
 ﻿package com.peernet.wifiextender.ui.client
 
+import android.annotation.SuppressLint
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -69,6 +70,32 @@ class ClientViewModel @Inject constructor(
                     clearLink("Host disconnected.")
                 }
                 wasJoined = joined
+            }
+        }
+        // Legacy-join watcher: users who associate through Android's own
+        // Wi-Fi picker (typing the passphrase) never fire Wi-Fi Direct
+        // callbacks on the client side, so joinedAsClient stays false
+        // forever. Poll the station SSID instead; DIRECT-*PeerNet* means
+        // someone joined our group manually — link exactly like a native
+        // join would.
+        viewModelScope.launch(Dispatchers.Default) {
+            val wm = context.applicationContext
+                .getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            var wasLegacyJoined = false
+            while (kotlinx.coroutines.currentCoroutineContext().isActive) {
+                val ssid = runCatching {
+                    @Suppress("DEPRECATION")
+                    wm.connectionInfo?.ssid?.removeSurrounding("\"")
+                }.getOrNull().orEmpty()
+                val legacyJoined =
+                    ssid.contains("DIRECT-", ignoreCase = true) &&
+                        ssid.contains("PeerNet", ignoreCase = true)
+                if (legacyJoined && !wasLegacyJoined && _uiState.value.connectedHost == null) {
+                    Timber.i("Legacy (OS picker) join detected via SSID %s", ssid)
+                    autoLink()
+                }
+                wasLegacyJoined = legacyJoined
+                delay(LEGACY_POLL_MS)
             }
         }
     }
@@ -229,7 +256,7 @@ class ClientViewModel @Inject constructor(
 
     private fun link(host: DiscoveredHost, viaP2p: Boolean) {
         saveProfile(host)
-        linkManager.setLinked(host)
+        linkManager.setLinked(host, currentWifiNetwork())
         _uiState.update {
             it.copy(
                 connectedHost = host,
@@ -239,6 +266,32 @@ class ClientViewModel @Inject constructor(
             )
         }
         startLiveness(host)
+    }
+
+    /** Live network for VPN socket pinning (null = let the system choose). */
+    fun linkedNetwork(): android.net.Network? = linkManager.linkedNetwork.value
+
+    /**
+     * The network the host link should ride on. Prefers the P2P interface
+     * (name starts with "p2p"); falls back to any plain Wi-Fi transport.
+     * Critical because Android routes app traffic over the DEFAULT network,
+     * and a "connected without internet" P2P Wi-Fi loses that role to
+     * cellular — where the host's private address is unreachable.
+     */
+    @SuppressLint("MissingPermission")
+    private fun currentWifiNetwork(): android.net.Network? {
+        val cm = context.applicationContext
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val networks = cm.allNetworks.toList()
+        val p2p = networks.firstOrNull { n ->
+            val lp = runCatching { cm.getLinkProperties(n) }.getOrNull()
+            lp?.interfaceName?.startsWith("p2p", ignoreCase = true) == true
+        }
+        if (p2p != null) return p2p
+        return networks.firstOrNull { n ->
+            val caps = runCatching { cm.getNetworkCapabilities(n) }.getOrNull()
+            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
     }
 
     /**
@@ -338,5 +391,6 @@ class ClientViewModel @Inject constructor(
         private const val PEER_SCAN_MS = 8_000L
         private const val LIVENESS_INTERVAL_MS = 5_000L
         private const val LIVENESS_MISSES = 2
+        private const val LEGACY_POLL_MS = 4_000L
     }
 }
