@@ -119,6 +119,11 @@ fun HomeScreen(
     ) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
             context.startForegroundService(vpnIntent())
+        } else {
+            // Silent denial used to look identical to a broken tunnel.
+            clientViewModel.reportTunnelStatus(
+                "VPN permission denied — internet cannot be routed. Disconnect and connect again to allow it."
+            )
         }
     }
 
@@ -142,10 +147,28 @@ fun HomeScreen(
             context.startForegroundService(vpnIntent())
         }
         // Surface capture + tunnel proof in the status line.
+        var silentSince = 0L
         while (true) {
             tunPackets = clientViewModel.packetCount()
             quicState = clientViewModel.tunnelState()
             engineStats = clientViewModel.engineStats()
+
+            // "Connected but nothing loads" is otherwise invisible: the tunnel
+            // reports healthy while the host relays nothing back. Sending with
+            // zero bytes returned for several seconds is that failure.
+            val sending = clientViewModel.outboundCount() > 0
+            val receiving = clientViewModel.inboundCount() > 0
+            if (quicState == STATE_CONNECTED && sending && !receiving) {
+                if (silentSince == 0L) silentSince = System.currentTimeMillis()
+                if (System.currentTimeMillis() - silentSince > SILENT_TUNNEL_MS) {
+                    clientViewModel.reportTunnelStatus(
+                        "Tunnel is up but the host is not sending anything back — " +
+                            "check that the host phone still has working internet."
+                    )
+                }
+            } else {
+                silentSince = 0L
+            }
             kotlinx.coroutines.delay(1000)
         }
     }
@@ -308,6 +331,12 @@ fun HomeScreen(
         }
     }
 }
+
+/** Tunnel state reported by the engine: 2 = connected. */
+private const val STATE_CONNECTED = 2
+
+/** How long a connected-but-silent tunnel is tolerated before it is called out. */
+private const val SILENT_TUNNEL_MS = 10_000L
 
 @Composable
 private fun InfoRow(label: String, value: String) {

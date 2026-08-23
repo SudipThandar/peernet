@@ -109,6 +109,11 @@ fn tun_tx() -> Option<TunTx> {
 static TCP_TERMINATED: AtomicU64 = AtomicU64::new(0);
 static UDP_FORWARDED: AtomicU64 = AtomicU64::new(0);
 
+/// Payloads that came *back* from the host (UDP replies + TCP stream data).
+/// The one number that distinguishes "tunnel works" from "tunnel connected to
+/// a host that cannot reach the internet".
+static INBOUND: AtomicU64 = AtomicU64::new(0);
+
 /// How long the engine's packet forwarder waits for a TUN write channel
 /// (50 ms per try) before giving up on a packet.
 const TUN_TX_WAIT_TRIES: usize = 40;
@@ -216,6 +221,11 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunCap
     TUN_STOP.store(false, Ordering::SeqCst);
     PACKETS.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
+    // Per-session counters: stale totals from a previous tunnel would make a
+    // dead data path look alive on the diagnostics line.
+    UDP_FORWARDED.store(0, Ordering::Relaxed);
+    TCP_TERMINATED.store(0, Ordering::Relaxed);
+    INBOUND.store(0, Ordering::Relaxed);
 
     let owned = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
     let mtu = mtu.clamp(1200, 1500) as usize;
@@ -508,9 +518,10 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_lastError<
     create_string(env, &msg)
 }
 
-/// NativeCore.engineStats() -> String, e.g. "tun=1420 udp=310 tcp=88".
+/// NativeCore.engineStats() -> String, e.g. "tun=1420 udp=310 tcp=88 in=402".
 /// Proves which half of the data path is moving when a user reports
-/// "connected but nothing loads".
+/// "connected but nothing loads": `in=0` with the others rising means the
+/// host is reachable but is not relaying (typically the host has no internet).
 #[no_mangle]
 pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats<
     'local,
@@ -519,10 +530,11 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
     _class: JClass<'local>,
 ) -> JString<'local> {
     let stats = format!(
-        "tun={} udp={} tcp={}",
+        "tun={} udp={} tcp={} in={}",
         PACKETS.load(Ordering::Relaxed),
         UDP_FORWARDED.load(Ordering::Relaxed),
         TCP_TERMINATED.load(Ordering::Relaxed),
+        INBOUND.load(Ordering::Relaxed),
     );
     create_string(env, &stats)
 }
@@ -818,6 +830,7 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
             Ok(v) => v,
             Err(_) => continue,
         };
+        INBOUND.fetch_add((datagram.len() - off) as u64, Ordering::Relaxed);
         // hdr.dst_* is the real remote peer that produced this data, but
         // the phone must see replies from its ORIGINAL destination (the
         // flow table records it) - critical for the virtual DNS IP.
@@ -958,6 +971,7 @@ async fn run_tcp_relays(
                     loop {
                         match rx.read(&mut buf).await {
                             Ok(Some(n)) if n > 0 => {
+                                INBOUND.fetch_add(n as u64, Ordering::Relaxed);
                                 let msg = FromUpstream::Data {
                                     flow,
                                     bytes: buf[..n].to_vec(),

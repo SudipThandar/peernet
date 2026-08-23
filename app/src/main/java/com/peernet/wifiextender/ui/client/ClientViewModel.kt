@@ -113,11 +113,28 @@ class ClientViewModel @Inject constructor(
     /** QUIC tunnel state: 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
     fun tunnelState(): Int = rustCore.tunnelState()
 
-    /** Engine data-path counters, e.g. "tun=120 udp=44 tcp=9". */
+    /** Engine data-path counters, e.g. "tun=120 udp=44 tcp=9 in=3011". */
     fun engineStats(): String = rustCore.engineStats()
+
+    /** Bytes/packets pushed toward the host (udp + tcp counters). */
+    fun outboundCount(): Long = statValue("udp") + statValue("tcp")
+
+    /** Payload bytes the host has relayed back; 0 means the host relays nothing. */
+    fun inboundCount(): Long = statValue("in")
+
+    private fun statValue(key: String): Long =
+        engineStats()
+            .split(' ')
+            .firstOrNull { it.startsWith("$key=") }
+            ?.substringAfter('=')
+            ?.toLongOrNull()
+            ?: 0L
 
     /** Plain-language tunnel progress/error for the single screen. */
     val tunnelStatus: StateFlow<String> = linkManager.tunnelStatus
+
+    /** Lets the UI report what only it can observe (e.g. denied VPN consent). */
+    fun reportTunnelStatus(message: String) = linkManager.setTunnelStatus(message)
 
     /**
      * CONNECT button. Priority order:
