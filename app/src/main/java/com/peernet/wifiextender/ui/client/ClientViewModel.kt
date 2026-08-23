@@ -117,14 +117,27 @@ class ClientViewModel @Inject constructor(
     /** QUIC tunnel state: 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
     fun tunnelState(): Int = rustCore.tunnelState()
 
-    /** Engine data-path counters, e.g. "tun=120 udp=44 tcp=9 in=3011". */
+    /** Engine data-path counters, e.g. "tun=120 udp=44 tcp=9 in=3011 lost=0 cap=up". */
     fun engineStats(): String = rustCore.engineStats()
 
     /** Bytes/packets pushed toward the host (udp + tcp counters). */
     fun outboundCount(): Long = statValue("udp") + statValue("tcp")
 
-    /** Payload bytes the host has relayed back; 0 means the host relays nothing. */
+    /** Payload bytes delivered back into the TUN; 0 means nothing reached the phone. */
     fun inboundCount(): Long = statValue("in")
+
+    /**
+     * Replies that arrived from the host but could not be handed to the phone.
+     * Distinguishes "the host cannot reach the internet" from "the local
+     * delivery path is broken" — they look identical on screen otherwise.
+     */
+    fun undeliveredCount(): Long = statValue("lost")
+
+    /**
+     * Whether the TUN capture loop is still running. A dead loop just freezes
+     * the counters, which reads as "the phone sent nothing".
+     */
+    fun captureAlive(): Boolean = engineStats().contains("cap=up")
 
     private fun statValue(key: String): Long =
         engineStats()

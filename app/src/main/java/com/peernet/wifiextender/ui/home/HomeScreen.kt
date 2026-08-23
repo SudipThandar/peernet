@@ -178,12 +178,25 @@ fun HomeScreen(
             // zero bytes returned for several seconds is that failure.
             val sending = clientViewModel.outboundCount() > 0
             val receiving = clientViewModel.inboundCount() > 0
-            if (quicState == STATE_CONNECTED && sending && !receiving) {
+            val undelivered = clientViewModel.undeliveredCount() > 0
+
+            // A dead capture loop only shows up as frozen counters, which reads
+            // as "the phone sent nothing" — name it instead.
+            if (quicState == STATE_CONNECTED && tunPackets > 0 && !clientViewModel.captureAlive()) {
+                clientViewModel.reportTunnelStatus(
+                    "Packet capture stopped — reconnect to restart the tunnel."
+                )
+            } else if (quicState == STATE_CONNECTED && sending && !receiving) {
                 if (silentSince == 0L) silentSince = System.currentTimeMillis()
                 if (System.currentTimeMillis() - silentSince > SILENT_TUNNEL_MS) {
                     clientViewModel.reportTunnelStatus(
-                        "Tunnel is up but the host is not sending anything back — " +
-                            "check that the host phone still has working internet."
+                        if (undelivered) {
+                            "Replies are arriving but cannot be delivered to this phone — " +
+                                "reconnect to rebuild the tunnel."
+                        } else {
+                            "Tunnel is up but the host is not sending anything back — " +
+                                "check that the host phone still has working internet."
+                        }
                     )
                 }
             } else {

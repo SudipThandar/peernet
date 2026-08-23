@@ -32,7 +32,8 @@ app/                     Android app (Compose UI, Hilt DI, services)
                          fingerprint into mDNS advertisement
   .../service/
     HostForegroundService        Keeps hosting alive in background (specialUse FGS)
-    PeerNetVpnService            TUN establishment, protect(), fd handoff; reads
+    PeerNetVpnService            TUN establishment (specialUse FGS, no protect() on the
+                                 fd), fd handoff; reads
                                  EXTRA_HOST_ADDR / EXTRA_HOST_FP and starts tunnel after capture
   .../core/NativeCore.kt         Raw JNI surface; RustCoreBridge = safe wrapper (use this)
   .../ui/client/ClientViewModel  Connect flow, auto-link watcher, liveness watchdog, profile save
@@ -47,7 +48,9 @@ core/                    Rust workspace (see core/README.md)
   peernet-host/tests     Loopback harness - THE quality gate (must pass before device testing)
   peernet-ffi/src/lib.rs JNI bridge: TUN capture + forwarder, engine lifecycle statics,
                          #[cfg(test)] loopback data-path tests (do NOT move to tests/ dir)
-.github/workflows/android.yml   CI: rust test -> .so for 3 ABIs -> assembleDebug -> artifact
+.github/workflows/android.yml   CI: rust test -> .so for 3 ABIs -> 16 KB alignment check
+                                -> assembleDebug -> artifact; unit tests + lint gate
+app/src/test/.../ManifestContractTest.kt  Manifest/FGS-permission contracts (see §10)
 scripts/                 build_rust_android.sh, run_tests.sh, format.sh
 docs/                    HANDOFF.md only real doc; ARCHITECTURE/TESTING/PLAY_STORE placeholders
 ```
@@ -141,15 +144,13 @@ First device test round (two Android phones, host on Wi-Fi) found two blockers, 
 9. Pure-Rust gates all green: handshake, relays, NAT, DNS redirect, concurrency, data-path roundtrip.
 
 ### NOT yet done (the gap)
-- **Retest after M7.6 fixes** (APK from commit `f533bc2` or later) — see §9 for the
-  exact retest script and what the screen must show.
+- **Retest after the M7.7 audit fixes** (APK from commit `be79ae2` or later) — see §9 for
+  the retest script and §10 for what each fix changed on screen.
 - Wi-Fi label may still read "connected without internet" while browsing works — that is
   inherent to the VPN-overlay design (internet rides the VPN, not that network). Success
   criterion = pages load, not the label.
 - Two-name confusion polish: Wi-Fi settings shows group SSID (`DIRECT-xx-PeerNet-…`),
   app shows host device name — same thing twice; unify display later.
-- Host-side FGS notification reported flaky ("not everytime the bar shows up") — needs
-  investigation (battery optimization exemption / START_STICKY behavior).
 - No reconnect/backoff integration between tunnel drops and the Wi-Fi link state machine yet.
 - IPv6 dropped silently (TUN config v4-only).
 - UDP flow table never evicts (no LRU/timeout yet); engine `PENDING_CAP` is the only RAM guard.
@@ -164,7 +165,10 @@ First device test round (two Android phones, host on Wi-Fi) found two blockers, 
    is dup-safe). Reader task owns reads; writer task consumes an unbounded channel of rebuilt
    packets. Do NOT put both readiness waits in one tokio::select! whose handlers touch the same
    AsyncFd — branch futures hold conflicting mutable borrows (compile error).
-3. **protect-before-detach** before handing the fd to Rust; failure aborts with Kotlin still owner.
+3. **Never call `protect()` on the TUN fd.** `protect()` excludes a *socket* from the VPN;
+   on a TUN descriptor it fails (`ENOTSOCK`) and used to abort every tunnel. The
+   routing-loop guard is `addDisallowedApplication(packageName)` on the Builder. Sockets
+   the app opens outside the tunnel are the only legitimate `protect()` targets.
 4. **No panics across FFI**; JNI entry points return flags/null-safe strings; poison-tolerant
    lock access via `.unwrap_or_else(|p| p.into_inner())` everywhere.
 5. **Generation guard:** `ENGINE_GEN` bumps on stop/new-start; handshake tasks and the UDP reply
@@ -201,19 +205,23 @@ First device test round (two Android phones, host on Wi-Fi) found two blockers, 
 
 - Windows dev box: **no local Rust toolchain**, invalid JAVA_HOME — don't build locally;
   push and let CI verify.
+- **The tester has no adb.** Nothing may fail only into logcat: every failure path must
+  end up in `lastError()` / the red status line / the on-screen counters.
 - Device matrix for later: Galaxy M11, J4, Pixel; Android 8/10/12/14+. RTC apps to test:
   Discord, WhatsApp, Meet, Zoom, Telegram, browser, Speedtest.
 
 ## 7. Suggested Plan Going Forward
 
-1. **Retest (next): full internet path with M7.5 fixes.**
-   - Install APK from commit `c959bb2` (or later) on both phones.
-   - Host: Share as before. Client: join via OS Wi-Fi picker + password (the preferred
-     flow), open the app, wait ~4 s for auto-link, confirm QUIC reaches Connected.
-   - Verify browsing/Speedtest through the tunnel; `adb logcat -s PeerNet` if it fails.
+1. **Retest (next): full internet path with the M7.7 audit fixes.**
+   - Install APK from commit `be79ae2` (or later) on both phones; uninstall the old build
+     first, since permission and foreground-service declarations changed.
+   - Host: SHARE. Client: join via OS Wi-Fi picker + password (the preferred flow), open
+     the app, wait ~4 s for auto-link, allow the VPN prompt.
+   - Success = pages load and `in=` climbs in the on-screen counters. The tester has no
+     adb, so every failure must name itself on screen (§9 retest script).
 2. **M8-ish: resilience.** Tunnel reconnect integration with ClientLinkManager backoff;
-   stop-tunnel on P2P disconnect; tunnel stats surfaced in UI; host FGS notification
-   reliability (battery-optimization exemption prompt).
+   stop-tunnel on P2P disconnect; battery-optimization exemption prompt for long hosting
+   sessions (the notification-disappearing bug itself was a state-replay defect, §10.6).
 3. **UX polish pass:** unify naming (one canonical label for the host network in app +
    a hint showing the actual SSID to look for in Wi-Fi settings); explain the
    "without internet" label behavior in-app so it never looks broken.
@@ -223,15 +231,22 @@ First device test round (two Android phones, host on Wi-Fi) found two blockers, 
 5. M10: foreground-service ownership refinements. M11: TESTING.md + device matrix passes.
    M12: PLAY_STORE_NOTES.md, signing, listing. Backlog: Windows client (Phase 2).
 
-Immediate concrete next step: retest with the M7.6 APK (commit `f533bc2` or later) using
-the OS-picker join flow — full script in §9. The on-screen red status line replaces logcat
-for a tester without adb.
+Immediate concrete next step: retest with the M7.7 APK (commit `be79ae2` or later) using
+the OS-picker join flow — full script in §9. The on-screen red status line and the
+`tun=/udp=/tcp=/in=` counters replace logcat for a tester without adb.
 
 ## 8. Verification Checklist for Any Change
 
-- [ ] Push -> CI green (rust test gate + 3-ABI build + assembleDebug + unit tests).
+- [ ] Push -> CI green. The pipeline is: rust `cargo test --release` gate, 3-ABI build,
+      **16 KB page-alignment check on every `.so`**, `assembleDebug`, unit tests
+      (incl. `ManifestContractTest`), **`:app:lintDebug` platform-contract gate**.
+- [ ] Manifest touched? The lint gate and `ManifestContractTest` must both still pass —
+      every declared `foregroundServiceType` needs its matching `uses-permission`, and the
+      VPN service must stay exported with its `android.net.VpnService` intent filter.
 - [ ] New JNI symbols: update BOTH `NativeCore.kt` and `lib.rs` in the same commit.
-- [ ] Never close the TUN fd from Kotlin after successful capture.
+- [ ] Never close the TUN fd from Kotlin after successful capture, and never `protect()` it.
+- [ ] New platform API call? Assume it can throw or no-op silently; make the failure
+      visible on screen (the tester has no adb).
 - [ ] Loopback tests still pass without a device (they are the gate).
 
 ## 9. M7.6 — "linked but no internet" root causes and fixes

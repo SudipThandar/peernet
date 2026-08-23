@@ -109,10 +109,16 @@ fn tun_tx() -> Option<TunTx> {
 static TCP_TERMINATED: AtomicU64 = AtomicU64::new(0);
 static UDP_FORWARDED: AtomicU64 = AtomicU64::new(0);
 
-/// Payloads that came *back* from the host (UDP replies + TCP stream data).
-/// The one number that distinguishes "tunnel works" from "tunnel connected to
-/// a host that cannot reach the internet".
+/// Payloads that came *back* from the host (UDP replies + TCP stream data)
+/// **and reached the TUN**. The one number that distinguishes "tunnel works"
+/// from "tunnel connected to a host that cannot reach the internet".
 static INBOUND: AtomicU64 = AtomicU64::new(0);
+
+/// Replies that arrived from the host but could not be handed to the phone
+/// (unknown flow, or the TUN writer is gone). Nonzero here means the tunnel
+/// is healthy and the *local* delivery path is broken — the two failures look
+/// identical on screen otherwise.
+static UNDELIVERED: AtomicU64 = AtomicU64::new(0);
 
 /// How long the engine's packet forwarder waits for a TUN write channel
 /// (50 ms per try) before giving up on a packet.
@@ -226,6 +232,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunCap
     UDP_FORWARDED.store(0, Ordering::Relaxed);
     TCP_TERMINATED.store(0, Ordering::Relaxed);
     INBOUND.store(0, Ordering::Relaxed);
+    UNDELIVERED.store(0, Ordering::Relaxed);
 
     let owned = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
     let mtu = mtu.clamp(1200, 1500) as usize;
@@ -530,11 +537,15 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
     _class: JClass<'local>,
 ) -> JString<'local> {
     let stats = format!(
-        "tun={} udp={} tcp={} in={}",
+        "tun={} udp={} tcp={} in={} lost={} cap={}",
         PACKETS.load(Ordering::Relaxed),
         UDP_FORWARDED.load(Ordering::Relaxed),
         TCP_TERMINATED.load(Ordering::Relaxed),
         INBOUND.load(Ordering::Relaxed),
+        UNDELIVERED.load(Ordering::Relaxed),
+        // The capture loop dying is invisible otherwise: counters simply stop
+        // moving, which reads as "the phone sent nothing".
+        if CAPTURE_ALIVE.load(Ordering::SeqCst) { "up" } else { "down" },
     );
     create_string(env, &stats)
 }
@@ -645,8 +656,13 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
                 };
                 match guard.try_io(|inner| inner.get_mut().write(&pkt)) {
                     Ok(Ok(_)) => wrote = true,
-                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Ok(Err(_)) | Err(_) => break,
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(Err(_)) => break,
+                    // Same trap as the reader: a full TUN queue arrives as
+                    // Err(TryIoError) with readiness cleared. Retry after the
+                    // next writability event instead of killing the writer,
+                    // which would silently strand every inbound reply.
+                    Err(_) => continue,
                 }
             }
             if !wrote {
@@ -684,8 +700,16 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
                     ));
                 }
             }
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Ok(Err(_)) | Err(_) => break,
+            // A signal-interrupted read is not a dead interface.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(_)) => break,
+            // `try_io` intercepts WouldBlock itself: the closure's EAGAIN is
+            // reported as Err(TryIoError) after clearing readiness, NOT as
+            // Ok(Err(WouldBlock)). Treating it as fatal used to end the whole
+            // capture after the very first packet (tun=1 forever, so every DNS
+            // retry and TCP SYN sat unread in the TUN queue). Readiness was
+            // cleared, so the next await blocks until real data arrives.
+            Err(_) => continue,
         }
     }
 
@@ -815,15 +839,24 @@ fn deliver_udp_reply(src_port: u16, payload: &[u8]) {
         .unwrap_or_else(|p| p.into_inner())
         .get(&src_port)
         .copied();
-    let Some(flow) = flow else { return };
-    let Some(tx) = tun_tx() else { return };
-    INBOUND.fetch_add(payload.len() as u64, Ordering::Relaxed);
+    let Some(flow) = flow else {
+        UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let Some(tx) = tun_tx() else {
+        UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     let packet = build_udp_packet(
         (Ipv4Addr::from(flow.dst_ip), flow.dst_port),
         (Ipv4Addr::from(flow.local_ip), src_port),
         payload,
     );
-    let _ = tx.send(packet);
+    if tx.send(packet).is_err() {
+        UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    INBOUND.fetch_add(payload.len() as u64, Ordering::Relaxed);
 }
 
 /// Test/advanced hook: publish a reply channel before starting a tunnel so
@@ -867,7 +900,6 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        INBOUND.fetch_add((datagram.len() - off) as u64, Ordering::Relaxed);
         // hdr.dst_* is the real remote peer that produced this data, but
         // the phone must see replies from its ORIGINAL destination (the
         // flow table records it) - critical for the virtual DNS IP.
@@ -876,8 +908,14 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
             .unwrap_or_else(|p| p.into_inner())
             .get(&hdr.src_port)
             .copied();
-        let Some(flow) = local_src else { continue };
-        let Some(tx) = tun_tx() else { continue };
+        let Some(flow) = local_src else {
+            UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let Some(tx) = tun_tx() else {
+            UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
         let packet = build_udp_packet(
             (
                 Ipv4Addr::from(flow.dst_ip),
@@ -887,8 +925,13 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
             &datagram[off..],
         );
         if tx.send(packet).is_err() {
+            // The writer half is gone: nothing can reach the phone anymore.
+            UNDELIVERED.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // Counted only once the bytes are queued for the TUN. Counting them
+        // on arrival made `in=` claim success while the reply was stranded.
+        INBOUND.fetch_add((datagram.len() - off) as u64, Ordering::Relaxed);
     }
 }
 
@@ -1152,6 +1195,11 @@ mod tests {
     const CLIENT_TUN_IP: [u8; 4] = [10, 215, 17, 2];
     const CLIENT_SRC_PORT: u16 = 54321;
 
+    /// The engine's statics (counters, TUN_TX, CAPTURE_FDS, TUN_STOP) are
+    /// process-global, so tests that drive a capture session or install a reply
+    /// channel must not overlap — cargo runs tests in parallel by default.
+    static ENGINE_LOCK: Mutex<()> = Mutex::new(());
+
     /// The host engine is started from a JNI thread, which has no tokio
     /// context. quinn needs one to register its UDP socket, so binding must
     /// enter the engine runtime itself. Regression guard for the defect that
@@ -1192,6 +1240,88 @@ mod tests {
         );
     }
 
+    /// The capture loop must survive an idle gap between packets.
+    ///
+    /// `AsyncFd::try_io` reports the closure's EAGAIN as `Err(TryIoError)`
+    /// (after clearing readiness), *not* as `Ok(Err(WouldBlock))`. Treating
+    /// that as fatal ended the capture right after the first packet, so the
+    /// phone's later DNS retries and TCP SYNs were never read: on-device
+    /// counters froze at `tun=1` and the tunnel looked dead while QUIC was
+    /// perfectly healthy.
+    ///
+    /// A socketpair stands in for the TUN: writing packet #2 only after the
+    /// reader has already drained packet #1 forces the EAGAIN path in between.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_survives_an_idle_gap_between_packets() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut fds = [0i32; 2];
+        // SOCK_SEQPACKET keeps datagram boundaries like a TUN does.
+        let rc = unsafe {
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr())
+        };
+        assert_eq!(rc, 0, "socketpair failed");
+        let phone_side = fds[0];
+        let tun_side = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+        PACKETS.store(0, Ordering::Relaxed);
+        UDP_FORWARDED.store(0, Ordering::Relaxed);
+        TUN_STOP.store(false, Ordering::SeqCst);
+
+        tokio::spawn(async move { run_capture(tun_side, 1500).await });
+
+        // No tunnel client is installed, so forwarding is a no-op; PACKETS is
+        // what proves the loop kept reading.
+        let packet = build_udp_packet(
+            (Ipv4Addr::from(CLIENT_TUN_IP), CLIENT_SRC_PORT),
+            (Ipv4Addr::new(10, 215, 17, 1), 53),
+            b"query",
+        );
+
+        for i in 0..3 {
+            let sent = unsafe {
+                libc::send(
+                    phone_side,
+                    packet.as_ptr() as *const libc::c_void,
+                    packet.len(),
+                    0,
+                )
+            };
+            assert!(sent > 0, "send #{i} failed");
+
+            // Let the reader drain and hit EAGAIN before the next packet.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while PACKETS.load(Ordering::Relaxed) < (i + 1) as u64 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "capture stopped reading after {} packet(s)",
+                    PACKETS.load(Ordering::Relaxed)
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+
+        assert_eq!(PACKETS.load(Ordering::Relaxed), 3, "all packets must be read");
+        assert!(
+            CAPTURE_ALIVE.load(Ordering::SeqCst),
+            "capture must still be alive after idle gaps"
+        );
+
+        // Leave the globals as they were found: closing the peer makes the
+        // reader see EOF and shut the session down cleanly.
+        unsafe { libc::close(phone_side) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while CAPTURE_ALIVE.load(Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        TUN_STOP.store(false, Ordering::SeqCst);
+    }
+
     fn start_echo() -> SocketAddr {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind echo");
         let addr = sock.local_addr().unwrap();
@@ -1208,6 +1338,7 @@ mod tests {
     /// host NAT -> echo socket -> reply pump -> rebuilt IPv4/UDP packet.
     #[tokio::test(flavor = "multi_thread")]
     async fn udp_roundtrip_through_host_nat() {
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let echo_addr = start_echo();
 
         let server =
