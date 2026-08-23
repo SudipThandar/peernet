@@ -136,7 +136,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     let std_file = std::fs::File::from(file);
     let _ = set_nonblocking(std_file.as_raw_fd());
 
-    let async_fd = match AsyncFd::new(std_file) {
+    let mut async_fd = match AsyncFd::new(std_file) {
         Ok(a) => a,
         Err(_) => {
             close_current();
