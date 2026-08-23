@@ -317,8 +317,7 @@ async fn service_stream(
         // TCP relay: first frame on a stream carries a PN TCP header; the
         // rest of the stream is raw payload piped to the real destination.
         if frame.kind == MessageKind::Data {
-            if TcpRelayHeader::decode(&frame.payload).is_ok() {
-                let (hdr, _) = TcpRelayHeader::decode(&frame.payload)?;
+            if let Ok((hdr, _start)) = TcpRelayHeader::decode(&frame.payload) {
                 tcp_relay(tx, rx, hdr, stats.clone()).await;
                 return;
             }
