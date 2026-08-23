@@ -224,10 +224,17 @@ impl TcpStack {
                 IpAddress::Ipv4(Ipv4Address::new(10, 215, 17, 254)),
                 32,
             ));
+            // Whitequark's transparent-stack trick (smoltcp#516): a /0 local
+            // prefix makes every destination locally deliverable. Kept AFTER
+            // the specific address so source selection prefers real IPs.
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 1)), // 0.0.0.1
+                0,
+            ));
         });
         let _ = iface
             .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::new(10, 215, 17, 253));
+            .add_default_ipv4_route(Ipv4Address::new(0, 0, 0, 1));
         // Flows target arbitrary internet addresses that are not our local
         // IP; AnyIP makes the interface accept them so listeners can match.
         iface.set_any_ip(true);
@@ -252,24 +259,12 @@ impl TcpStack {
     /// Blocking engine loop. Runs until the upstream channel receiver is
     /// dropped or all packet producers hang up.
     pub fn run(mut self) {
-        loop {
-            let now = self.now();
-            self.drain_incoming(now);
+        while self.upstream_alive {
+            self.step();
             if !self.upstream_alive {
                 return;
             }
-
-            let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
-
-            self.flush_device_output();
-            self.drain_from_upstream();
-            self.pump_flows();
-
-            if !self.upstream_alive {
-                return;
-            }
-
-            match self.iface.poll_delay(now, &self.sockets) {
+            match self.iface.poll_delay(self.now(), &self.sockets) {
                 // Cap sleeps at ~5 ms regardless of what smoltcp suggests;
                 // latency matters more than a little extra CPU here.
                 Some(d) => {
@@ -279,6 +274,22 @@ impl TcpStack {
                 None => std::thread::sleep(Duration::from_millis(2)),
             }
         }
+    }
+
+    /// One engine iteration: ingest queued packets, advance the stack,
+    /// emit outputs. Split out so tests can drive deterministically.
+    pub(crate) fn step(&mut self) {
+        let now = self.now();
+        self.drain_incoming(now);
+        if !self.upstream_alive {
+            return;
+        }
+
+        let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
+
+        self.flush_device_output();
+        self.drain_from_upstream();
+        self.pump_flows();
     }
 
     fn now(&self) -> SmolInstant {
@@ -757,5 +768,87 @@ mod tests {
         assert_eq!(got.len(), payload.len(), "echo returned everything");
         assert_eq!(got, payload, "bulk payload intact");
         h.shutdown();
+    }
+
+    // -- deterministic, single-threaded diagnostics --------------------------
+
+    fn checksum_words(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += (data[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Hand-crafted IPv4+TCP SYN with valid checksums.
+    fn build_syn(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> Vec<u8> {
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 6;
+        ip[12..16].copy_from_slice(&src);
+        ip[16..20].copy_from_slice(&dst);
+        let c = checksum_words(&ip);
+        ip[10..12].copy_from_slice(&c.to_be_bytes());
+
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&sport.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dport.to_be_bytes());
+        tcp[4..8].copy_from_slice(&1000u32.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = TCP_SYN;
+        tcp[14..16].copy_from_slice(&8192u16.to_be_bytes());
+
+        let mut pseudo = Vec::with_capacity(12 + tcp.len());
+        pseudo.extend_from_slice(&src);
+        pseudo.extend_from_slice(&dst);
+        pseudo.extend_from_slice(&[0, 6]);
+        pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(&tcp);
+        let c = checksum_words(&pseudo);
+        tcp[16..18].copy_from_slice(&c.to_be_bytes());
+
+        ip.extend_from_slice(&tcp);
+        ip
+    }
+
+    #[test]
+    fn syn_produces_synack_without_threads() {
+        let (pkt_out_tx, pkt_out_rx) = mpsc::channel();
+        let (to_up_tx, _to_up_rx) = mpsc::channel::<ToUpstream>();
+        let (mut st, pkt_in_tx, _up_tx) =
+            TcpStack::channels(pkt_out_tx, to_up_tx);
+
+        pkt_in_tx
+            .send(build_syn(PHONE_IP, REMOTE_IP, 40001, 443))
+            .unwrap();
+
+        st.step();
+        eprintln!("after step1: flows={:?} rxq={} listeners_ok", st.flows.keys().collect::<Vec<_>>(), st.device.rx_queue.borrow().len());
+        for _ in 0..3 {
+            st.step();
+        }
+        eprintln!("txq after steps: {}", st.device.tx_queue.borrow().len());
+
+        match pkt_out_rx.try_recv() {
+            Ok(reply) => {
+                eprintln!("reply len={} flags=0x{:02x}", reply.len(), reply[33]);
+                assert!(reply.len() >= 40);
+                assert_eq!(&reply[12..16], &REMOTE_IP);
+                assert_eq!(&reply[16..20], &PHONE_IP);
+                assert_eq!(reply[33], TCP_SYN | TCP_ACK, "must be SYN-ACK");
+            }
+            Err(e) => panic!("no SYN-ACK produced: {e}; flows={:?}", st.flows.keys().collect::<Vec<_>>()),
+        }
     }
 }
