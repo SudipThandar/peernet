@@ -188,6 +188,14 @@ impl TunnelClient {
         self.session_id.load(Ordering::Acquire)
     }
 
+    /// Direct access to the underlying QUIC connection for advanced users
+    /// (e.g. the TUN forwarder that streams relay datagrams in both
+    /// directions). The public helpers above remain the simple path.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+
     pub fn state(&self) -> ClientState {
         *self._state_rx.borrow()
     }
