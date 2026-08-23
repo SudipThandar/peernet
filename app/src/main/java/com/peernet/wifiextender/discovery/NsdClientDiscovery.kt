@@ -32,6 +32,7 @@ class NsdClientDiscovery(context: Context) {
     ): List<DiscoveredHost> = suspendCancellableCoroutine { cont ->
         val found = LinkedHashMap<String, DiscoveredHost>()
         val finished = AtomicBoolean(false)
+        val resolving = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
 
         var discoveryListener: NsdManager.DiscoveryListener? = null
@@ -49,10 +50,12 @@ class NsdClientDiscovery(context: Context) {
         val resolveListener = object : NsdManager.ResolveListener {
             override fun onResolveFailed(info: NsdServiceInfo?, errorCode: Int) {
                 Timber.w("NSD resolve failed: %d", errorCode)
+                resolving.set(false)
             }
 
             @Suppress("DEPRECATION")
             override fun onServiceResolved(info: NsdServiceInfo?) {
+                resolving.set(false)
                 info ?: return
                 Timber.d("NSD resolved host: %s", info.serviceName)
                 @Suppress("DEPRECATION")
@@ -74,7 +77,11 @@ class NsdClientDiscovery(context: Context) {
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo?) {
                 serviceInfo ?: return
+                // NsdManager permits a single in-flight resolve; extra calls
+                // fail with FAILURE_ALREADY_ACTIVE and would poison the round.
+                if (!resolving.compareAndSet(false, true)) return
                 runCatching { nsdManager.resolveService(serviceInfo, resolveListener) }
+                    .onFailure { resolving.set(false) }
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo?) {

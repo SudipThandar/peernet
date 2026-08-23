@@ -10,6 +10,7 @@ import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,8 +33,9 @@ data class ClientUiState(
 )
 
 /**
- * Client logic — strictly on-demand:
- * nothing scans until the user taps CONNECT.
+ * Client logic — discovery runs when the user taps CONNECT and automatically
+ * whenever this device joins a Wi-Fi Direct network (reconnect case): once a
+ * known host's network is joined, linking happens without further taps.
  */
 @HiltViewModel
 class ClientViewModel @Inject constructor(
@@ -52,16 +54,28 @@ class ClientViewModel @Inject constructor(
 
     init {
         _uiState.update { it.copy(savedHostIds = loadSavedHostIds()) }
+        viewModelScope.launch {
+            var wasJoined = false
+            wifiDirect.state.collect { s ->
+                val joined = s.joinedAsClient && !s.hosting
+                if (joined && !wasJoined) autoLink()
+                if (!joined && wasJoined && !s.hosting && _uiState.value.connectedHost != null) {
+                    // Host tore down the group; drop the stale link.
+                    linkManager.setLinked(null)
+                    _uiState.update { it.copy(connectedHost = null, status = "Host disconnected.") }
+                }
+                wasJoined = joined
+            }
+        }
     }
 
     /** Live TUN capture counter for the UI (0 when not capturing). */
     fun packetCount(): Long = rustCore.tunPacketCount()
 
-    fun isVpnCaptureActive(): Boolean = rustCore.isAvailable && _uiState.value.connectedHost != null
-
     /**
      * One explicit round: scan current network -> link to the first
      * PeerNet host found. Called only from the CONNECT button.
+     * Runs several NSD rounds because mDNS after a fresh join needs time.
      */
     fun connectNow() {
         if (!busy.compareAndSet(false, true)) return
@@ -70,8 +84,8 @@ class ClientViewModel @Inject constructor(
         }
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                val hosts = runCatching { discovery.discoverOnce() }.getOrDefault(emptyList())
-                val target = hosts.firstOrNull()
+                wifiDirect.acquireMulticast()
+                val target = findVerifiedHost(rounds = MANUAL_ROUNDS)
                 if (target == null) {
                     _uiState.update {
                         it.copy(
@@ -85,30 +99,68 @@ class ClientViewModel @Inject constructor(
                     link(target)
                 }
             } finally {
+                wifiDirect.releaseMulticast()
                 busy.set(false)
             }
         }
     }
 
-    private fun link(host: DiscoveredHost) {
-        _uiState.update { it.copy(status = "Connecting to ${host.name}…") }
+    /**
+     * Rising edge of "joined a Wi-Fi Direct group as client" (includes app
+     * cold-start while already joined). Probes with patience so slow mDNS
+     * propagation after a fresh join cannot produce a false "not available".
+     */
+    private fun autoLink() {
+        if (_uiState.value.connectedHost != null) return
+        if (!busy.compareAndSet(false, true)) return
         viewModelScope.launch(Dispatchers.Default) {
-            val ok = probe(host)
-            if (ok) {
-                saveProfile(host)
-                linkManager.setLinked(host)
+            try {
+                wifiDirect.acquireMulticast()
                 _uiState.update {
-                    it.copy(
-                        connectedHost = host,
-                        savedHostIds = loadSavedHostIds(),
-                        status = "Linked to ${host.name}."
-                    )
+                    it.copy(searching = true, status = "PeerNet network detected — looking for host…")
                 }
-            } else {
-                _uiState.update {
-                    it.copy(status = "Found ${host.name} but could not reach it. Make sure the host phone is still sharing.")
+                val target = findVerifiedHost(rounds = AUTO_ROUNDS)
+                if (target != null) {
+                    _uiState.update { it.copy(searching = false) }
+                    link(target)
+                } else {
+                    // Stay quiet: the user can always tap CONNECT manually.
+                    _uiState.update { it.copy(searching = false, status = "") }
                 }
+            } finally {
+                wifiDirect.releaseMulticast()
+                busy.set(false)
             }
+        }
+    }
+
+    /**
+     * Up to [rounds] NSD rounds; returns the first host whose link banner
+     * verifies. Unreachable entries are retried in later rounds instead of
+     * consuming the whole attempt.
+     */
+    private suspend fun findVerifiedHost(rounds: Int): DiscoveredHost? {
+        repeat(rounds) { attempt ->
+            val hosts = runCatching { discovery.discoverOnce(timeoutMs = ROUND_TIMEOUT_MS) }
+                .getOrDefault(emptyList())
+            for (host in hosts) {
+                if (probe(host)) return host
+            }
+            Timber.d("Round %d/%d: %d hosts advertised, none verified", attempt + 1, rounds, hosts.size)
+            if (attempt < rounds - 1) delay(ROUND_GAP_MS)
+        }
+        return null
+    }
+
+    private fun link(host: DiscoveredHost) {
+        saveProfile(host)
+        linkManager.setLinked(host)
+        _uiState.update {
+            it.copy(
+                connectedHost = host,
+                savedHostIds = loadSavedHostIds(),
+                status = "Linked to ${host.name}."
+            )
         }
     }
 
@@ -170,5 +222,9 @@ class ClientViewModel @Inject constructor(
     companion object {
         private const val PREFS = "peernet_client_profiles"
         private const val KEY_PROFILES = "profiles"
+        private const val MANUAL_ROUNDS = 3
+        private const val AUTO_ROUNDS = 8
+        private const val ROUND_TIMEOUT_MS = 4_000L
+        private const val ROUND_GAP_MS = 1_200L
     }
 }

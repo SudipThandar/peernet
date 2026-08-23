@@ -60,8 +60,16 @@ class PeerNetVpnService : VpnService() {
 
         val started = rustCore.startTunCapture(fd, MTU)
         if (!started) {
-            Timber.w("Rust refused TUN capture; stopping")
-            stopTunnel()
+            // Kotlin detached this fd, so it is ours to close — otherwise it
+            // leaks (Rust only closes the fd it actually accepted). Also tear
+            // down any stale capture that caused the refusal so the next
+            // start attempt begins from a clean slate.
+            Timber.w("Rust refused TUN capture; resetting engine state")
+            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+            runCatching { rustCore.stopTunCapture() }
+            tunFd = -1
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
             return START_NOT_STICKY
         }
 

@@ -41,8 +41,9 @@ import com.peernet.wifiextender.util.Permissions
  *  SHARE   – share this phone's internet (host)
  *  CONNECT – link to a host whose Wi-Fi Direct network you joined (client)
  *
- * Flow: join DIRECT-xx in phone settings with its password, open PeerNet,
- * it detects and links automatically.
+ * Flow: first time, join the DIRECT-xx network in phone settings with its
+ * password. On later shares the network is remembered by the OS and the app
+ * detects + links automatically; CONNECT stays as a manual fallback.
  */
 @Composable
 fun HomeScreen(
@@ -95,7 +96,12 @@ fun HomeScreen(
     }
 
     LaunchedEffect(client.connectedHost?.hostId) {
-        if (client.connectedHost == null) return@LaunchedEffect
+        if (client.connectedHost == null) {
+            // Covers host-initiated teardown, not just manual disconnect:
+            // a dead link must never keep the TUN up.
+            stopVpn()
+            return@LaunchedEffect
+        }
         val prepare = android.net.VpnService.prepare(context)
         if (prepare != null) {
             vpnLauncher.launch(prepare)

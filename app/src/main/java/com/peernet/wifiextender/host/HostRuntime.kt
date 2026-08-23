@@ -47,9 +47,12 @@ class HostRuntime @Inject constructor(
     fun canStart(): Boolean = Permissions.missing(context).isEmpty()
 
     fun startSharing() {
+        val shortId = HostIdentity.shortId(context)
+
         // Brand the Wi-Fi Direct identity so clients see "PeerNet-xxxx",
-        // not the owner's personal device name.
-        wifiDirect.setDeviceName("PeerNet-${HostIdentity.shortId(context)}")
+        // not the owner's personal device name. Reflection-based; no-op where
+        // the platform blocks it (API 33+ brands via explicit group SSID below).
+        wifiDirect.setDeviceName("PeerNet-$shortId")
 
         // Foreground service keeps hosting alive when the app is backgrounded
         // or swiped away (Section 18.1). Must be started before/with hosting.
@@ -60,13 +63,24 @@ class HostRuntime @Inject constructor(
             context.startService(intent)
         }
 
-        wifiDirect.startHosting()
+        // Keep mDNS queries from clients reachable: Wi-Fi power save drops
+        // multicast frames on P2P groups otherwise.
+        wifiDirect.acquireMulticast()
+
+        // Stable group credentials (honored on API 33+): the network always
+        // appears as DIRECT-PeerNet-xxxx with an unchanging passphrase, so a
+        // client that joined once auto-rejoins on every future share.
+        wifiDirect.startHosting(
+            ssid = "DIRECT-PeerNet-$shortId",
+            passphrase = "pn-${HostIdentity.id(context)}"
+        )
     }
 
     fun stopSharing() {
         linkServer.stop()
         advertiser.unregister()
         wifiDirect.stopHosting()
+        wifiDirect.releaseMulticast()
         context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java))
     }
 }

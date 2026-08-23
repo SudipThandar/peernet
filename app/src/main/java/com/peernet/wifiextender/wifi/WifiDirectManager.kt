@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pGroup
@@ -53,6 +54,9 @@ class WifiDirectManager @Inject constructor(
     private var channel: WifiP2pManager.Channel? = null
     private var receiverRegistered = false
     private var pendingCreate = false
+    private var requestedSsid: String? = null
+    private var requestedPassphrase: String? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     private val _state = MutableStateFlow(WifiDirectState(p2pSupported = manager != null))
     val state: StateFlow<WifiDirectState> = _state.asStateFlow()
@@ -202,16 +206,25 @@ class WifiDirectManager @Inject constructor(
     /**
      * Creates this device as a Wi-Fi Direct Group Owner (Section 14.2):
      * remove stale group first, retry-once semantics handled by caller UI.
+     *
+     * When [ssid]/[passphrase] are provided and the platform supports it
+     * (API 33+), the group is created with those exact credentials so the
+     * network shows up as "DIRECT-PeerNet-xxxx" in Wi-Fi settings and stays
+     * stable across shares — clients that joined once auto-rejoin. On older
+     * builds the credentials are system-chosen; the reflection-based device
+     * rename remains the only branding path there.
      */
-    fun startHosting() {
+    fun startHosting(ssid: String? = null, passphrase: String? = null) {
         val mgr = manager
         val ch = channel
         if (mgr == null || ch == null) {
             _state.update { it.copy(error = "Wi-Fi Direct is not available on this device.") }
             return
         }
-        Timber.i("Starting Wi-Fi Direct hosting")
+        Timber.i("Starting Wi-Fi Direct hosting (ssid=%s)", ssid ?: "<system>")
         _state.update { it.copy(error = null, creating = true) }
+        requestedSsid = ssid
+        requestedPassphrase = passphrase
         pendingCreate = true
 
         mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
@@ -223,6 +236,8 @@ class WifiDirectManager @Inject constructor(
     fun stopHosting() {
         Timber.i("Stopping Wi-Fi Direct hosting")
         pendingCreate = false
+        requestedSsid = null
+        requestedPassphrase = null
 
         // Optimistic immediate reset: UI and services must react instantly even
         // if the platform removeGroup callback never arrives (OEM quirk guard).
@@ -239,27 +254,70 @@ class WifiDirectManager @Inject constructor(
     }
 
     private fun createGroup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel) {
-        @Suppress("DEPRECATION")
-        mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Timber.i("Wi-Fi Direct group created")
-                pendingCreate = false
-                _state.update { it.copy(creating = false, hosting = true, error = null) }
-                refreshGroupInfo()
+        // Local copies: mutable properties cannot be smart-cast to non-null.
+        val ssid = requestedSsid
+        val passphrase = requestedPassphrase
+        val customConfig: WifiP2pConfig? = if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !ssid.isNullOrEmpty() && !passphrase.isNullOrEmpty()
+        ) {
+            try {
+                WifiP2pConfig.Builder()
+                    .setNetworkName(ssid)
+                    .setPassphrase(passphrase)
+                    .build()
+            } catch (t: Throwable) {
+                Timber.w(t, "custom group config rejected; falling back to system credentials")
+                null
             }
+        } else {
+            null
+        }
 
-            override fun onFailure(reason: Int) {
-                Timber.w("createGroup failed: %d", reason)
-                pendingCreate = false
-                _state.update {
-                    it.copy(
-                        creating = false,
-                        hosting = false,
-                        error = "Could not create the local network: ${reasonText(reason)}. Retrying may help."
-                    )
-                }
+        if (customConfig != null) {
+            mgr.createGroup(ch, customConfig, groupListener(mgr, ch))
+        } else {
+            @Suppress("DEPRECATION")
+            mgr.createGroup(ch, groupListener(mgr, ch))
+        }
+    }
+
+    /**
+     * Shared success/failure handling for both createGroup variants. A failed
+     * custom-credential attempt falls back once to the legacy call so hosting
+     * still works on builds that reject explicit group names.
+     */
+    private fun groupListener(
+        mgr: WifiP2pManager,
+        ch: WifiP2pManager.Channel
+    ): WifiP2pManager.ActionListener = object : WifiP2pManager.ActionListener {
+        override fun onSuccess() {
+            Timber.i("Wi-Fi Direct group created")
+            pendingCreate = false
+            _state.update { it.copy(creating = false, hosting = true, error = null) }
+            refreshGroupInfo()
+        }
+
+        override fun onFailure(reason: Int) {
+            if (requestedSsid != null || requestedPassphrase != null) {
+                Timber.w("createGroup(custom) failed: %d — retrying with system credentials", reason)
+                requestedSsid = null
+                requestedPassphrase = null
+                pendingCreate = true
+                @Suppress("DEPRECATION")
+                mgr.createGroup(ch, groupListener(mgr, ch))
+                return
             }
-        })
+            Timber.w("createGroup failed: %d", reason)
+            pendingCreate = false
+            _state.update {
+                it.copy(
+                    creating = false,
+                    hosting = false,
+                    error = "Could not create the local network: ${reasonText(reason)}. Retrying may help."
+                )
+            }
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -323,6 +381,37 @@ class WifiDirectManager @Inject constructor(
                 passphraseAvailable = true,
                 groupOwnerAddress = null
             )
+        }
+    }
+
+    /**
+     * Multicast reception guard. Without it, Wi-Fi power save silently drops
+     * mDNS frames on P2P groups and discovery "randomly" finds nothing.
+     * Non-refcounted: acquire/release are idempotent across both roles
+     * (host advertises, client discovers) which never run simultaneously.
+     */
+    fun acquireMulticast(): Boolean {
+        multicastLock?.let { return it.isHeld }
+        val wm = context.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return false
+        return try {
+            val lock = wm.createMulticastLock("peernet-mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            multicastLock = lock
+            true
+        } catch (t: Throwable) {
+            Timber.w(t, "multicast lock unavailable")
+            false
+        }
+    }
+
+    fun releaseMulticast() {
+        val lock = multicastLock ?: return
+        try {
+            if (lock.isHeld) lock.release()
+        } catch (t: Throwable) {
+            Timber.w(t, "multicast lock release failed")
         }
     }
 
