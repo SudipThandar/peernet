@@ -155,6 +155,8 @@ class WifiDirectManager @Inject constructor(
                     _state.update { it.copy(error = "Join failed: ${reasonText(reason)}") }
                 }
             })
+        } catch (e: SecurityException) {
+            reportP2pDenied("connect", e)
         } catch (t: Throwable) {
             Timber.w(t, "connectToPeer threw")
             _state.update { it.copy(error = "Join failed unexpectedly. Please retry.") }
@@ -219,6 +221,9 @@ class WifiDirectManager @Inject constructor(
                 }
             })
             true
+        } catch (e: SecurityException) {
+            reportP2pDenied("connect(byCredentials)", e)
+            false
         } catch (t: Throwable) {
             Timber.w(t, "joinByCredentials threw")
             false
@@ -226,23 +231,21 @@ class WifiDirectManager @Inject constructor(
     }
 
     /**
-     * Runs a Wi-Fi Direct call that the platform guards with
-     * NEARBY_WIFI_DEVICES / location. Those throw SecurityException when the
-     * grant is missing or revoked mid-session, and an uncaught throw here
-     * looks to the user like the app doing nothing at all — so it becomes a
-     * visible error instead.
+     * Reports a Wi-Fi Direct call rejected for a missing NEARBY_WIFI_DEVICES /
+     * location grant. Every guarded call catches SecurityException explicitly:
+     * the grant can be revoked mid-session, and an uncaught throw there looks
+     * to the user like the app simply doing nothing.
+     *
+     * Note this cannot be a helper that wraps a lambda — lint only credits a
+     * catch clause in the same method as the guarded call.
      */
-    private inline fun p2pCall(what: String, block: () -> Unit) {
-        try {
-            block()
-        } catch (e: SecurityException) {
-            Timber.w(e, "%s rejected for missing Wi-Fi Direct permission", what)
-            _state.update {
-                it.copy(
-                    creating = false,
-                    error = "Wi-Fi Direct permission was denied. Allow \"Nearby devices\" for PeerNet in Settings."
-                )
-            }
+    private fun reportP2pDenied(what: String, e: SecurityException) {
+        Timber.w(e, "%s rejected for missing Wi-Fi Direct permission", what)
+        _state.update {
+            it.copy(
+                creating = false,
+                error = "Wi-Fi Direct permission was denied. Allow \"Nearby devices\" for PeerNet in Settings."
+            )
         }
     }
 
@@ -250,12 +253,14 @@ class WifiDirectManager @Inject constructor(
     fun leaveCurrentGroup() {
         val mgr = manager ?: return
         val ch = channel ?: return
-        p2pCall("removeGroup") {
+        try {
             @Suppress("DEPRECATION")
             mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {}
                 override fun onFailure(reason: Int) {}
             })
+        } catch (e: SecurityException) {
+            reportP2pDenied("removeGroup", e)
         }
     }
 
@@ -283,11 +288,13 @@ class WifiDirectManager @Inject constructor(
         requestedPassphrase = passphrase
         pendingCreate = true
 
-        p2pCall("removeGroup(before create)") {
+        try {
             mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() = createGroup(mgr, ch)
                 override fun onFailure(reason: Int) = createGroup(mgr, ch)
             })
+        } catch (e: SecurityException) {
+            reportP2pDenied("removeGroup(before create)", e)
         }
     }
 
@@ -304,12 +311,14 @@ class WifiDirectManager @Inject constructor(
         val mgr = manager
         val ch = channel
         if (mgr == null || ch == null) return
-        p2pCall("removeGroup(stop)") {
+        try {
             @Suppress("DEPRECATION")
             mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {}
                 override fun onFailure(reason: Int) {}
             })
+        } catch (e: SecurityException) {
+            reportP2pDenied("removeGroup(stop)", e)
         }
     }
 
@@ -334,13 +343,15 @@ class WifiDirectManager @Inject constructor(
             null
         }
 
-        p2pCall("createGroup") {
+        try {
             if (customConfig != null) {
                 mgr.createGroup(ch, customConfig, groupListener(mgr, ch))
             } else {
                 @Suppress("DEPRECATION")
                 mgr.createGroup(ch, groupListener(mgr, ch))
             }
+        } catch (e: SecurityException) {
+            reportP2pDenied("createGroup", e)
         }
     }
 
@@ -366,9 +377,11 @@ class WifiDirectManager @Inject constructor(
                 requestedSsid = null
                 requestedPassphrase = null
                 pendingCreate = true
-                p2pCall("createGroup(fallback)") {
+                try {
                     @Suppress("DEPRECATION")
                     mgr.createGroup(ch, groupListener(mgr, ch))
+                } catch (e: SecurityException) {
+                    reportP2pDenied("createGroup(fallback)", e)
                 }
                 return
             }
