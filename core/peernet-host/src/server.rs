@@ -199,7 +199,15 @@ async fn handle_connection(
                             #[allow(clippy::needless_borrows_for_generic_args)]
                             let (hdr, start) = match peernet_proto::UdpRelayHeader::decode(&data) {
                                 Ok(x) => x,
-                                Err(_) => continue, // not a relay datagram; ignore
+                                Err(e) => {
+                                    #[cfg(test)]
+                                    eprintln!(
+                                        "[nat-diag] decode failed: {e} len={} head={:?}",
+                                        data.len(),
+                                        &data[..data.len().min(24)]
+                                    );
+                                    continue;
+                                }
                             };
                             #[cfg(test)]
                             eprintln!(
