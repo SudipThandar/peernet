@@ -196,10 +196,19 @@ async fn handle_connection(
                     _ = shutdown.changed() => break,
                     dgram = conn.read_datagram() => match dgram {
                         Ok(data) => {
+                            #[allow(clippy::needless_borrows_for_generic_args)]
                             let (hdr, start) = match peernet_proto::UdpRelayHeader::decode(&data) {
                                 Ok(x) => x,
                                 Err(_) => continue, // not a relay datagram; ignore
                             };
+                            #[cfg(test)]
+                            eprintln!(
+                                "[nat-diag] in len={} start={} hdr={:?} head={:?}",
+                                data.len(),
+                                start,
+                                hdr,
+                                &data[..data.len().min(20)]
+                            );
                             let payload = &data[start..];
                             stats.record_down(payload.len() as u64);
 
@@ -420,6 +429,8 @@ async fn pump_udp_replies(
             Ok(x) => x,
             Err(_) => break,
         };
+        #[cfg(test)]
+        eprintln!("[pump-diag] recv n={} peer={}", n, peer);
         stats.record_down(n as u64);
         let src_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let hdr = peernet_proto::UdpRelayHeader {
