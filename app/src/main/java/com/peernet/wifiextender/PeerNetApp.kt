@@ -22,8 +22,34 @@ class PeerNetApp : Application() {
             Timber.plant(Timber.DebugTree())
         }
 
+        recordCrashesForNextLaunch()
+
         // Constraint 8: notification channels must be created at app startup, never lazily.
         createNotificationChannels()
+    }
+
+    /**
+     * Persists the reason for any crash so the next launch can show it.
+     *
+     * The tester has no adb, so a crash was previously indistinguishable from
+     * "the tunnel stopped working" — and a sticky service that crashes on start
+     * loops invisibly, showing up only as data counters resetting.
+     */
+    private fun recordCrashesForNextLaunch() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            runCatching {
+                val where = error.stackTrace.firstOrNull()
+                    ?.let { " at ${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" }
+                    .orEmpty()
+                val message = "${error.javaClass.simpleName}: ${error.message.orEmpty().take(180)}$where"
+                getSharedPreferences(CRASH_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_LAST_CRASH, "[${thread.name}] $message")
+                    .commit() // synchronous: the process is about to die
+            }
+            previous?.uncaughtException(thread, error)
+        }
     }
 
     private fun createNotificationChannels() {
@@ -58,5 +84,20 @@ class PeerNetApp : Application() {
     companion object {
         const val CHANNEL_HOST = "peernet_host"
         const val CHANNEL_TUNNEL = "peernet_tunnel"
+
+        private const val CRASH_PREFS = "peernet_diagnostics"
+        private const val KEY_LAST_CRASH = "last_crash"
+
+        /** Last recorded crash, or null. Cleared once the user has seen it. */
+        fun lastCrash(context: Context): String? =
+            context.getSharedPreferences(CRASH_PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_LAST_CRASH, null)
+
+        fun clearLastCrash(context: Context) {
+            context.getSharedPreferences(CRASH_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_LAST_CRASH)
+                .apply()
+        }
     }
 }

@@ -93,6 +93,15 @@ fun HomeScreen(
     var tunPackets by remember { mutableStateOf(0L) }
     var quicState by remember { mutableStateOf(0) }
     var engineStats by remember { mutableStateOf("") }
+    // Read once per composition entry, then cleared: the message survives the
+    // process death that produced it, which is the whole point.
+    var lastCrash by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        lastCrash = com.peernet.wifiextender.PeerNetApp.lastCrash(context)
+        if (lastCrash != null) {
+            com.peernet.wifiextender.PeerNetApp.clearLastCrash(context)
+        }
+    }
     val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
 
     fun vpnIntent(): android.content.Intent =
@@ -255,6 +264,16 @@ fun HomeScreen(
                 text = tunnelStatus,
                 style = MaterialTheme.typography.bodySmall,
                 color = if (quicState == 2) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
+            )
+        }
+
+        // A crash is otherwise invisible without adb: the app just reappears
+        // and the tunnel counters restart. Show what killed it, once.
+        if (lastCrash != null) {
+            Text(
+                text = "Recovered from a crash: $lastCrash",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
             )
         }
 

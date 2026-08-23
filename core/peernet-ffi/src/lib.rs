@@ -57,6 +57,32 @@ fn init_logging() {
         );
         log::info!("engine logging online ({} v{})", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     }
+    install_panic_hook();
+}
+
+/// A panic inside a spawned engine task only kills that task: the tunnel then
+/// looks connected while its data path is dead, with nothing on screen. Route
+/// panics into `lastError()` so the app can show them (the tester has no adb).
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let where_ = info
+                .location()
+                .map(|l| format!(" at {}:{}", l.file(), l.line()))
+                .unwrap_or_default();
+            let what = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".to_string());
+            set_last_error(&format!("engine panic: {what}{where_}"));
+            jni_log(&format!("[panic] {what}{where_}"));
+            previous(info);
+        }));
+    });
 }
 
 // ---------- TUN capture state ----------

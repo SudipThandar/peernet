@@ -1,7 +1,6 @@
 package com.peernet.wifiextender.service
 
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.app.Notification
@@ -287,16 +286,21 @@ class PeerNetVpnService : VpnService() {
                 .setContentIntent(openIntent)
                 .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // specialUse, matching the manifest: systemExempted needs a
-            // platform exemption and throws SecurityException on Android 14+.
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        // A throw here used to kill the service the moment it started, and the
+        // sticky restart re-crashed it in a loop (visible only as tunnel
+        // counters resetting). Report instead of dying silently.
+        try {
+            val type = ForegroundServiceType.current()
+            if (type != null) {
+                startForeground(NOTIFICATION_ID, notification, type)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (t: Throwable) {
+            // Reporting and stopping beats crashing: a crash here is restarted
+            // by the system and simply crashes again.
+            Timber.e(t, "startForeground rejected")
+            fail("Android refused to start the tunnel service (${t.javaClass.simpleName}).")
         }
     }
 
