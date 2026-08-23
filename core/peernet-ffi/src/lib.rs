@@ -473,7 +473,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     // Publish the write-back channel for the reply pump (replacing any
     // stale sender from a previous session; its receiver gets dropped,
     // which makes old pumps exit on their next send).
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     install_reply_channel(tx);
 
     // Reply writer: rebuilt packets -> TUN. Exits when the pump side goes
@@ -495,7 +495,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
             };
             let mut wrote = false;
             while !wrote {
-                let guard = match async_fd.writable_mut().await {
+                let mut guard = match async_fd.writable_mut().await {
                     Ok(g) => g,
                     Err(_) => break,
                 };
@@ -519,7 +519,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
         if TUN_STOP.load(Ordering::SeqCst) {
             break;
         }
-        let guard = match async_fd.readable_mut().await {
+        let mut guard = match async_fd.readable_mut().await {
             Ok(g) => g,
             Err(_) => break,
         };
