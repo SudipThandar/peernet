@@ -38,7 +38,7 @@ data class ClientUiState(
 )
 
 /**
- * Client logic — discovery runs when the user taps CONNECT and automatically
+ * Client logic ï¿½ discovery runs when the user taps CONNECT and automatically
  * whenever this device joins a Wi-Fi Direct network (reconnect case): once a
  * known host's network is joined, linking happens without further taps.
  */
@@ -76,27 +76,33 @@ class ClientViewModel @Inject constructor(
         // Legacy-join watcher: users who associate through Android's own
         // Wi-Fi picker (typing the passphrase) never fire Wi-Fi Direct
         // callbacks on the client side, so joinedAsClient stays false
-        // forever. Poll the station SSID instead; DIRECT-*PeerNet* means
-        // someone joined our group manually — link exactly like a native
-        // join would.
+        // forever. Poll for a reachable host on the link instead: the
+        // Wi-Fi Direct group owner is our gateway, so one cheap TCP probe
+        // confirms it. SSID text is only a hint â€” some builds hide it
+        // ("<unknown ssid>") which used to make the app claim no network
+        // was found while it was demonstrably connected.
         viewModelScope.launch(Dispatchers.Default) {
             val wm = appContext
                 .getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-            var wasLegacyJoined = false
             while (kotlinx.coroutines.currentCoroutineContext().isActive) {
+                delay(LEGACY_POLL_MS)
+                if (_uiState.value.connectedHost != null) continue
+                if (_uiState.value.searching || busy.get()) continue
+                if (wifiDirect.state.value.hosting) continue
                 val ssid = runCatching {
                     @Suppress("DEPRECATION")
                     wm.connectionInfo?.ssid?.removeSurrounding("\"")
                 }.getOrNull().orEmpty()
-                val legacyJoined =
-                    ssid.contains("DIRECT-", ignoreCase = true) &&
-                        ssid.contains("PeerNet", ignoreCase = true)
-                if (legacyJoined && !wasLegacyJoined && _uiState.value.connectedHost == null) {
-                    Timber.i("Legacy (OS picker) join detected via SSID %s", ssid)
-                    autoLink()
+                val candidate = gatewayCandidate() ?: continue
+                val verified = probeDetails(candidate) ?: continue
+                Timber.i("Host detected on joined network (ssid=%s, gw=%s)", ssid, candidate.address)
+                if (busy.compareAndSet(false, true)) {
+                    try {
+                        link(verified, viaP2p = true)
+                    } finally {
+                        busy.set(false)
+                    }
                 }
-                wasLegacyJoined = legacyJoined
-                delay(LEGACY_POLL_MS)
             }
         }
     }
@@ -107,10 +113,16 @@ class ClientViewModel @Inject constructor(
     /** QUIC tunnel state: 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
     fun tunnelState(): Int = rustCore.tunnelState()
 
+    /** Engine data-path counters, e.g. "tun=120 udp=44 tcp=9". */
+    fun engineStats(): String = rustCore.engineStats()
+
+    /** Plain-language tunnel progress/error for the single screen. */
+    val tunnelStatus: StateFlow<String> = linkManager.tunnelStatus
+
     /**
      * CONNECT button. Priority order:
      *  1. Learn the host id via mDNS, then JOIN its Wi-Fi Direct network with
-     *     the stable credentials (API 33+) — the phone actually associates
+     *     the stable credentials (API 33+) ï¿½ the phone actually associates
      *     with DIRECT-PeerNet-xxxx, visible in Wi-Fi settings.
      *  2. Otherwise find a peer advertising a PeerNet name and invite it.
      *  3. Last resort: link over whatever network the phone is on right now
@@ -120,7 +132,7 @@ class ClientViewModel @Inject constructor(
     fun connectNow() {
         if (!busy.compareAndSet(false, true)) return
         _uiState.update {
-            it.copy(searching = true, status = "Searching this network for a PeerNet host…")
+            it.copy(searching = true, status = "Searching this network for a PeerNet hostï¿½")
         }
         viewModelScope.launch(Dispatchers.Default) {
             var joined = false
@@ -133,21 +145,21 @@ class ClientViewModel @Inject constructor(
                         passphrase = "pn-$hid"
                     )
                 ) {
-                    _uiState.update { it.copy(status = "Joining the PeerNet network…") }
+                    _uiState.update { it.copy(status = "Joining the PeerNet networkï¿½") }
                     joined = awaitJoined(JOIN_WAIT_MS)
                 }
 
                 if (!joined) {
                     val peer = findPeerNetPeer()
                     if (peer != null) {
-                        _uiState.update { it.copy(status = "Joining ${peer.deviceName}…") }
+                        _uiState.update { it.copy(status = "Joining ${peer.deviceName}ï¿½") }
                         wifiDirect.connectToPeer(peer.deviceAddress)
                         joined = awaitJoined(JOIN_WAIT_MS)
                     }
                 }
 
                 if (joined) {
-                    _uiState.update { it.copy(status = "PeerNet network joined — establishing link…") }
+                    _uiState.update { it.copy(status = "PeerNet network joined ï¿½ establishing linkï¿½") }
                     val target = findVerifiedHost(rounds = AUTO_ROUNDS)
                     if (target != null) {
                         _uiState.update { it.copy(searching = false) }
@@ -220,7 +232,7 @@ class ClientViewModel @Inject constructor(
             try {
                 wifiDirect.acquireMulticast()
                 _uiState.update {
-                    it.copy(searching = true, status = "PeerNet network detected — looking for host…")
+                    it.copy(searching = true, status = "PeerNet network detected ï¿½ looking for hostï¿½")
                 }
                 val target = findVerifiedHost(rounds = AUTO_ROUNDS)
                 if (target != null) {
@@ -241,29 +253,95 @@ class ClientViewModel @Inject constructor(
      * Up to [rounds] NSD rounds; returns the first host whose link banner
      * verifies. Unreachable entries are retried in later rounds instead of
      * consuming the whole attempt.
+     *
+     * The gateway shortcut runs first: when this phone sits on a Wi-Fi Direct
+     * network, the host IS the gateway, so one TCP probe finds it even when
+     * mDNS is blocked, slow, or answering on the wrong interface (the most
+     * common cause of "no PeerNet network found" while actually connected).
      */
     private suspend fun findVerifiedHost(rounds: Int): DiscoveredHost? {
+        gatewayCandidate()?.let { candidate ->
+            probeDetails(candidate)?.let { verified ->
+                Timber.i("Host found via link gateway %s", candidate.address)
+                return verified
+            }
+        }
         repeat(rounds) { attempt ->
             val hosts = runCatching { discovery.discoverOnce(timeoutMs = ROUND_TIMEOUT_MS) }
                 .getOrDefault(emptyList())
             for (host in hosts) {
-                if (probe(host)) return host
+                probeDetails(host)?.let { return it }
             }
             Timber.d("Round %d/%d: %d hosts advertised, none verified", attempt + 1, rounds, hosts.size)
-            if (attempt < rounds - 1) delay(ROUND_GAP_MS)
+            if (attempt < rounds - 1) {
+                // A late-forming group can hand out its gateway between
+                // rounds; keep retrying the cheap path too.
+                gatewayCandidate()?.let { candidate ->
+                    probeDetails(candidate)?.let { return it }
+                }
+                delay(ROUND_GAP_MS)
+            }
         }
         return null
+    }
+
+    /**
+     * The Wi-Fi Direct group owner (= the host) derived from routing state:
+     * the default gateway of the P2P/Wi-Fi link, typically 192.168.49.1.
+     * Needs no callbacks, no mDNS and no permissions.
+     */
+    @SuppressLint("MissingPermission")
+    private fun gatewayCandidate(): DiscoveredHost? {
+        val cm = appContext
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val gateways = buildList {
+            for (network in runCatching { cm.allNetworks.toList() }.getOrDefault(emptyList())) {
+                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull() ?: continue
+                val iface = lp.interfaceName.orEmpty()
+                val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
+                val isWifiLike = iface.startsWith("p2p", ignoreCase = true) ||
+                    caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+                if (!isWifiLike) continue
+                for (route in lp.routes) {
+                    val gw = route.gateway ?: continue
+                    if (gw is java.net.Inet4Address && !gw.isAnyLocalAddress) add(gw.hostAddress)
+                }
+                // A /24 P2P group has no default route entry on some OEM
+                // builds; the group owner still owns .1 of our own subnet.
+                for (addr in lp.linkAddresses) {
+                    val ip = addr.address
+                    if (ip is java.net.Inet4Address && addr.prefixLength >= 24) {
+                        val o = ip.address
+                        add("${o[0].toInt() and 0xFF}.${o[1].toInt() and 0xFF}.${o[2].toInt() and 0xFF}.1")
+                    }
+                }
+            }
+        }.filterNotNull().distinct()
+
+        val gateway = gateways.firstOrNull() ?: return null
+        return DiscoveredHost(
+            name = "PeerNet host",
+            port = com.peernet.wifiextender.wifi.LinkServer.PORT,
+            address = gateway,
+            hostId = null
+        )
     }
 
     private fun link(host: DiscoveredHost, viaP2p: Boolean) {
         saveProfile(host)
         linkManager.setLinked(host, currentWifiNetwork())
+        val pinMissing = host.fingerprint.isNullOrBlank()
         _uiState.update {
             it.copy(
                 connectedHost = host,
                 savedHostIds = loadSavedHostIds(),
-                status = if (viaP2p) "Linked to ${host.name} via the PeerNet network."
-                else "Linked to ${host.name} over your current Wi-Fi."
+                status = when {
+                    pinMissing ->
+                        "Linked to ${host.name}, but the host's tunnel engine is not ready. " +
+                            "Tap SHARE off/on on the host phone, then reconnect."
+                    viaP2p -> "Linked to ${host.name} via the PeerNet network."
+                    else -> "Linked to ${host.name} over your current Wi-Fi."
+                }
             )
         }
         startLiveness(host)
@@ -277,7 +355,7 @@ class ClientViewModel @Inject constructor(
      * (name starts with "p2p"); falls back to any plain Wi-Fi transport.
      * Critical because Android routes app traffic over the DEFAULT network,
      * and a "connected without internet" P2P Wi-Fi loses that role to
-     * cellular — where the host's private address is unreachable.
+     * cellular ï¿½ where the host's private address is unreachable.
      */
     @SuppressLint("MissingPermission")
     private fun currentWifiNetwork(): android.net.Network? {
@@ -340,20 +418,47 @@ class ClientViewModel @Inject constructor(
         _uiState.update { it.copy(savedHostIds = loadSavedHostIds()) }
     }
 
-    private suspend fun probe(host: DiscoveredHost): Boolean = withContext(Dispatchers.IO) {
-        runCatching {
-            Socket().use { s ->
-                s.soTimeout = 3_000
-                s.connect(InetSocketAddress(host.address, host.port), 3_000)
-                val banner = s.getInputStream().bufferedReader().readLine() ?: ""
-                Timber.d("Probe banner from %s: %s", host.name, banner)
-                banner.startsWith(com.peernet.wifiextender.wifi.LinkServer.BANNER_PREFIX)
+    private suspend fun probe(host: DiscoveredHost): Boolean = probeDetails(host) != null
+
+    /**
+     * Verifies a host and returns it enriched with whatever the banner
+     * reports. `PN-LINK-2` carries the QUIC certificate fingerprint and
+     * tunnel port, which is the authoritative source: mDNS TXT records are
+     * often stale (engine started after advertising) or dropped entirely,
+     * and a client without the pin cannot open the tunnel at all.
+     */
+    private suspend fun probeDetails(host: DiscoveredHost): DiscoveredHost? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                Socket().use { s ->
+                    s.soTimeout = 3_000
+                    s.connect(InetSocketAddress(host.address, host.port), 3_000)
+                    val banner = s.getInputStream().bufferedReader().readLine() ?: ""
+                    Timber.d("Probe banner from %s: %s", host.address, banner)
+                    if (!banner.startsWith(com.peernet.wifiextender.wifi.LinkServer.BANNER_PREFIX)) {
+                        return@runCatching null
+                    }
+                    val parts = banner.trim().split(" ")
+                    val bannerHid = parts.getOrNull(1)?.takeIf { it.isNotBlank() }
+                    val bannerFp = parts.getOrNull(2)
+                        ?.takeIf { it.length == 64 && it.all { c -> c.isDigit() || c in 'a'..'f' } }
+                    val bannerPort = parts.getOrNull(3)?.toIntOrNull()
+                    host.copy(
+                        hostId = host.hostId ?: bannerHid,
+                        fingerprint = bannerFp ?: host.fingerprint,
+                        tunnelPort = bannerPort ?: host.tunnelPort,
+                        name = if (host.name == "PeerNet host" && bannerHid != null) {
+                            "PeerNet-${bannerHid.takeLast(4)}"
+                        } else {
+                            host.name
+                        }
+                    )
+                }
+            }.getOrElse {
+                Timber.d("Probe failed for %s: %s", host.address, it.message)
+                null
             }
-        }.getOrElse {
-            Timber.d("Probe failed for %s: %s", host.name, it.message)
-            false
         }
-    }
 
     private fun saveProfile(host: DiscoveredHost) {
         val arr = JSONArray(prefs.getString(KEY_PROFILES, "[]") ?: "[]")

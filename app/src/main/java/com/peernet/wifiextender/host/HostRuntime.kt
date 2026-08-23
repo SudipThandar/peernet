@@ -34,18 +34,36 @@ class HostRuntime @Inject constructor(
     @Volatile
     private var engineFingerprint: String? = null
 
+    /** What the mDNS record currently claims, so stale pins get corrected. */
+    @Volatile
+    private var advertisedFingerprint: String? = null
+
     init {
         scope.launch {
             wifiDirect.state.collect { s ->
                 if (s.hosting && s.ssid != null) {
+                    val fp = engineFingerprint ?: ""
+                    // The engine can finish binding after the group appears;
+                    // re-publish so clients never read an empty/stale pin.
+                    if (advertisedFingerprint != null && advertisedFingerprint != fp) {
+                        advertiser.unregister()
+                        advertisedFingerprint = null
+                    }
                     advertiser.register(
                         displayName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
-                        fingerprint = engineFingerprint ?: ""
+                        fingerprint = fp
                     )
-                    linkServer.start(hostId)
+                    advertisedFingerprint = fp
+                    linkServer.start(hostId) {
+                        com.peernet.wifiextender.wifi.HostLinkDetails(
+                            fingerprint = engineFingerprint ?: "",
+                            tunnelPort = NsdHostAdvertiser.PNTP_PORT
+                        )
+                    }
                 } else if (!s.hosting && !s.creating) {
                     linkServer.stop()
                     advertiser.unregister()
+                    advertisedFingerprint = null
                 }
             }
         }
@@ -75,10 +93,14 @@ class HostRuntime @Inject constructor(
         wifiDirect.acquireMulticast()
 
         // PNTP QUIC engine (M7): owns the tunnel port; its certificate
-        // fingerprint is advertised so clients can pin it.
+        // fingerprint is advertised so clients can pin it. The resolver we
+        // hand over is where client DNS queries (aimed at the tunnel's
+        // virtual DNS address) get redirected — without it nothing resolves
+        // on the client and browsing fails even with a healthy tunnel.
         engineFingerprint = rustCore.startHost(
             com.peernet.wifiextender.discovery.NsdHostAdvertiser.PNTP_PORT,
-            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim(),
+            systemDnsUpstream()
         )
         if (engineFingerprint == null) {
             android.util.Log.w("HostRuntime", "QUIC engine unavailable; clients will not be able to tunnel")
@@ -96,10 +118,29 @@ class HostRuntime @Inject constructor(
     fun stopSharing() {
         linkServer.stop()
         advertiser.unregister()
+        advertisedFingerprint = null
         wifiDirect.stopHosting()
         wifiDirect.releaseMulticast()
         rustCore.stopHost()
         engineFingerprint = null
         context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java))
+    }
+
+    /**
+     * This phone's real resolver ("ip:53"), taken from the network that
+     * currently carries internet. Client queries land on the tunnel's virtual
+     * DNS address, so the host must forward them somewhere real; a public
+     * resolver is the fallback when the system list is unreadable.
+     */
+    private fun systemDnsUpstream(): String {
+        val fallback = "1.1.1.1:53"
+        return runCatching {
+            val cm = context
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val active = cm.activeNetwork ?: return fallback
+            val dns = cm.getLinkProperties(active)?.dnsServers.orEmpty()
+            val v4 = dns.firstOrNull { it is java.net.Inet4Address }?.hostAddress
+            if (v4.isNullOrBlank()) fallback else "$v4:53"
+        }.getOrDefault(fallback)
     }
 }

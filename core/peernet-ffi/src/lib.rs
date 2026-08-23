@@ -109,6 +109,10 @@ fn tun_tx() -> Option<TunTx> {
 static TCP_TERMINATED: AtomicU64 = AtomicU64::new(0);
 static UDP_FORWARDED: AtomicU64 = AtomicU64::new(0);
 
+/// How long the engine's packet forwarder waits for a TUN write channel
+/// (50 ms per try) before giving up on a packet.
+const TUN_TX_WAIT_TRIES: usize = 40;
+
 /// Intake into the active session's TCP terminator engine. Present only
 /// while a tunnel owns an engine; teardown drops it, which lets the engine
 /// thread wind down.
@@ -148,6 +152,18 @@ fn host_slot() -> &'static HostSlot {
 fn client_slot() -> &'static ClientSlot {
     static S: OnceLock<ClientSlot> = OnceLock::new();
     S.get_or_init(|| Mutex::new(None))
+}
+
+/// Last engine failure in human-readable form. Surfaced to the UI through
+/// `lastError()` so on-device diagnosis never requires adb.
+fn last_error_slot() -> &'static Mutex<String> {
+    static S: OnceLock<Mutex<String>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn set_last_error(msg: &str) {
+    crate::jni_log(msg);
+    *last_error_slot().lock().unwrap_or_else(|p| p.into_inner()) = msg.to_string();
 }
 
 // ---------- Core info ----------
@@ -241,12 +257,14 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunPacketCo
 
 // ---------- PNTP engine lifecycle (Milestone 7) ----------
 
-/// NativeCore.startHost(port: Int, deviceName: String) -> String
+/// NativeCore.startHost(port: Int, deviceName: String, dnsUpstream: String) -> String
 ///
 /// Binds the QUIC host server on 0.0.0.0:port and runs its accept loop on the
-/// engine runtime. Returns the SHA-256 certificate fingerprint (lowercase
-/// hex) for advertisement, or "" when a server is already running or the
-/// bind failed.
+/// engine runtime. `dnsUpstream` ("ip:port") is where client DNS queries aimed
+/// at the tunnel's virtual resolver get redirected; an unparsable value falls
+/// back to the server default. Returns the SHA-256 certificate fingerprint
+/// (lowercase hex) for advertisement, or "" when a server is already running
+/// or the bind failed.
 #[no_mangle]
 pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
     'local,
@@ -255,8 +273,10 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
     _class: JClass<'local>,
     port: jint,
     device_name: JString<'local>,
+    dns_upstream: JString<'local>,
 ) -> JString<'local> {
     let name = get_string(&mut env, &device_name);
+    let dns = get_string(&mut env, &dns_upstream);
     let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_some() {
         return create_string(env, "");
@@ -265,6 +285,15 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
     match HostServer::bind(addr, &name) {
         Ok(server) => {
             let fingerprint = server.fingerprint_hex().to_string();
+            match SocketAddr::from_str(dns.trim()) {
+                Ok(resolver) => {
+                    server.set_dns_upstream(resolver);
+                    crate::jni_log(&format!("[host] DNS upstream {resolver}"));
+                }
+                Err(_) => {
+                    crate::jni_log("[host] DNS upstream unset; keeping built-in default");
+                }
+            }
             let server = std::sync::Arc::new(server);
             runtime().spawn({
                 let server = server.clone();
@@ -274,7 +303,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
             create_string(env, &fingerprint)
         }
         Err(e) => {
-            crate::jni_log(&format!("[host] bind failed: {e}"));
+            set_last_error(&format!("host bind failed: {e}"));
             create_string(env, "")
         }
     }
@@ -331,16 +360,25 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel
     let name = get_string(&mut env, &device_name);
 
     let Ok(parsed) = SocketAddr::from_str(&addr) else {
+        set_last_error(&format!("bad host address '{addr}'"));
         return 0;
     };
+    // A missing/short fingerprint can never authenticate the host: fail loud
+    // here instead of letting the TLS layer reject it seconds later with the
+    // TUN already installed (which looks like "connected, no internet").
+    if fp.trim().len() != 64 || !fp.trim().chars().all(|c| c.is_ascii_hexdigit()) {
+        set_last_error("host fingerprint missing or malformed (host engine not ready?)");
+        return 0;
+    }
     if CLIENT_STARTING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return 0;
     }
 
+    set_last_error("");
     TUNNEL_STATE.store(1, Ordering::SeqCst); // Connecting
     let gen = ENGINE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     runtime().spawn(async move {
-        let opts = ClientOptions::new(parsed, "peernet-host", fp, name);
+        let opts = ClientOptions::new(parsed, "peernet-host", fp.trim().to_string(), name);
         match TunnelClient::connect(opts).await {
             Ok(client) => {
                 if ENGINE_GEN.load(Ordering::SeqCst) != gen {
@@ -373,7 +411,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel
                 *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
             }
             Err(e) => {
-                crate::jni_log(&format!("[client] connect failed: {e}"));
+                set_last_error(&format!("tunnel connect failed: {e}"));
                 if ENGINE_GEN.load(Ordering::SeqCst) == gen {
                     TUNNEL_STATE.store(0, Ordering::SeqCst);
                     CLIENT_STARTING.store(false, Ordering::SeqCst);
@@ -435,6 +473,42 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunnelState
     _class: JClass<'local>,
 ) -> jint {
     TUNNEL_STATE.load(Ordering::SeqCst)
+}
+
+/// NativeCore.lastError() -> String ("" when nothing failed since the last
+/// successful start). Lets the single-screen UI explain failures on the
+/// device instead of requiring a logcat session.
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_lastError<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let msg = last_error_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    create_string(env, &msg)
+}
+
+/// NativeCore.engineStats() -> String, e.g. "tun=1420 udp=310 tcp=88".
+/// Proves which half of the data path is moving when a user reports
+/// "connected but nothing loads".
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let stats = format!(
+        "tun={} udp={} tcp={}",
+        PACKETS.load(Ordering::Relaxed),
+        UDP_FORWARDED.load(Ordering::Relaxed),
+        TCP_TERMINATED.load(Ordering::Relaxed),
+    );
+    create_string(env, &stats)
 }
 
 /// All fds backing an active capture session (original + read/write
@@ -777,16 +851,27 @@ pub fn spawn_tcp_termination(client: std::sync::Arc<TunnelClient>, gen: u64) {
     // Publish the intake so forward_outbound can feed it; teardown drops it.
     *TCP_PKT_TX.write().unwrap_or_else(|p| p.into_inner()) = Some(pkt_in_tx);
 
-    // Engine-emitted packets back into the TUN writer.
+    // Engine-emitted packets back into the TUN writer. The TUN channel can
+    // legitimately be absent for a moment (the tunnel is established BEFORE
+    // the interface is installed, so failures never black-hole the phone):
+    // wait for it instead of tearing the flow down forever.
     std::thread::spawn(move || {
         while let Ok(pkt) = pkt_out_rx.recv() {
-            match tun_tx() {
-                Some(tx) => {
-                    if tx.send(pkt).is_err() {
+            let mut delivered = false;
+            for _ in 0..TUN_TX_WAIT_TRIES {
+                match tun_tx() {
+                    Some(tx) => {
+                        if tx.send(pkt.clone()).is_ok() {
+                            delivered = true;
+                        }
                         break;
                     }
+                    None => std::thread::sleep(Duration::from_millis(50)),
                 }
-                None => break,
+            }
+            if !delivered && tun_tx().is_none() {
+                // Capture really is gone; the engine will be torn down.
+                break;
             }
         }
     });

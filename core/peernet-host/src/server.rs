@@ -80,6 +80,15 @@ impl HostServer {
 
         let (shutdown_tx, _) = watch::channel(false);
 
+        // Clients point their TUN at a virtual DNS address (10.215.17.1), so
+        // every query arrives with a destination that exists nowhere. Without
+        // a redirect target those packets are silently dropped and NOTHING
+        // resolves on the client, which looks exactly like "no internet".
+        // A public resolver is the safe default; the app overrides it with
+        // the host's own system resolver via set_dns_upstream().
+        let nat = Arc::new(UdpNat::new());
+        nat.set_dns_upstream(SocketAddr::from(([1, 1, 1, 1], 53)));
+
         Ok(Self {
             endpoint,
             local_addr,
@@ -87,7 +96,7 @@ impl HostServer {
             fingerprint_hex,
             sessions: Arc::new(SessionManager::new()),
             stats: Arc::new(TunnelStats::default()),
-            nat: Arc::new(UdpNat::new()),
+            nat,
             udp_readers: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
         })
@@ -228,7 +237,12 @@ async fn handle_connection(
                             if is_new {
                                 let conn = conn.clone();
                                 let stats = stats.clone();
-                                tokio::spawn(pump_udp_replies(socket, conn, stats));
+                                tokio::spawn(pump_udp_replies(
+                                    socket,
+                                    conn,
+                                    stats,
+                                    hdr.src_port,
+                                ));
                             }
                         }
                         Err(_) => break,
@@ -324,8 +338,7 @@ async fn service_stream(
                 };
                 stats.record_up(n as u64);
 
-                let src_port =
-                    socket.local_addr().map(|a| a.port()).unwrap_or(hdr.src_port);
+                let src_port = hdr.src_port;
                 let reply_hdr = peernet_proto::UdpRelayHeader {
                     session_id: hdr.session_id,
                     src_port,
@@ -453,11 +466,14 @@ async fn tcp_relay(
 }
 
 /// Forwards UDP responses arriving on a NAT socket back to the client as
-/// relay datagrams, preserving the outbound source port (spec 12.6).
+/// relay datagrams. The header always echoes the CLIENT's original source
+/// port (spec 12.6): the client keys its TUN flow table on it, so reporting
+/// our local port would strand every reply whenever port preservation failed.
 async fn pump_udp_replies(
     socket: Arc<tokio::net::UdpSocket>,
     conn: Connection,
     stats: Arc<TunnelStats>,
+    client_src_port: u16,
 ) {
     let mut buf = vec![0u8; 65536];
     loop {
@@ -466,10 +482,9 @@ async fn pump_udp_replies(
             Err(_) => break,
         };
         stats.record_down(n as u64);
-        let src_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let hdr = peernet_proto::UdpRelayHeader {
             session_id: 0,
-            src_port,
+            src_port: client_src_port,
             dst_ip: peer.ip(),
             dst_port: peer.port(),
         };

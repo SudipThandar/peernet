@@ -36,7 +36,7 @@ internal object NativeCore {
     external fun tunPacketCount(): Long
 
     /** Binds the QUIC host on 0.0.0.0:port; returns cert fingerprint or "". */
-    external fun startHost(port: Int, deviceName: String): String
+    external fun startHost(port: Int, deviceName: String, dnsUpstream: String): String
 
     external fun stopHost(): Boolean
 
@@ -49,6 +49,12 @@ internal object NativeCore {
 
     /** 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
     external fun tunnelState(): Int
+
+    /** Human-readable last engine failure, or "" when healthy. */
+    external fun lastError(): String
+
+    /** Data-path counters, e.g. "tun=120 udp=44 tcp=9". */
+    external fun engineStats(): String
 }
 
 /**
@@ -102,9 +108,9 @@ class RustCoreBridge @Inject constructor() {
     }
 
     /** Cert fingerprint (lowercase hex) or null when the engine refused. */
-    fun startHost(port: Int, deviceName: String): String? {
+    fun startHost(port: Int, deviceName: String, dnsUpstream: String): String? {
         if (!isAvailable) return null
-        return runCatching { NativeCore.startHost(port, deviceName).ifEmpty { null } }
+        return runCatching { NativeCore.startHost(port, deviceName, dnsUpstream).ifEmpty { null } }
             .onFailure { Timber.w(it, "startHost failed") }
             .getOrNull()
     }
@@ -135,5 +141,17 @@ class RustCoreBridge @Inject constructor() {
     fun tunnelState(): Int {
         if (!isAvailable) return 0
         return runCatching { NativeCore.tunnelState() }.getOrDefault(0)
+    }
+
+    /** Last engine failure in plain words, or "" when nothing failed. */
+    fun lastError(): String {
+        if (!isAvailable) return "native engine missing from this build"
+        return runCatching { NativeCore.lastError() }.getOrDefault("")
+    }
+
+    /** Data-path counters for on-screen diagnosis. */
+    fun engineStats(): String {
+        if (!isAvailable) return ""
+        return runCatching { NativeCore.engineStats() }.getOrDefault("")
     }
 }

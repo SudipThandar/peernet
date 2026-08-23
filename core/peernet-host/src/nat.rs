@@ -64,7 +64,6 @@ impl UdpNat {
                 .await
                 .map_err(|e| format!("udp bind failed: {e}"))?,
         };
-        let actual_port = socket.local_addr().map_err(|e| e.to_string())?.port();
         let socket = Arc::new(socket);
 
         let mut mappings = self.lock();
@@ -72,8 +71,12 @@ impl UdpNat {
         if let Some(existing) = mappings.get(&client_src_port) {
             return Ok(existing.socket.clone());
         }
+        // Key by the CLIENT's source port, never the local one: when port
+        // preservation fails the local port differs, and keying by it would
+        // orphan the mapping (a fresh socket per packet, and replies that no
+        // longer match the client's flow table).
         mappings.insert(
-            actual_port,
+            client_src_port,
             Mapping { socket: socket.clone(), last_used: Instant::now() },
         );
         Ok(socket)

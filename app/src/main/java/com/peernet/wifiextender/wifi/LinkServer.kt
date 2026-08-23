@@ -14,7 +14,13 @@ import java.net.Socket
  * Port note: the QUIC tunnel endpoint (M7) owns 4433; this banner responder
  * lives on 4434 so both can coexist. NSD advertises this port for probes.
  *
- * Wire format: "PN-LINK-1 <host_id>\n"
+ * Wire format: "PN-LINK-2 <host_id> <cert_fingerprint|-> <tunnel_port>\n"
+ * (legacy "PN-LINK-1 <host_id>" is still accepted by clients).
+ *
+ * The fingerprint travels here because mDNS TXT records proved unreliable in
+ * the field: a client that cannot learn the pin cannot open the tunnel, and
+ * the failure looked like "linked but no internet". The banner is generated
+ * per connection, so an engine that starts late is still reported correctly.
  */
 class LinkServer(private val port: Int = PORT) {
 
@@ -24,7 +30,7 @@ class LinkServer(private val port: Int = PORT) {
     @Volatile
     private var serverSocket: ServerSocket? = null
 
-    fun start(hostId: String) {
+    fun start(hostId: String, details: () -> HostLinkDetails) {
         stop()
         running = true
         Thread {
@@ -40,7 +46,7 @@ class LinkServer(private val port: Int = PORT) {
                     } catch (t: Throwable) {
                         break
                     }
-                    handle(client, hostId)
+                    handle(client, hostId, details)
                 }
             } catch (t: Throwable) {
                 if (running) Timber.w(t, "Link server stopped unexpectedly")
@@ -51,12 +57,14 @@ class LinkServer(private val port: Int = PORT) {
         }.start()
     }
 
-    private fun handle(client: Socket, hostId: String) {
+    private fun handle(client: Socket, hostId: String, details: () -> HostLinkDetails) {
         Thread {
             runCatching {
+                val d = runCatching { details() }.getOrDefault(HostLinkDetails())
+                val fp = d.fingerprint.ifBlank { "-" }
                 client.soTimeout = 3_000
                 client.getOutputStream().apply {
-                    write("PN-LINK-1 $hostId\n".toByteArray())
+                    write("PN-LINK-2 $hostId $fp ${d.tunnelPort}\n".toByteArray())
                     flush()
                 }
             }
@@ -79,3 +87,9 @@ class LinkServer(private val port: Int = PORT) {
         const val BANNER_PREFIX = "PN-LINK-"
     }
 }
+
+/** What the host tells probing clients about its tunnel endpoint. */
+data class HostLinkDetails(
+    val fingerprint: String = "",
+    val tunnelPort: Int = 4433
+)

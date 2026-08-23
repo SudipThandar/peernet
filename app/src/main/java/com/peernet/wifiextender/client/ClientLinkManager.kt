@@ -23,8 +23,21 @@ class ClientLinkManager @Inject constructor() {
     private val _linkedNetwork = MutableStateFlow<Network?>(null)
     val linkedNetwork: StateFlow<Network?> = _linkedNetwork.asStateFlow()
 
+    /**
+     * Plain-language tunnel progress written by the VPN service and read by
+     * the single screen. Users have no adb, so every failure has to be
+     * explainable from the UI alone.
+     */
+    private val _tunnelStatus = MutableStateFlow("")
+    val tunnelStatus: StateFlow<String> = _tunnelStatus.asStateFlow()
+
+    fun setTunnelStatus(text: String) {
+        _tunnelStatus.value = text
+    }
+
     fun setLinked(host: DiscoveredHost?, network: Network? = null) {
         _linkedHost.value = host
         _linkedNetwork.value = if (host != null) network else null
+        if (host == null) _tunnelStatus.value = ""
     }
 }

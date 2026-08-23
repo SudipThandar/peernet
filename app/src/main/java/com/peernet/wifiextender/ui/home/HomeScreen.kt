@@ -88,6 +88,8 @@ fun HomeScreen(
     // ---- VPN consent + TUN start once a host link exists (Milestone 6/7) ----
     var tunPackets by remember { mutableStateOf(0L) }
     var quicState by remember { mutableStateOf(0) }
+    var engineStats by remember { mutableStateOf("") }
+    val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
 
     fun vpnIntent(): android.content.Intent =
         android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java).apply {
@@ -143,6 +145,7 @@ fun HomeScreen(
         while (true) {
             tunPackets = clientViewModel.packetCount()
             quicState = clientViewModel.tunnelState()
+            engineStats = clientViewModel.engineStats()
             kotlinx.coroutines.delay(1000)
         }
     }
@@ -178,16 +181,26 @@ fun HomeScreen(
         Text(
             text = buildString {
                 append(if (home.internetAvailable) "Internet: connected" else "Internet: not connected")
-                if (tunPackets > 0) append("  •  TUN: $tunPackets packets")
                 when (quicState) {
-                    1 -> append("  •  QUIC connecting…")
-                    2 -> append("  •  QUIC connected")
-                    3 -> append("  •  QUIC reconnecting…")
+                    1 -> append("  •  tunnel connecting…")
+                    2 -> append("  •  tunnel up")
+                    3 -> append("  •  tunnel reconnecting…")
                 }
+                if (tunPackets > 0) append("  •  $engineStats")
             },
             style = MaterialTheme.typography.bodyMedium,
             color = Color.Gray
         )
+
+        // Tunnel progress/failure in plain words — the only diagnostic a
+        // user without adb can act on.
+        if (tunnelStatus.isNotBlank()) {
+            Text(
+                text = tunnelStatus,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (quicState == 2) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
+            )
+        }
 
         home.engineVersion?.let {
             Text(

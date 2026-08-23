@@ -28,11 +28,15 @@ class PeerNetVpnService : VpnService() {
 
     @Inject lateinit var rustCore: RustCoreBridge
 
+    @Inject lateinit var linkManager: com.peernet.wifiextender.client.ClientLinkManager
+
     private var tunFd: Int = -1
 
     @Volatile private var hostAddr: String? = null
 
     @Volatile private var hostFp: String? = null
+
+    @Volatile private var bringUp: Thread? = null
 
     override fun onBind(intent: Intent?) = super.onBind(intent)
 
@@ -61,17 +65,77 @@ class PeerNetVpnService : VpnService() {
             pinSocketsToUnderlying()
             return START_STICKY
         }
+        if (bringUp?.isAlive == true) return START_STICKY
+
+        val addr = hostAddr
+        val fp = hostFp
+        if (addr.isNullOrBlank() || fp.isNullOrBlank()) {
+            // No endpoint = the TUN could only swallow traffic. Refuse to
+            // install it; the phone keeps whatever connectivity it has.
+            fail("Host tunnel details missing — reconnect once the host is sharing.")
+            return START_NOT_STICKY
+        }
+
+        // Order matters: bring the QUIC tunnel UP FIRST, and only install the
+        // default-route TUN once it is carrying traffic. Establishing the TUN
+        // before the tunnel works turns every app offline for as long as the
+        // handshake is failing, which is indistinguishable from a broken
+        // phone (and was exactly the reported symptom).
+        bindProcessToLink()
+        linkManager.setTunnelStatus("Connecting to host…")
+        if (!rustCore.startTunnel(addr, fp, Build.MODEL)) {
+            fail(rustCore.lastError().ifBlank { "Tunnel refused by engine." })
+            return START_NOT_STICKY
+        }
+
+        bringUp = Thread { awaitTunnelThenCapture() }.apply {
+            name = "peernet-vpn-bringup"
+            isDaemon = true
+            start()
+        }
+        return START_STICKY
+    }
+
+    /**
+     * Waits for the handshake, then hands the TUN to the engine. Runs off the
+     * main thread: onStartCommand must never block.
+     */
+    private fun awaitTunnelThenCapture() {
+        val deadline = System.currentTimeMillis() + CONNECT_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            when (rustCore.tunnelState()) {
+                STATE_CONNECTED -> break
+                STATE_DISCONNECTED -> {
+                    val err = rustCore.lastError()
+                    if (err.isNotBlank()) {
+                        fail(err)
+                        return
+                    }
+                }
+            }
+            try {
+                Thread.sleep(POLL_MS)
+            } catch (t: InterruptedException) {
+                return
+            }
+        }
+        if (rustCore.tunnelState() != STATE_CONNECTED) {
+            fail(
+                rustCore.lastError().ifBlank {
+                    "Could not reach the host tunnel. Check that SHARE is still on."
+                }
+            )
+            return
+        }
 
         val fd = establishTun()
         if (fd < 0) {
-            Timber.w("TUN establishment failed; stopping")
-            stopSelf()
-            return START_NOT_STICKY
+            fail("Android refused to create the VPN interface.")
+            return
         }
         tunFd = fd
 
-        val started = rustCore.startTunCapture(fd, MTU)
-        if (!started) {
+        if (!rustCore.startTunCapture(fd, MTU)) {
             // Kotlin detached this fd, so it is ours to close — otherwise it
             // leaks (Rust only closes the fd it actually accepted). Also tear
             // down any stale capture that caused the refusal so the next
@@ -80,16 +144,23 @@ class PeerNetVpnService : VpnService() {
             runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
             runCatching { rustCore.stopTunCapture() }
             tunFd = -1
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return START_NOT_STICKY
+            fail("Engine refused the tunnel interface.")
+            return
         }
 
-        connectEngine()
         pinSocketsToUnderlying()
-
+        linkManager.setTunnelStatus("Tunnel active")
         Timber.i("TUN capture started (fd=%d mtu=%d)", fd, MTU)
-        return START_STICKY
+    }
+
+    /** Reports why the tunnel is not up and leaves the phone as it was. */
+    private fun fail(reason: String) {
+        Timber.w("VPN bring-up failed: %s", reason)
+        linkManager.setTunnelStatus(reason)
+        runCatching { rustCore.stopTunnel() }
+        unbindProcessFromLink()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     @Volatile private var underlying: android.net.Network? = null
@@ -119,17 +190,26 @@ class PeerNetVpnService : VpnService() {
     }
 
     /**
-     * M7: drives the PNTP QUIC client against the linked host once the TUN
-     * is up. Best-effort: without engine/endpoint info the capture still
-     * runs (counters only), matching pre-M7 behavior.
+     * Routes this process's own sockets (the QUIC tunnel included) over the
+     * link network. `setUnderlyingNetworks` only labels the VPN for the
+     * system's accounting — it does NOT choose a route, so without this the
+     * engine's UDP socket follows the DEFAULT network. On a phone with mobile
+     * data that means the handshake is sent to the carrier, where the host's
+     * private address does not exist, and the tunnel silently never connects.
      */
-    private fun connectEngine() {
-        val addr = hostAddr ?: return
-        val fp = hostFp ?: return
-        if (!rustCore.startTunnel(addr, fp, android.os.Build.MODEL)) {
-            Timber.w("QUIC tunnel start refused for %s", addr)
-        } else {
-            Timber.i("QUIC tunnel connecting to %s", addr)
+    private fun bindProcessToLink() {
+        val net = underlying ?: return
+        runCatching {
+            val cm = getSystemService(android.net.ConnectivityManager::class.java)
+            cm?.bindProcessToNetwork(net)
+        }.onSuccess { Timber.i("Process bound to link network %s", net) }
+            .onFailure { Timber.w(it, "bindProcessToNetwork failed") }
+    }
+
+    private fun unbindProcessFromLink() {
+        runCatching {
+            getSystemService(android.net.ConnectivityManager::class.java)
+                ?.bindProcessToNetwork(null)
         }
     }
 
@@ -167,11 +247,30 @@ class PeerNetVpnService : VpnService() {
     }
 
     private fun stopTunnel() {
+        bringUp?.interrupt()
+        bringUp = null
         rustCore.stopTunnel()
         rustCore.stopTunCapture()
         tunFd = -1
+        unbindProcessFromLink()
+        linkManager.setTunnelStatus("")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    override fun onRevoke() {
+        // User revoked VPN permission from system settings.
+        Timber.i("VPN permission revoked by user")
+        stopTunnel()
+        super.onRevoke()
+    }
+
+    override fun onDestroy() {
+        rustCore.stopTunnel()
+        rustCore.stopTunCapture()
+        tunFd = -1
+        unbindProcessFromLink()
+        super.onDestroy()
     }
 
     private fun startAsForeground() {
@@ -210,5 +309,9 @@ class PeerNetVpnService : VpnService() {
         const val VPN_ADDRESS = "10.215.17.2"
         const val VIRTUAL_DNS = "10.215.17.1"
         private const val NOTIFICATION_ID = 1002
+        private const val CONNECT_TIMEOUT_MS = 20_000L
+        private const val POLL_MS = 250L
+        private const val STATE_DISCONNECTED = 0
+        private const val STATE_CONNECTED = 2
     }
 }
