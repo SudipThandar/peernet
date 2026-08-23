@@ -192,6 +192,39 @@ class WifiDirectManager @Inject constructor(
         }
     }
 
+    /**
+     * Requests joining a group by exact credentials (API 33+). This makes the
+     * OS associate with the group owner's network — the connection then shows
+     * up in Wi-Fi settings like any manually joined network.
+     *
+     * Returns true when the request was submitted; association completes
+     * asynchronously and is observable through [state] (joinedAsClient).
+     */
+    fun joinByCredentials(ssid: String, passphrase: String): Boolean {
+        val mgr = manager ?: return false
+        val ch = channel ?: return false
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        return try {
+            val config = WifiP2pConfig.Builder()
+                .setNetworkName(ssid)
+                .setPassphrase(passphrase)
+                .build()
+            mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Timber.i("Join requested for %s", ssid)
+                }
+
+                override fun onFailure(reason: Int) {
+                    Timber.w("Join %s failed: %d", ssid, reason)
+                }
+            })
+            true
+        } catch (t: Throwable) {
+            Timber.w(t, "joinByCredentials threw")
+            false
+        }
+    }
+
     /** Client-side leave: drops the Wi-Fi Direct connection to the host. */
     fun leaveCurrentGroup() {
         val mgr = manager ?: return

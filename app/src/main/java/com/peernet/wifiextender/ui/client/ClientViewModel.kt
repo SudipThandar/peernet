@@ -10,13 +10,17 @@ import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
@@ -48,6 +52,7 @@ class ClientViewModel @Inject constructor(
     private val discovery = NsdClientDiscovery(context)
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private val busy = AtomicBoolean(false)
+    private var livenessJob: Job? = null
 
     private val _uiState = MutableStateFlow(ClientUiState())
     val uiState: StateFlow<ClientUiState> = _uiState.asStateFlow()
@@ -61,8 +66,7 @@ class ClientViewModel @Inject constructor(
                 if (joined && !wasJoined) autoLink()
                 if (!joined && wasJoined && !s.hosting && _uiState.value.connectedHost != null) {
                     // Host tore down the group; drop the stale link.
-                    linkManager.setLinked(null)
-                    _uiState.update { it.copy(connectedHost = null, status = "Host disconnected.") }
+                    clearLink("Host disconnected.")
                 }
                 wasJoined = joined
             }
@@ -73,9 +77,14 @@ class ClientViewModel @Inject constructor(
     fun packetCount(): Long = rustCore.tunPacketCount()
 
     /**
-     * One explicit round: scan current network -> link to the first
-     * PeerNet host found. Called only from the CONNECT button.
-     * Runs several NSD rounds because mDNS after a fresh join needs time.
+     * CONNECT button. Priority order:
+     *  1. Learn the host id via mDNS, then JOIN its Wi-Fi Direct network with
+     *     the stable credentials (API 33+) — the phone actually associates
+     *     with DIRECT-PeerNet-xxxx, visible in Wi-Fi settings.
+     *  2. Otherwise find a peer advertising a PeerNet name and invite it.
+     *  3. Last resort: link over whatever network the phone is on right now
+     *     (e.g. both phones on the same router). Such links carry a liveness
+     *     watchdog so they die when the host stops sharing.
      */
     fun connectNow() {
         if (!busy.compareAndSet(false, true)) return
@@ -83,25 +92,88 @@ class ClientViewModel @Inject constructor(
             it.copy(searching = true, status = "Searching this network for a PeerNet host…")
         }
         viewModelScope.launch(Dispatchers.Default) {
+            var joined = false
             try {
                 wifiDirect.acquireMulticast()
-                val target = findVerifiedHost(rounds = MANUAL_ROUNDS)
-                if (target == null) {
+
+                val hid = discoverHostId()
+                if (hid != null && wifiDirect.joinByCredentials(
+                        ssid = "DIRECT-PeerNet-${hid.takeLast(4)}",
+                        passphrase = "pn-$hid"
+                    )
+                ) {
+                    _uiState.update { it.copy(status = "Joining the PeerNet network…") }
+                    joined = awaitJoined(JOIN_WAIT_MS)
+                }
+
+                if (!joined) {
+                    val peer = findPeerNetPeer()
+                    if (peer != null) {
+                        _uiState.update { it.copy(status = "Joining ${peer.deviceName}…") }
+                        wifiDirect.connectToPeer(peer.deviceAddress)
+                        joined = awaitJoined(JOIN_WAIT_MS)
+                    }
+                }
+
+                if (joined) {
+                    _uiState.update { it.copy(status = "PeerNet network joined — establishing link…") }
+                    val target = findVerifiedHost(rounds = AUTO_ROUNDS)
+                    if (target != null) {
+                        _uiState.update { it.copy(searching = false) }
+                        link(target, viaP2p = true)
+                        return@launch
+                    }
+                }
+
+                val fallback = findVerifiedHost(rounds = MANUAL_ROUNDS)
+                if (fallback != null) {
+                    _uiState.update { it.copy(searching = false) }
+                    link(fallback, viaP2p = joined)
+                } else {
                     _uiState.update {
                         it.copy(
                             searching = false,
-                            status = "No PeerNet host on this network. Join the host's DIRECT-xx network " +
-                                "in Wi-Fi settings (password is on the host phone), then tap Connect."
+                            status = "No PeerNet host found. Join the host's DIRECT-xx network in Wi-Fi settings " +
+                                "(password is on the host phone), then tap Connect."
                         )
                     }
-                } else {
-                    _uiState.update { it.copy(searching = false) }
-                    link(target)
                 }
             } finally {
                 wifiDirect.releaseMulticast()
                 busy.set(false)
             }
+        }
+    }
+
+    /** First mDNS round used purely to read the host's identity (hid TXT). */
+    private suspend fun discoverHostId(): String? =
+        runCatching { discovery.discoverOnce(timeoutMs = ROUND_TIMEOUT_MS) }
+            .getOrDefault(emptyList())
+            .firstOrNull { !it.hostId.isNullOrBlank() }?.hostId
+
+    /** Polls P2P state until the device reports membership in a group as client. */
+    private suspend fun awaitJoined(waitMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + waitMs
+        while (System.currentTimeMillis() < deadline) {
+            if (wifiDirect.state.value.joinedAsClient) return true
+            delay(JOIN_POLL_MS)
+        }
+        return wifiDirect.state.value.joinedAsClient
+    }
+
+    /** Wi-Fi Direct scan for a peer whose advertised name starts with PeerNet. */
+    private suspend fun findPeerNetPeer(): android.net.wifi.p2p.WifiP2pDevice? {
+        wifiDirect.startPeerDiscovery()
+        return try {
+            kotlinx.coroutines.withTimeout(PEER_SCAN_MS) {
+                wifiDirect.state.first { s -> s.peers.isNotEmpty() }.peers
+                    .firstOrNull { it.deviceName.startsWith("PeerNet", ignoreCase = true) }
+            }
+        } catch (t: Throwable) {
+            Timber.d("No PeerNet-named peer discovered: %s", t.message)
+            null
+        } finally {
+            wifiDirect.stopPeerDiscovery()
         }
     }
 
@@ -122,7 +194,7 @@ class ClientViewModel @Inject constructor(
                 val target = findVerifiedHost(rounds = AUTO_ROUNDS)
                 if (target != null) {
                     _uiState.update { it.copy(searching = false) }
-                    link(target)
+                    link(target, viaP2p = true)
                 } else {
                     // Stay quiet: the user can always tap CONNECT manually.
                     _uiState.update { it.copy(searching = false, status = "") }
@@ -152,23 +224,53 @@ class ClientViewModel @Inject constructor(
         return null
     }
 
-    private fun link(host: DiscoveredHost) {
+    private fun link(host: DiscoveredHost, viaP2p: Boolean) {
         saveProfile(host)
         linkManager.setLinked(host)
         _uiState.update {
             it.copy(
                 connectedHost = host,
                 savedHostIds = loadSavedHostIds(),
-                status = "Linked to ${host.name}."
+                status = if (viaP2p) "Linked to ${host.name} via the PeerNet network."
+                else "Linked to ${host.name} over your current Wi-Fi."
             )
         }
+        startLiveness(host)
+    }
+
+    /**
+     * Watchdog for links that are NOT backed by a joined P2P group (e.g. both
+     * phones on the same router): if the host stops answering, drop the link
+     * instead of showing a stale "Connected". P2P-backed links are owned by
+     * the group-teardown watcher above and are left alone here.
+     */
+    private fun startLiveness(host: DiscoveredHost) {
+        livenessJob?.cancel()
+        livenessJob = viewModelScope.launch(Dispatchers.Default) {
+            var misses = 0
+            while (isActive) {
+                delay(LIVENESS_INTERVAL_MS)
+                misses = if (probe(host)) 0 else misses + 1
+                val p2pBacked = wifiDirect.state.value.joinedAsClient
+                if (misses >= LIVENESS_MISSES && !p2pBacked) {
+                    clearLink("Host disconnected.")
+                    break
+                }
+            }
+        }
+    }
+
+    private fun clearLink(message: String) {
+        livenessJob?.cancel()
+        livenessJob = null
+        linkManager.setLinked(null)
+        _uiState.update { it.copy(connectedHost = null, status = message) }
     }
 
     /** Drops the link and leaves any joined Wi-Fi Direct group. */
     fun disconnect() {
-        linkManager.setLinked(null)
+        clearLink("Disconnected.")
         wifiDirect.leaveCurrentGroup()
-        _uiState.update { it.copy(connectedHost = null, status = "Disconnected.") }
     }
 
     fun forget(hostId: String) {
@@ -226,5 +328,10 @@ class ClientViewModel @Inject constructor(
         private const val AUTO_ROUNDS = 8
         private const val ROUND_TIMEOUT_MS = 4_000L
         private const val ROUND_GAP_MS = 1_200L
+        private const val JOIN_WAIT_MS = 15_000L
+        private const val JOIN_POLL_MS = 750L
+        private const val PEER_SCAN_MS = 8_000L
+        private const val LIVENESS_INTERVAL_MS = 5_000L
+        private const val LIVENESS_MISSES = 2
     }
 }
