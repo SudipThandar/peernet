@@ -15,7 +15,11 @@ data class DiscoveredHost(
     val name: String,
     val port: Int,
     val address: String?,
-    val hostId: String?
+    val hostId: String?,
+    /** SHA-256 (hex) of the host's QUIC certificate for pinning. */
+    val fingerprint: String? = null,
+    /** QUIC tunnel port (TXT "tp"); falls back to the PNTP port. */
+    val tunnelPort: Int = 4433
 )
 
 /**
@@ -65,7 +69,9 @@ class NsdClientDiscovery(context: Context) {
                     name = info.serviceName,
                     port = info.port,
                     address = info.host?.hostAddress,
-                    hostId = hid
+                    hostId = hid,
+                    fingerprint = attrs["fp"]?.toString(Charsets.UTF_8),
+                    tunnelPort = attrs["tp"]?.toString(Charsets.UTF_8)?.toIntOrNull() ?: 4433
                 )
                 if (found.size >= MAX_HOSTS) finish()
             }

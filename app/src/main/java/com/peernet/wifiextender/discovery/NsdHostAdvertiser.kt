@@ -12,9 +12,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Advertises `_peernet._udp` with PNTP TXT metadata so nearby clients can
  * discover this host while it is sharing.
  *
- * Note: the advertised port is the future PNTP QUIC port (4433). The actual
- * tunnel server binds there in Milestone 5; discovery already uses the final
- * wire format so later milestones need no breaking changes.
+ * Ports: the advertised [port] is the link-probe port (4434, banner
+ * responder). The QUIC tunnel endpoint owns 4433 and is advertised via the
+ * "tp" TXT attribute so M7+ clients know where to connect.
  */
 class NsdHostAdvertiser(context: Context) {
 
@@ -29,7 +29,7 @@ class NsdHostAdvertiser(context: Context) {
 
     fun register(
         displayName: String,
-        port: Int = PNTP_PORT,
+        port: Int = LINK_PORT,
         fingerprint: String = "",
         mode: String = "host"
     ) {
@@ -44,6 +44,7 @@ class NsdHostAdvertiser(context: Context) {
             setAttribute("hid", hid)
             setAttribute("name", displayName)
             setAttribute("port", port.toString())
+            setAttribute("tp", PNTP_PORT.toString())
             if (fingerprint.isNotEmpty()) setAttribute("fp", fingerprint)
             setAttribute("mode", mode)
             setAttribute("cap", "quic,udp,rtc")
@@ -87,5 +88,6 @@ class NsdHostAdvertiser(context: Context) {
     companion object {
         const val SERVICE_TYPE = "_peernet._udp."
         const val PNTP_PORT = 4433
+        const val LINK_PORT = 4434
     }
 }

@@ -8,9 +8,11 @@ import java.net.Socket
 /**
  * Minimal PNTP-port link responder.
  *
- * Answers probes on the tunnel port (4433) with a version banner so clients
- * can verify they reached a genuine PeerNet host before pairing. Replaced by
- * the full QUIC endpoint in Milestone 5; the port and banner format stay.
+ * Answers probes with a version banner so clients can verify they reached a
+ * genuine PeerNet host before pairing.
+ *
+ * Port note: the QUIC tunnel endpoint (M7) owns 4433; this banner responder
+ * lives on 4434 so both can coexist. NSD advertises this port for probes.
  *
  * Wire format: "PN-LINK-1 <host_id>\n"
  */
@@ -73,7 +75,7 @@ class LinkServer(private val port: Int = PORT) {
     }
 
     companion object {
-        const val PORT = 4433
+        const val PORT = 4434
         const val BANNER_PREFIX = "PN-LINK-"
     }
 }

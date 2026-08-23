@@ -23,18 +23,25 @@ import javax.inject.Singleton
 @Singleton
 class HostRuntime @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val wifiDirect: WifiDirectManager
+    private val wifiDirect: WifiDirectManager,
+    private val rustCore: com.peernet.wifiextender.core.RustCoreBridge
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val advertiser = NsdHostAdvertiser(context)
     private val linkServer = LinkServer()
     private val hostId = HostIdentity.id(context)
 
+    @Volatile
+    private var engineFingerprint: String? = null
+
     init {
         scope.launch {
             wifiDirect.state.collect { s ->
                 if (s.hosting && s.ssid != null) {
-                    advertiser.register(displayName = "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                    advertiser.register(
+                        displayName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+                        fingerprint = engineFingerprint ?: ""
+                    )
                     linkServer.start(hostId)
                 } else if (!s.hosting && !s.creating) {
                     linkServer.stop()
@@ -67,6 +74,16 @@ class HostRuntime @Inject constructor(
         // multicast frames on P2P groups otherwise.
         wifiDirect.acquireMulticast()
 
+        // PNTP QUIC engine (M7): owns the tunnel port; its certificate
+        // fingerprint is advertised so clients can pin it.
+        engineFingerprint = rustCore.startHost(
+            com.peernet.wifiextender.discovery.NsdHostAdvertiser.PNTP_PORT,
+            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+        )
+        if (engineFingerprint == null) {
+            android.util.Log.w("HostRuntime", "QUIC engine unavailable; clients will not be able to tunnel")
+        }
+
         // Stable group credentials (honored on API 33+): the network always
         // appears as DIRECT-PeerNet-xxxx with an unchanging passphrase, so a
         // client that joined once auto-rejoins on every future share.
@@ -81,6 +98,8 @@ class HostRuntime @Inject constructor(
         advertiser.unregister()
         wifiDirect.stopHosting()
         wifiDirect.releaseMulticast()
+        rustCore.stopHost()
+        engineFingerprint = null
         context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java))
     }
 }

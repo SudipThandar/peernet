@@ -58,12 +58,16 @@ fun HomeScreen(
 
     val context = LocalContext.current
     var missingPerms by remember { mutableStateOf(Permissions.missing(context)) }
+    // Distinguishes "user tapped SHARE" from the startup prompt so granting
+    // permissions at first launch never silently starts hosting.
+    var pendingStartSharing by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
         missingPerms = Permissions.missing(context)
-        if (grants.values.all { it }) {
+        if (grants.values.all { it } && pendingStartSharing) {
+            pendingStartSharing = false
             hostViewModel.startSharing()
         }
     }
@@ -72,20 +76,39 @@ fun HomeScreen(
         homeViewModel.startObserving()
         hostViewModel.onScreenShown()
         missingPerms = Permissions.missing(context)
-        // No auto-search: scanning happens only when the user taps CONNECT.
+        // Ask for location/nearby-devices up front: first-run users grant
+        // once here instead of being interrupted mid-SHARE or mid-CONNECT.
+        if (missingPerms.isNotEmpty()) {
+            permissionLauncher.launch(Permissions.runtimePermissions().toTypedArray())
+        }
     }
 
     val scope = rememberCoroutineScope()
 
-    // ---- VPN consent + TUN start once a host link exists (Milestone 6) ----
+    // ---- VPN consent + TUN start once a host link exists (Milestone 6/7) ----
     var tunPackets by remember { mutableStateOf(0L) }
+    var quicState by remember { mutableStateOf(0) }
+
+    fun vpnIntent(): android.content.Intent =
+        android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java).apply {
+            val h = client.connectedHost
+            if (h?.address != null) {
+                putExtra(
+                    com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_HOST_ADDR,
+                    "${h.address}:${h.tunnelPort}"
+                )
+                putExtra(
+                    com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_HOST_FP,
+                    h.fingerprint ?: ""
+                )
+            }
+        }
+
     val vpnLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
-            context.startForegroundService(
-                android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java)
-            )
+            context.startForegroundService(vpnIntent())
         }
     }
 
@@ -106,13 +129,12 @@ fun HomeScreen(
         if (prepare != null) {
             vpnLauncher.launch(prepare)
         } else {
-            context.startForegroundService(
-                android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java)
-            )
+            context.startForegroundService(vpnIntent())
         }
-        // Surface capture proof in the status line.
+        // Surface capture + tunnel proof in the status line.
         while (true) {
             tunPackets = clientViewModel.packetCount()
+            quicState = clientViewModel.tunnelState()
             kotlinx.coroutines.delay(1000)
         }
     }
@@ -149,6 +171,11 @@ fun HomeScreen(
             text = buildString {
                 append(if (home.internetAvailable) "Internet: connected" else "Internet: not connected")
                 if (tunPackets > 0) append("  •  TUN: $tunPackets packets")
+                when (quicState) {
+                    1 -> append("  •  QUIC connecting…")
+                    2 -> append("  •  QUIC connected")
+                    3 -> append("  •  QUIC reconnecting…")
+                }
             },
             style = MaterialTheme.typography.bodyMedium,
             color = Color.Gray
@@ -170,6 +197,7 @@ fun HomeScreen(
                 if (isHosting) {
                     hostViewModel.stopSharing()
                 } else if (missingPerms.isNotEmpty()) {
+                    pendingStartSharing = true
                     permissionLauncher.launch(Permissions.runtimePermissions().toTypedArray())
                 } else {
                     hostViewModel.startSharing()

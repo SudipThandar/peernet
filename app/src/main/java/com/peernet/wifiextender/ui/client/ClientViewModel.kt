@@ -76,6 +76,9 @@ class ClientViewModel @Inject constructor(
     /** Live TUN capture counter for the UI (0 when not capturing). */
     fun packetCount(): Long = rustCore.tunPacketCount()
 
+    /** QUIC tunnel state: 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
+    fun tunnelState(): Int = rustCore.tunnelState()
+
     /**
      * CONNECT button. Priority order:
      *  1. Learn the host id via mDNS, then JOIN its Wi-Fi Direct network with
@@ -305,6 +308,8 @@ class ClientViewModel @Inject constructor(
             put("name", host.name)
             put("port", host.port)
             put("address", host.address ?: "")
+            put("fp", host.fingerprint ?: "")
+            put("tp", host.tunnelPort)
         }
         val out = JSONArray()
         out.put(obj)

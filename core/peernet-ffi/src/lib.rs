@@ -11,13 +11,18 @@
 //!   which rules out double-close UB (stop path closes it exactly once)
 
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use jni::objects::{JClass, JString, JValue};
 use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
+use peernet_client::{ClientOptions, ClientState, TunnelClient};
 use peernet_core::SessionId;
+use peernet_host::HostServer;
 use tokio::io::unix::AsyncFd;
 use std::io::Read as _;
 
@@ -40,6 +45,28 @@ static TUN_FD: AtomicI32 = AtomicI32::new(-1);
 static TUN_STOP: AtomicBool = AtomicBool::new(false);
 static PACKETS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
+
+// ---------- PNTP engine state (Milestone 7) ----------
+
+/// Mirrors peernet_client::ClientState for cheap JNI polling:
+/// 0 Disconnected, 1 Connecting, 2 Connected, 3 Backoff.
+static TUNNEL_STATE: AtomicI32 = AtomicI32::new(0);
+static CLIENT_STARTING: AtomicBool = AtomicBool::new(false);
+/// Invalidates in-flight connects when a stop/new-start supersedes them.
+static ENGINE_GEN: AtomicU64 = AtomicU64::new(0);
+
+type HostSlot = Mutex<Option<std::sync::Arc<HostServer>>>;
+type ClientSlot = Mutex<Option<std::sync::Arc<TunnelClient>>>;
+
+fn host_slot() -> &'static HostSlot {
+    static S: OnceLock<HostSlot> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+fn client_slot() -> &'static ClientSlot {
+    static S: OnceLock<ClientSlot> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
 
 // ---------- Core info ----------
 
@@ -128,6 +155,192 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunPacketCo
     _class: JClass<'local>,
 ) -> jlong {
     PACKETS.load(Ordering::Relaxed) as jlong
+}
+
+// ---------- PNTP engine lifecycle (Milestone 7) ----------
+
+/// NativeCore.startHost(port: Int, deviceName: String) -> String
+///
+/// Binds the QUIC host server on 0.0.0.0:port and runs its accept loop on the
+/// engine runtime. Returns the SHA-256 certificate fingerprint (lowercase
+/// hex) for advertisement, or "" when a server is already running or the
+/// bind failed.
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    port: jint,
+    device_name: JString<'local>,
+) -> JString<'local> {
+    let name = get_string(env, &device_name);
+    let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_some() {
+        return create_string(env, "");
+    }
+    let addr = SocketAddr::from(([0, 0, 0, 0], port.clamp(1, 65535) as u16));
+    match HostServer::bind(addr, &name) {
+        Ok(server) => {
+            let fingerprint = server.fingerprint_hex().to_string();
+            let server = std::sync::Arc::new(server);
+            runtime().spawn({
+                let server = server.clone();
+                async move { server.run().await }
+            });
+            *guard = Some(server);
+            create_string(env, &fingerprint)
+        }
+        Err(e) => {
+            crate::jni_log(&format!("[host] bind failed: {e}"));
+            create_string(env, "")
+        }
+    }
+}
+
+/// NativeCore.stopHost() -> Boolean
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_stopHost<
+    'local,
+>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
+    match guard.take() {
+        Some(server) => {
+            server.shutdown();
+            1
+        }
+        None => 0,
+    }
+}
+
+/// NativeCore.hostSessionCount() -> Int
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_hostSessionCount<
+    'local,
+>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jint {
+    let guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().map(|s| s.session_count()).unwrap_or(0) as jint
+}
+
+/// NativeCore.startTunnel(serverAddr: String, fingerprintHex: String, deviceName: String) -> Boolean
+///
+/// Connects to the pinned-fingerprint QUIC host. The handshake runs on the
+/// engine runtime; progress is observable via tunnelState(). Returns false
+/// only when a connect attempt is already in flight or arguments are bad —
+/// handshake failure surfaces as tunnelState() == 0.
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    server_addr: JString<'local>,
+    fingerprint_hex: JString<'local>,
+    device_name: JString<'local>,
+) -> jboolean {
+    let addr = get_string(env, &server_addr);
+    let fp = get_string(env, &fingerprint_hex);
+    let name = get_string(env, &device_name);
+
+    let Ok(parsed) = SocketAddr::from_str(&addr) else {
+        return 0;
+    };
+    if !CLIENT_STARTING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) {
+        return 0;
+    }
+
+    TUNNEL_STATE.store(1, Ordering::SeqCst); // Connecting
+    let gen = ENGINE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    runtime().spawn(async move {
+        let opts = ClientOptions::new(parsed, "peernet-host", fp, name);
+        match TunnelClient::connect(opts).await {
+            Ok(client) => {
+                if ENGINE_GEN.load(Ordering::SeqCst) != gen {
+                    // Superseded by stop/new start during the handshake.
+                    client.shutdown();
+                    return;
+                }
+                let client = std::sync::Arc::new(client);
+                *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(client.clone());
+                CLIENT_STARTING.store(false, Ordering::SeqCst);
+                // Mirror watch-channel state into the atomic until the link dies.
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if ENGINE_GEN.load(Ordering::SeqCst) != gen {
+                        break;
+                    }
+                    let s = client.state();
+                    TUNNEL_STATE.store(map_state(s), Ordering::SeqCst);
+                    if matches!(s, ClientState::Backoff | ClientState::Disconnected) {
+                        break;
+                    }
+                }
+                *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+            Err(e) => {
+                crate::jni_log(&format!("[client] connect failed: {e}"));
+                if ENGINE_GEN.load(Ordering::SeqCst) == gen {
+                    TUNNEL_STATE.store(0, Ordering::SeqCst);
+                    CLIENT_STARTING.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+    1
+}
+
+fn map_state(state: ClientState) -> i32 {
+    match state {
+        ClientState::Disconnected => 0,
+        ClientState::Connecting => 1,
+        ClientState::Connected => 2,
+        ClientState::Backoff => 3,
+    }
+}
+
+/// NativeCore.stopTunnel() -> Boolean
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_stopTunnel<
+    'local,
+>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    CLIENT_STARTING.store(false, Ordering::SeqCst);
+    TUNNEL_STATE.store(0, Ordering::SeqCst);
+    // Invalidate any handshake still in flight.
+    ENGINE_GEN.fetch_add(1, Ordering::SeqCst);
+    // Clone the handle out before touching the slot again; shutdown() is
+    // synchronous so it is safe outside the lock.
+    let client = {
+        let guard = client_slot().lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().map(std::sync::Arc::clone)
+    };
+    match client {
+        Some(client) => {
+            client.shutdown();
+            *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+            1
+        }
+        None => 0,
+    }
+}
+
+/// NativeCore.tunnelState() -> Int (see TUNNEL_STATE mapping)
+#[no_mangle]
+pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunnelState<
+    'local,
+>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jint {
+    TUNNEL_STATE.load(Ordering::SeqCst)
 }
 
 async fn run_capture(file: OwnedFd, mtu: usize) {
@@ -224,6 +437,12 @@ fn create_string<'local>(env: JNIEnv<'local>, value: &str) -> JString<'local> {
             Err(_) => unsafe { JString::from_raw(std::ptr::null_mut()) },
         },
     }
+}
+
+fn get_string<'local>(env: JNIEnv<'local>, value: &JString<'local>) -> String {
+    env.get_string(value)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 // Keep JValue referenced so the import stays valid across cfg combinations.

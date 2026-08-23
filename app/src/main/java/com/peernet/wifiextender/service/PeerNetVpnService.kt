@@ -30,6 +30,10 @@ class PeerNetVpnService : VpnService() {
 
     private var tunFd: Int = -1
 
+    @Volatile private var hostAddr: String? = null
+
+    @Volatile private var hostFp: String? = null
+
     override fun onBind(intent: Intent?) = super.onBind(intent)
 
     override fun onCreate() {
@@ -44,6 +48,11 @@ class PeerNetVpnService : VpnService() {
                 return START_NOT_STICKY
             }
         }
+
+        // Remember the latest host endpoint so a restart (START_STICKY path
+        // or re-start while capturing) reconnects to the right host.
+        intent?.getStringExtra(EXTRA_HOST_ADDR)?.let { hostAddr = it }
+        intent?.getStringExtra(EXTRA_HOST_FP)?.let { hostFp = it }
 
         if (tunFd != -1) {
             // Already capturing.
@@ -73,8 +82,25 @@ class PeerNetVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        connectEngine()
+
         Timber.i("TUN capture started (fd=%d mtu=%d)", fd, MTU)
         return START_STICKY
+    }
+
+    /**
+     * M7: drives the PNTP QUIC client against the linked host once the TUN
+     * is up. Best-effort: without engine/endpoint info the capture still
+     * runs (counters only), matching pre-M7 behavior.
+     */
+    private fun connectEngine() {
+        val addr = hostAddr ?: return
+        val fp = hostFp ?: return
+        if (!rustCore.startTunnel(addr, fp, android.os.Build.MODEL)) {
+            Timber.w("QUIC tunnel start refused for %s", addr)
+        } else {
+            Timber.i("QUIC tunnel connecting to %s", addr)
+        }
     }
 
     /**
@@ -111,6 +137,7 @@ class PeerNetVpnService : VpnService() {
     }
 
     private fun stopTunnel() {
+        rustCore.stopTunnel()
         rustCore.stopTunCapture()
         tunFd = -1
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -145,6 +172,8 @@ class PeerNetVpnService : VpnService() {
 
     companion object {
         const val ACTION_STOP = "com.peernet.wifiextender.action.STOP_VPN"
+        const val EXTRA_HOST_ADDR = "host_addr"
+        const val EXTRA_HOST_FP = "host_fp"
         const val SESSION = "PeerNet"
         const val MTU = 1280
         const val VPN_ADDRESS = "10.215.17.2"

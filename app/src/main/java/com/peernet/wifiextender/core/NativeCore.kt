@@ -34,6 +34,21 @@ internal object NativeCore {
     external fun stopTunCapture(): Boolean
 
     external fun tunPacketCount(): Long
+
+    /** Binds the QUIC host on 0.0.0.0:port; returns cert fingerprint or "". */
+    external fun startHost(port: Int, deviceName: String): String
+
+    external fun stopHost(): Boolean
+
+    external fun hostSessionCount(): Int
+
+    /** Connects to a pinned-fingerprint QUIC host. Progress via tunnelState(). */
+    external fun startTunnel(serverAddr: String, fingerprintHex: String, deviceName: String): Boolean
+
+    external fun stopTunnel(): Boolean
+
+    /** 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
+    external fun tunnelState(): Int
 }
 
 /**
@@ -84,5 +99,41 @@ class RustCoreBridge @Inject constructor() {
     fun tunPacketCount(): Long {
         if (!isAvailable) return 0L
         return runCatching { NativeCore.tunPacketCount() }.getOrDefault(0L)
+    }
+
+    /** Cert fingerprint (lowercase hex) or null when the engine refused. */
+    fun startHost(port: Int, deviceName: String): String? {
+        if (!isAvailable) return null
+        return runCatching { NativeCore.startHost(port, deviceName).ifEmpty { null } }
+            .onFailure { Timber.w(it, "startHost failed") }
+            .getOrNull()
+    }
+
+    fun stopHost(): Boolean {
+        if (!isAvailable) return false
+        return runCatching { NativeCore.stopHost() }.getOrDefault(false)
+    }
+
+    fun hostSessionCount(): Int {
+        if (!isAvailable) return 0
+        return runCatching { NativeCore.hostSessionCount() }.getOrDefault(0)
+    }
+
+    fun startTunnel(serverAddr: String, fingerprintHex: String, deviceName: String): Boolean {
+        if (!isAvailable) return false
+        return runCatching { NativeCore.startTunnel(serverAddr, fingerprintHex, deviceName) }
+            .onFailure { Timber.w(it, "startTunnel failed") }
+            .getOrDefault(false)
+    }
+
+    fun stopTunnel(): Boolean {
+        if (!isAvailable) return false
+        return runCatching { NativeCore.stopTunnel() }.getOrDefault(false)
+    }
+
+    /** 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
+    fun tunnelState(): Int {
+        if (!isAvailable) return 0
+        return runCatching { NativeCore.tunnelState() }.getOrDefault(0)
     }
 }
