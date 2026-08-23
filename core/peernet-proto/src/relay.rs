@@ -44,7 +44,7 @@ fn encode_ip(ip: IpAddr, out: &mut Vec<u8>) -> u8 {
 
 fn decode_ip(flags: u8, cur: &mut usize, bytes: &[u8]) -> Result<IpAddr, PntpError> {
     let need = if flags & FLAG_IPV6 != 0 { 16 } else { 4 };
-    if cur + need > bytes.len() {
+    if *cur + need > bytes.len() {
         return Err(PntpError::UnexpectedEof);
     }
     let ip = if need == 4 {
