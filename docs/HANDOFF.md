@@ -67,7 +67,7 @@ is NOT in the repo — it lives outside. Docs only reveal M10/M11/M12 themes.
 | M6 | VpnService TUN + Rust async capture (fd ownership, protect-first) | Done |
 | **M7 part 1** | **Engine lifecycle via FFI + permission-at-launch + port split** | **Done** |
 | **M7 part 2** | **UDP/DNS data path end-to-end through TUN** | **Done** |
-| M7 part 3 | TCP data path (needs local userspace termination, e.g. smoltcp) | NOT started |
+| **M7 part 3+3b** | **TCP data path: smoltcp terminator + QUIC relay-stream wiring** | **Done (needs device test)** |
 
 This session's commits (oldest to newest):
 - `75b22e2` M6 fixes: stable branded SSID/passphrase, multicast locks both sides,
@@ -83,6 +83,17 @@ This session's commits (oldest to newest):
   `connection().send_datagram`, reverse-path pump rebuilding packets into TUN, orig-dst
   source rewrite (virtual DNS), split read/write fd halves, CAPTURE_FDS close-once tracking,
   loopback roundtrip tests inside lib.rs.
+- `8f0a11e`..`6d74598` M7 part 3: new `peernet-tcp` crate — smoltcp-based transparent TCP
+  terminator (per-SYN listeners keyed on full 4-tuple), channel seam (`TcpStack::channels`)
+  for upstream, simulated-phone loopback tests (handshake/echo/close, concurrent flows,
+  256KB bulk). Key fixes: AnyIP + whitequark `/0` local-prefix trick for arbitrary
+  destinations; Arc/Mutex queues so the stack is Send; downstream backpressure
+  (`PENDING_CAP`) instead of flow-killing.
+- `541e613` M7 part 3b: FFI wiring — `spawn_tcp_termination()` builds the engine per
+  tunnel generation; forward_outbound feeds proto==6 packets in; orchestrator task maps
+  ToUpstream::Open/Data/Eof onto one QUIC bi-stream per flow (framed TcpRelayHeader then
+  raw bytes), reader halves pump internet->engine; Eof = half-close; teardown drops intake
+  on stop/link-death.
 
 ## 4. Current State — What Works vs What's Left
 
@@ -100,16 +111,18 @@ This session's commits (oldest to newest):
 5. **UDP/DNS forwarding (M7 part 2)**: phone's UDP traffic flows TUN -> QUIC relay datagrams
    -> host NAT -> internet; replies rebuilt as valid IPv4/UDP into TUN. DNS via the virtual
    IP works because replies are rewritten to claim the ORIGINAL destination as source.
-6. Pure-Rust gates all green: handshake, relays, NAT, DNS redirect, concurrency, data-path roundtrip.
+6. **TCP forwarding (M7 part 3+3b)**: phone TCP flows are terminated locally by the
+   peernet-tcp engine and carried as one QUIC bi-stream per flow (TcpRelayHeader + raw
+   bytes) to the host, which splices them to real sockets (idle timeout, FIN both ways).
+   Full-duplex with backpressure. All CI-verified in loopback; NOT yet device-tested.
+7. Pure-Rust gates all green: handshake, relays, NAT, DNS redirect, concurrency, data-path roundtrip.
 
 ### NOT yet done (the gap)
-- **TCP still doesn't flow.** Outbound TCP is counted (`TCP_DROPPED`) and logged once.
-  Needs local userspace termination (smoltcp or equivalent) per-flow, piping bytes over
-  `TcpRelayHeader` streams — the host side already supports exactly that wire format.
-  This is M7 part 3; until then web browsing over the tunnel does not work (DNS + UDP apps do).
+- **Device test of the full internet path** (PC hosts group -> phone browses through it).
 - No reconnect/backoff integration between tunnel drops and the Wi-Fi link state machine yet.
 - `jni_log()` still a no-op on device (counters are the observability story).
 - IPv6 dropped silently (TUN config v4-only).
+- UDP flow table never evicts (no LRU/timeout yet); engine `PENDING_CAP` is the only RAM guard.
 - docs/ARCHITECTURE.md, TESTING.md, PLAY_STORE_NOTES.md still placeholders.
 
 ## 5. Key Design Rules (do not break these)
@@ -147,22 +160,22 @@ This session's commits (oldest to newest):
 
 ## 7. Suggested Plan Going Forward
 
-1. **M7 part 3 (next): TCP data path.**
-   - Add smoltcp (or equivalent userspace stack) per flow: terminate each phone TCP connection
-     locally, pipe bytes over QUIC streams using `TcpRelayHeader` (host already pipes
-     stream-to-real-socket bidirectionally until EOF/idle).
-   - Wire into `forward_outbound`: proto==6 currently counts+drops.
-   - Extend lib.rs loopback tests: fake TUN flow through termination -> echo server -> rebuild.
+1. **Device test (next): full internet path.**
+   - Install latest CI APK (`peernet-debug-apk` artifact) on phone; run host on PC
+     (or PC-hosted group via the app's share mode on a second Android, per current flow).
+   - Verify: DNS resolves, browser loads sites over TCP through tunnel, Speedtest works.
+   - Watch `tunPacketCount()` counters; TCP_TERMINATED should climb while browsing.
 2. **M8-ish: resilience.** Tunnel reconnect integration with ClientLinkManager backoff;
    stop-tunnel on P2P disconnect; real logcat logging replacing no-op jni_log; tunnel stats
    surfaced in UI.
 3. **M9-ish: hardening.** MTU review, IPv6 decision, UDP flow LRU/timeout (table never evicts),
-   battery/doze behavior, NAT port-collision fallback when port preservation fails.
+   battery/doze behavior, NAT port-collision fallback when port preservation fails,
+   TCP idle-timeout tuning vs long-lived connections.
 4. M10: foreground-service ownership refinements. M11: TESTING.md + device matrix passes.
    M12: PLAY_STORE_NOTES.md, signing, listing. Backlog: Windows client (Phase 2).
 
-Immediate concrete next step: M7 part 3 — smoltcp-based TCP termination wired into
-`forward_outbound`, loopback-tested in lib.rs before any device run.
+Immediate concrete next step: device test — CI APK on phone + host running, browse
+through the tunnel. Everything up to that point is loopback-verified.
 
 ## 8. Verification Checklist for Any Change
 
