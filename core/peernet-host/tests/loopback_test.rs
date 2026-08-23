@@ -68,6 +68,14 @@ async fn handshake_heartbeat_and_stats() {
             .udp_exchange(45987, echo_addr, &vec![7u8; 1024])
             .await
             .expect("udp relay roundtrip");
+        if echoed.len() != 1024 {
+            eprintln!(
+                "[diag] echoed.len={} prefix={:?} suffix={:?}",
+                echoed.len(),
+                &echoed[..16.min(echoed.len())],
+                &echoed[echoed.len().saturating_sub(16)..]
+            );
+        }
         assert_eq!(echoed.len(), 1024);
 
         let host_stats = server.stats_snapshot();
