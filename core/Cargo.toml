@@ -5,6 +5,7 @@ members = [
     "peernet-core",
     "peernet-host",
     "peernet-client",
+    "peernet-tcp",
     "peernet-ffi",
 ]
 

@@ -1,0 +1,13 @@
+[package]
+name = "peernet-tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+] }
