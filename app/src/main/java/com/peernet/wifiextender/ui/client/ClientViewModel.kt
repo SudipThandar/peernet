@@ -39,7 +39,8 @@ data class ClientUiState(
 class ClientViewModel @Inject constructor(
     @ApplicationContext context: Context,
     private val wifiDirect: WifiDirectManager,
-    private val linkManager: ClientLinkManager
+    private val linkManager: ClientLinkManager,
+    private val rustCore: com.peernet.wifiextender.core.RustCoreBridge
 ) : ViewModel() {
 
     private val discovery = NsdClientDiscovery(context)
@@ -52,6 +53,11 @@ class ClientViewModel @Inject constructor(
     init {
         _uiState.update { it.copy(savedHostIds = loadSavedHostIds()) }
     }
+
+    /** Live TUN capture counter for the UI (0 when not capturing). */
+    fun packetCount(): Long = rustCore.tunPacketCount()
+
+    fun isVpnCaptureActive(): Boolean = rustCore.isAvailable && _uiState.value.connectedHost != null
 
     /**
      * One explicit round: scan current network -> link to the first

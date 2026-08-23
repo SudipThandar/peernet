@@ -76,6 +76,43 @@ fun HomeScreen(
 
     val scope = rememberCoroutineScope()
 
+    // ---- VPN consent + TUN start once a host link exists (Milestone 6) ----
+    var tunPackets by remember { mutableStateOf(0L) }
+    val vpnLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            context.startForegroundService(
+                android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java)
+            )
+        }
+    }
+
+    fun stopVpn() {
+        context.stopService(
+            android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java)
+        )
+    }
+
+    LaunchedEffect(client.connectedHost?.hostId) {
+        if (client.connectedHost == null) return@LaunchedEffect
+        val prepare = android.net.VpnService.prepare(context)
+        if (prepare != null) {
+            vpnLauncher.launch(
+                androidx.activity.result.IntentSenderRequest.Builder(prepare).build()
+            )
+        } else {
+            context.startForegroundService(
+                android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java)
+            )
+        }
+        // Surface capture proof in the status line.
+        while (true) {
+            tunPackets = clientViewModel.packetCount()
+            kotlinx.coroutines.delay(1000)
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -105,7 +142,10 @@ fun HomeScreen(
         Text(statusText, style = MaterialTheme.typography.headlineMedium, color = statusColor)
 
         Text(
-            text = if (home.internetAvailable) "Internet: connected" else "Internet: not connected",
+            text = buildString {
+                append(if (home.internetAvailable) "Internet: connected" else "Internet: not connected")
+                if (tunPackets > 0) append("  •  TUN: $tunPackets packets")
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = Color.Gray
         )
@@ -148,11 +188,14 @@ fun HomeScreen(
             onClick = {
                 when {
                     // Client disconnect
-                    linkedHost != null && !isHosting -> clientViewModel.disconnect()
+                    linkedHost != null && !isHosting -> {
+                        stopVpn()
+                        clientViewModel.disconnect()
+                    }
                     // Host tapping CONNECT: stop sharing first, then search as client
                     isHosting -> scope.launch {
                         hostViewModel.stopSharing()
-                        delay(2_500) // let the Wi-Fi Direct group tear down before scanning
+                        delay(2_500)
                         clientViewModel.connectNow()
                     }
                     else -> clientViewModel.connectNow()

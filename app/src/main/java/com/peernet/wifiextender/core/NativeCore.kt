@@ -27,6 +27,13 @@ internal object NativeCore {
     external fun version(): String
 
     external fun newSessionId(): String
+
+    /** Takes ownership of the TUN fd. Returns false when busy/invalid. */
+    external fun startTunCapture(fd: Int, mtu: Int): Boolean
+
+    external fun stopTunCapture(): Boolean
+
+    external fun tunPacketCount(): Long
 }
 
 /**
@@ -55,5 +62,27 @@ class RustCoreBridge @Inject constructor() {
         return runCatching { NativeCore.newSessionId().ifEmpty { null } }
             .onFailure { Timber.w(it, "NativeCore.newSessionId failed") }
             .getOrNull()
+    }
+
+    /**
+     * Hands a TUN file descriptor to the engine. The fd must already be
+     * protected. After a successful call, Rust owns the fd — Kotlin must not
+     * close it. Returns false when capture is already running or unavailable.
+     */
+    fun startTunCapture(fd: Int, mtu: Int): Boolean {
+        if (!isAvailable) return false
+        return runCatching { NativeCore.startTunCapture(fd, mtu) }
+            .onFailure { Timber.w(it, "startTunCapture failed") }
+            .getOrDefault(false)
+    }
+
+    fun stopTunCapture(): Boolean {
+        if (!isAvailable) return false
+        return runCatching { NativeCore.stopTunCapture() }.getOrDefault(false)
+    }
+
+    fun tunPacketCount(): Long {
+        if (!isAvailable) return 0L
+        return runCatching { NativeCore.tunPacketCount() }.getOrDefault(0L)
     }
 }
