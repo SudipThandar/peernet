@@ -274,11 +274,16 @@ impl TunnelClient {
         // Half-close so the remote side sees EOF and can finish its reply.
         let _ = tx.shutdown().await;
 
+        // Drain until the host closes its side (FIN -> Ok(None)).
         let mut out = Vec::new();
-        // quinn's inherent read_to_end drains until the host closes the stream.
-        rx.read_to_end(&mut out)
-            .await
-            .map_err(|e| format!("reply read failed: {e}"))?;
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match rx.read(&mut buf).await {
+                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(n)) => out.extend_from_slice(&buf[..n]),
+                Err(e) => return Err(format!("reply read failed: {e}")),
+            }
+        }
         Ok(out)
     }
 
