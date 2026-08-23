@@ -228,6 +228,9 @@ impl TcpStack {
         let _ = iface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(10, 215, 17, 253));
+        // Flows target arbitrary internet addresses that are not our local
+        // IP; AnyIP makes the interface accept them so listeners can match.
+        iface.set_any_ip(true);
 
         let mut sockets = SocketSet::new(Vec::new());
 
