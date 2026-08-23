@@ -19,7 +19,7 @@ use peernet_core::{SessionId, TunnelStats};
 use peernet_proto::{
     read_frame, write_frame, MessageKind, PeerMessage, TcpRelayHeader,
     ALPN, DATAGRAM_BUFFER_BYTES, IDLE_TIMEOUT_SECS, KEEPALIVE_INTERVAL_SECS,
-    TCP_CONNECT_TIMEOUT_SECS, TCP_IDLE_TIMEOUT_SECS, UDP_HEADER_BASE,
+    TCP_CONNECT_TIMEOUT_SECS, TCP_IDLE_TIMEOUT_SECS,
 };
 use quinn::{Connection, Endpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -371,14 +371,15 @@ async fn tcp_relay(
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
+            // quinn RecvStream::read yields Option<usize> (None = FIN).
             match tokio::time::timeout(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS), rx.read(&mut buf)).await {
-                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
-                Ok(Ok(n)) => {
+                Ok(Ok(Some(n))) => {
                     stats.record_down(n as u64);
                     if tcp_w.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
             }
         }
         let _ = tcp_w.shutdown().await;

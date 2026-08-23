@@ -17,7 +17,7 @@ use peernet_proto::{
 };
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
 /// Mirrors the Kotlin client lifecycle.
@@ -274,7 +274,7 @@ impl TunnelClient {
         // Half-close so the remote side sees EOF and can finish its reply.
         let _ = tx.shutdown().await;
 
-        let mut out = Vec::new();
+        // quinn's inherent read_to_end drains until the host closes the stream.
         rx.read_to_end(&mut out)
             .await
             .map_err(|e| format!("reply read failed: {e}"))?;
