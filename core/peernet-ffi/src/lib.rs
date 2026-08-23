@@ -1,4 +1,4 @@
-//! JNI bridge between the Android app and the Rust engine.
+﻿//! JNI bridge between the Android app and the Rust engine.
 //!
 //! Loaded from Kotlin via `System.loadLibrary("peernet_core")`.
 //! Symbol names must match `com.peernet.wifiextender.core.NativeCore` exactly.
@@ -6,7 +6,7 @@
 //! Constraints honored here:
 //! - no panics cross the FFI boundary
 //! - TUN fd is received as i32, wrapped in `OwnedFd`, and driven exclusively
-//!   through tokio async I/O (`AsyncFd`) — never blocking reads
+//!   through tokio async I/O (`AsyncFd`) â€” never blocking reads
 //! - ownership transfers to Rust on start; Kotlin never closes the same fd,
 //!   which rules out double-close UB (stop path closes it exactly once)
 
@@ -19,9 +19,9 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
 use peernet_core::SessionId;
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt as _, ReadExt};
+use std::io::Read as _;
 
-/// Dedicated engine runtime — JNI has no ambient tokio context.
+/// Dedicated engine runtime â€” JNI has no ambient tokio context.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -84,7 +84,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunCap
         return 0;
     }
     if TUN_FD.swap(fd as i32, Ordering::SeqCst) != -1 {
-        // Already capturing; hand the fd back untouched by leaving it open —
+        // Already capturing; hand the fd back untouched by leaving it open â€”
         // caller treats false as "abort" and will not close it either.
         return 0;
     }
@@ -156,8 +156,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
             Err(_) => break,
         };
         let result = guard.try_io(|inner| {
-            let mut inner = inner.get_ref();
-            (&mut inner).read(&mut buf)
+            inner.get_mut().read(&mut buf)
         });
         match result {
             Ok(Ok(0)) => break, // EOF: interface closed

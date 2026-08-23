@@ -30,7 +30,7 @@ class PeerNetVpnService : VpnService() {
 
     private var tunFd: Int = -1
 
-    override fun onBind(intent: Intent?) = super.onBind()
+    override fun onBind(intent: Intent?) = super.onBind(intent)
 
     override fun onCreate() {
         super.onCreate()

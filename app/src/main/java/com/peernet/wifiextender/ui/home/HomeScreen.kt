@@ -79,7 +79,7 @@ fun HomeScreen(
     // ---- VPN consent + TUN start once a host link exists (Milestone 6) ----
     var tunPackets by remember { mutableStateOf(0L) }
     val vpnLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
+        ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
             context.startForegroundService(
@@ -98,9 +98,7 @@ fun HomeScreen(
         if (client.connectedHost == null) return@LaunchedEffect
         val prepare = android.net.VpnService.prepare(context)
         if (prepare != null) {
-            vpnLauncher.launch(
-                androidx.activity.result.IntentSenderRequest.Builder(prepare).build()
-            )
+            vpnLauncher.launch(prepare)
         } else {
             context.startForegroundService(
                 android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java)
