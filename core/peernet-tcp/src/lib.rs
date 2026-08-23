@@ -506,7 +506,6 @@ mod tests {
         phone_sockets: SocketSet<'static>,
         pkt_in_tx: Option<mpsc::Sender<Vec<u8>>>,
         pkt_out_rx: mpsc::Receiver<Vec<u8>>,
-        to_up_rx: mpsc::Receiver<ToUpstream>,
         up_tx: Option<mpsc::Sender<FromUpstream>>,
         bridge: Bridge,
         started: Instant,
@@ -571,7 +570,6 @@ mod tests {
                 phone_sockets: sockets,
                 pkt_in_tx: Some(pkt_in_tx),
                 pkt_out_rx,
-                to_up_rx,
                 up_tx: Some(up_tx),
                 bridge: Bridge {
                     seen_open,
@@ -685,7 +683,6 @@ mod tests {
             self.up_tx.take();
             std::thread::sleep(Duration::from_millis(30));
             while self.pkt_out_rx.try_recv().is_ok() {}
-            while self.to_up_rx.try_recv().is_ok() {}
         }
     }
 
