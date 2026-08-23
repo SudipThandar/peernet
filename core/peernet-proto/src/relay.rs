@@ -25,7 +25,8 @@ pub const FLAG_RTC: u8 = 0x10;
 /// Wire sizes: magic(2)+ver(1)+type(1) + ports(2+2) + flags(1) + ip(4|16).
 pub const TCP_HEADER_LEN_V4: usize = 13;
 pub const TCP_HEADER_LEN_V6: usize = 25;
-pub const UDP_HEADER_BASE: usize = 7; // magic..type + session(4)
+/// magic(2)+ver(1)+type(1)+session(4).
+pub const UDP_HEADER_BASE: usize = 8;
 pub const UDP_HEADER_LEN_V4: usize = UDP_HEADER_BASE + 2 + 4 + 2 + 1;
 pub const UDP_HEADER_LEN_V6: usize = UDP_HEADER_BASE + 2 + 16 + 2 + 1;
 
