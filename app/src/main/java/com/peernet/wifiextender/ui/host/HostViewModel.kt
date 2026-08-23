@@ -26,7 +26,9 @@ data class HostUiState(
     val connectedClients: Int = 0,
     val error: String? = null,
     /** False when the QUIC engine never came up — clients cannot tunnel. */
-    val engineReady: Boolean = false
+    val engineReady: Boolean = false,
+    /** The engine's own reason, when it refused to start. */
+    val engineFailure: String? = null
 )
 
 @HiltViewModel
@@ -45,7 +47,8 @@ class HostViewModel @Inject constructor(
                 passphrase = s.passphrase,
                 passphraseAvailable = s.passphraseAvailable,
                 groupOwnerAddress = s.groupOwnerAddress,
-                engineReady = hostRuntime.engineReady
+                engineReady = hostRuntime.engineReady,
+                engineFailure = hostRuntime.engineFailure
             )
             else -> HostUiState(hostState = HostState.IDLE)
         }

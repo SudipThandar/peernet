@@ -38,6 +38,10 @@ class HostRuntime @Inject constructor(
     @Volatile
     private var advertisedFingerprint: String? = null
 
+    /** Engine's own reason for refusing to start, shown on the host screen. */
+    @Volatile
+    private var engineError: String? = null
+
     init {
         scope.launch {
             wifiDirect.state.collect { s ->
@@ -131,6 +135,14 @@ class HostRuntime @Inject constructor(
         get() = !engineFingerprint.isNullOrBlank()
 
     /**
+     * Why the engine is not usable, in the engine's own words — the host phone
+     * is the only place this is visible, and a share without an engine looks
+     * healthy while being useless to every client.
+     */
+    val engineFailure: String?
+        get() = if (engineReady) null else (engineError ?: "tunnel engine did not start")
+
+    /**
      * Starts the tunnel engine, retrying once through a stop: a leftover
      * server from an earlier share still owns the port and would make every
      * later share unusable (the engine refuses and clients get no pin).
@@ -139,10 +151,15 @@ class HostRuntime @Inject constructor(
         val port = NsdHostAdvertiser.PNTP_PORT
         val name = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
         val dns = systemDnsUpstream()
+        engineError = null
         rustCore.startHost(port, name, dns)?.let { return it }
-        android.util.Log.w("HostRuntime", "engine start refused; recycling previous instance")
+        android.util.Log.w("HostRuntime", "engine start refused (${rustCore.lastError()}); recycling")
         rustCore.stopHost()
-        return rustCore.startHost(port, name, dns)
+        val second = rustCore.startHost(port, name, dns)
+        if (second == null) {
+            engineError = rustCore.lastError()?.ifBlank { null }
+        }
+        return second
     }
 
     /**

@@ -257,6 +257,28 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunPacketCo
 
 // ---------- PNTP engine lifecycle (Milestone 7) ----------
 
+/// Binds the QUIC host server from *any* thread.
+///
+/// quinn registers the UDP socket with the ambient tokio reactor while
+/// `Endpoint::server` runs, and a JNI thread has no runtime context: without
+/// entering the engine runtime first this fails on-device with "no async
+/// runtime found", the host has no certificate to advertise, and every client
+/// silently loses its tunnel — while every `#[tokio::test]` still passes.
+pub fn bind_host_server(addr: SocketAddr, device_name: &str, dns: &str) -> Result<HostServer, String> {
+    let _guard = runtime().enter();
+    let server = HostServer::bind(addr, device_name)?;
+    match SocketAddr::from_str(dns.trim()) {
+        Ok(resolver) => {
+            server.set_dns_upstream(resolver);
+            crate::jni_log(&format!("[host] DNS upstream {resolver}"));
+        }
+        Err(_) => {
+            crate::jni_log("[host] DNS upstream unparsable; keeping built-in default");
+        }
+    }
+    Ok(server)
+}
+
 /// NativeCore.startHost(port: Int, deviceName: String, dnsUpstream: String) -> String
 ///
 /// Binds the QUIC host server on 0.0.0.0:port and runs its accept loop on the
@@ -264,7 +286,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunPacketCo
 /// at the tunnel's virtual resolver get redirected; an unparsable value falls
 /// back to the server default. Returns the SHA-256 certificate fingerprint
 /// (lowercase hex) for advertisement, or "" when a server is already running
-/// or the bind failed.
+/// or the bind failed (reason readable via lastError()).
 #[no_mangle]
 pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
     'local,
@@ -279,31 +301,25 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
     let dns = get_string(&mut env, &dns_upstream);
     let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_some() {
+        set_last_error("host engine already running on this port");
         return create_string(env, "");
     }
     let addr = SocketAddr::from(([0, 0, 0, 0], port.clamp(1, 65535) as u16));
-    match HostServer::bind(addr, &name) {
+    match bind_host_server(addr, &name, &dns) {
         Ok(server) => {
             let fingerprint = server.fingerprint_hex().to_string();
-            match SocketAddr::from_str(dns.trim()) {
-                Ok(resolver) => {
-                    server.set_dns_upstream(resolver);
-                    crate::jni_log(&format!("[host] DNS upstream {resolver}"));
-                }
-                Err(_) => {
-                    crate::jni_log("[host] DNS upstream unset; keeping built-in default");
-                }
-            }
             let server = std::sync::Arc::new(server);
             runtime().spawn({
                 let server = server.clone();
                 async move { server.run().await }
             });
             *guard = Some(server);
+            crate::jni_log(&format!("[host] engine up on {addr}, pin {fingerprint}"));
             create_string(env, &fingerprint)
         }
         Err(e) => {
             set_last_error(&format!("host bind failed: {e}"));
+            crate::jni_log(&format!("[host] bind failed: {e}"));
             create_string(env, "")
         }
     }
@@ -1084,6 +1100,32 @@ mod tests {
 
     const CLIENT_TUN_IP: [u8; 4] = [10, 215, 17, 2];
     const CLIENT_SRC_PORT: u16 = 54321;
+
+    /// The host engine is started from a JNI thread, which has no tokio
+    /// context. quinn needs one to register its UDP socket, so binding must
+    /// enter the engine runtime itself. Regression guard for the defect that
+    /// made every on-device share advertise an empty pin (no tunnel possible)
+    /// while all `#[tokio::test]` cases passed, because they always supply a
+    /// runtime that production never has.
+    #[test]
+    fn host_binds_from_a_thread_with_no_runtime() {
+        std::thread::spawn(|| {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "test thread must mimic JNI: no ambient runtime"
+            );
+            let server = bind_host_server(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                "runtime-less-host",
+                "1.1.1.1:53",
+            )
+            .expect("host bind must not require an ambient runtime");
+            assert_eq!(server.fingerprint_hex().len(), 64, "pin must be advertisable");
+            server.shutdown();
+        })
+        .join()
+        .expect("bind thread panicked");
+    }
 
     fn start_echo() -> SocketAddr {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind echo");

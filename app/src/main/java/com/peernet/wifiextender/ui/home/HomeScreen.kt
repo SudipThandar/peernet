@@ -297,8 +297,8 @@ fun HomeScreen(
                         // Without the engine there is no pin and no relay, so
                         // a client would join the network and get nothing.
                         Text(
-                            "Tunnel engine not running — clients cannot get internet. " +
-                                "Tap the button to stop sharing, then share again.",
+                            "Tunnel engine not running — clients cannot get internet.\n" +
+                                "Reason: ${host.engineFailure ?: "unknown"}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error
                         )
