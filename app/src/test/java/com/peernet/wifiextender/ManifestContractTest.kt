@@ -63,19 +63,51 @@ class ManifestContractTest {
         }
     }
 
-    /** The `<service …>…</service>` (or self-closing) declaration for [name]. */
-    private fun serviceBlock(name: String): String {
-        val start = manifest.indexOf("android:name=\"$name\"")
-        assertTrue("no <service> declaration for $name", start > 0)
-        val open = manifest.lastIndexOf("<service", start)
-        val selfClose = manifest.indexOf("/>", start)
-        val blockClose = manifest.indexOf("</service>", start)
-        val end = when {
-            blockClose < 0 -> selfClose + 2
-            selfClose in 0 until blockClose -> selfClose + 2
-            else -> blockClose + "</service>".length
+    @Test
+    fun `foreground service types have their required permission`() {
+        // Android 14+ throws SecurityException from startForeground() when the
+        // declared type's permission is absent — the service dies in onCreate,
+        // which looks like "the feature just doesn't work".
+        val required = mapOf(
+            "specialUse" to "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+            "systemExempted" to "android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED",
+            "dataSync" to "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+            "connectedDevice" to "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+            "location" to "android.permission.FOREGROUND_SERVICE_LOCATION",
+            "mediaPlayback" to "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+        )
+        val declared = Regex("android:foregroundServiceType=\"([A-Za-z|]+)\"")
+            .findAll(manifest)
+            .flatMap { it.groupValues[1].split('|').asSequence() }
+            .toList()
+
+        assertTrue("no foregroundServiceType found — parser or manifest changed", declared.isNotEmpty())
+        for (type in declared) {
+            val permission = required[type] ?: continue
+            assertTrue(
+                "foregroundServiceType=\"$type\" needs <uses-permission $permission>",
+                manifest.contains(permission)
+            )
         }
-        return manifest.substring(open, end)
+    }
+
+    /** The `<service …>…</service>` (or self-closing) declaration for [name]. */
+
+    private fun serviceBlock(name: String): String {
+        val marker = manifest.indexOf("android:name=\"$name\"")
+        assertTrue("no <service> declaration for $name", marker > 0)
+        val open = manifest.lastIndexOf("<service", marker)
+        // Where the opening tag itself ends — note a child <property …/> also
+        // contains "/>", so scanning for the first "/>" would cut the block
+        // short and hide the intent filter.
+        val tagEnd = manifest.indexOf('>', marker)
+        assertTrue("malformed <service> for $name", tagEnd > open)
+        if (manifest[tagEnd - 1] == '/') {
+            return manifest.substring(open, tagEnd + 1)
+        }
+        val close = manifest.indexOf("</service>", tagEnd)
+        assertTrue("unterminated <service> for $name", close > tagEnd)
+        return manifest.substring(open, close + "</service>".length)
     }
 
     /**
