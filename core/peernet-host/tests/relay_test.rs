@@ -1,4 +1,4 @@
-//! PNTP relay harness (Milestone 5 gate).
+﻿//! PNTP relay harness (Milestone 5 gate).
 //!
 //! Covers the mandatory pre-device-testing cases:
 //! - TCP connect + bidirectional data + clean close
@@ -112,7 +112,7 @@ async fn udp_roundtrip_preserves_source_port() {
         let chosen_port = 45987u16;
         let payload = b"ping-via-nat";
         let reply = client
-            .udp_exchange(chosen_port, echo_addr, payload)
+            .udp_exchange_via_stream(chosen_port, echo_addr, payload)
             .await
             .expect("udp exchange");
 
@@ -155,7 +155,7 @@ async fn dns_redirect_to_custom_upstream() {
         // Query aimed at a public resolver; the host redirects it upstream.
         let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
         let response = client
-            .udp_exchange(5353, "8.8.8.8:53".parse().unwrap(), query)
+            .udp_exchange_via_stream(5353, "8.8.8.8:53".parse().unwrap(), query)
             .await
             .expect("dns exchange");
 
@@ -193,7 +193,7 @@ async fn concurrent_ten_tcp_plus_ten_udp_relays() {
             tasks.push(tokio::spawn(async move {
                 let msg = format!("udp-{i}").into_bytes();
                 let port = 46000u16 + i;
-                let reply = c.udp_exchange(port, udp_addr, &msg).await.expect("udp relay");
+                let reply = c.udp_exchange_via_stream(port, udp_addr, &msg).await.expect("udp relay");
                 assert_eq!(&reply[..2], &port.to_be_bytes());
                 assert_eq!(&reply[2..], &msg[..]);
             }));

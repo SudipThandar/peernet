@@ -1,9 +1,9 @@
-//! PNTP QUIC host server (Milestone 4).
+﻿//! PNTP QUIC host server (Milestone 4).
 //!
 //! Binds a `quinn` endpoint with:
 //! - ALPN `pn/1` (mismatched connections rejected by TLS)
 //! - self-signed certificate; clients pin its SHA-256 fingerprint
-//! - idle timeout 90s, keep-alive 20s, 64KB datagram buffers (spec §9.3)
+//! - idle timeout 90s, keep-alive 20s, 64KB datagram buffers (spec Â§9.3)
 //!
 //! Per connection: one control stream (Hello/KeepAlive/Stats/Bye), an
 //! unreliable-datagram echo path (replaced by real relays in Milestone 5),
@@ -106,7 +106,7 @@ impl HostServer {
         self.local_addr
     }
 
-    /// SHA-256 (hex) of this host's DER certificate — goes into QR/TXT records.
+    /// SHA-256 (hex) of this host's DER certificate â€” goes into QR/TXT records.
     pub fn fingerprint_hex(&self) -> &str {
         &self.fingerprint_hex
     }
@@ -275,6 +275,7 @@ async fn handle_connection(
         };
         let (tx, rx) = streams;
         tokio::spawn(service_stream(
+            nat.clone(),
             tx,
             rx,
             conn.clone(),
@@ -293,6 +294,7 @@ async fn handle_connection(
 
 #[allow(clippy::too_many_arguments)]
 async fn service_stream(
+    nat: Arc<UdpNat>,
     mut tx: quinn::SendStream,
     mut rx: quinn::RecvStream,
     _conn: Connection,
@@ -315,8 +317,50 @@ async fn service_stream(
         // TCP relay: first frame on a stream carries a PN TCP header; the
         // rest of the stream is raw payload piped to the real destination.
         if frame.kind == MessageKind::Data {
-            if let Ok((hdr, _start)) = TcpRelayHeader::decode(&frame.payload) {
-                tcp_relay(tx, rx, hdr, stats).await;
+            if TcpRelayHeader::decode(&frame.payload).is_ok() {
+                let (hdr, _) = TcpRelayHeader::decode(&frame.payload)?;
+                tcp_relay(tx, rx, hdr, stats.clone()).await;
+                return;
+            }
+            // UDP relay over a length-framed stream (spec-sanctioned fallback).
+            if let Ok((hdr, start)) = peernet_proto::UdpRelayHeader::decode(&frame.payload) {
+                stats.record_down(frame.payload.len() as u64);
+                let payload = &frame.payload[start..];
+                let dst = nat.resolve_dst(SocketAddr::new(hdr.dst_ip, hdr.dst_port));
+                let socket = match nat.get_or_create(hdr.src_port).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                if socket.send_to(payload, dst).await.is_err() {
+                    return;
+                }
+
+                let mut buf = vec![0u8; 65536];
+                let received = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    socket.recv_from(&mut buf),
+                )
+                .await;
+                let (n, peer) = match received {
+                    Ok(Ok(x)) => x,
+                    _ => return,
+                };
+                stats.record_up(n as u64);
+
+                let src_port =
+                    socket.local_addr().map(|a| a.port()).unwrap_or(hdr.src_port);
+                let reply_hdr = peernet_proto::UdpRelayHeader {
+                    session_id: hdr.session_id,
+                    src_port,
+                    dst_ip: peer.ip(),
+                    dst_port: peer.port(),
+                };
+                let mut reply = reply_hdr.encode(0);
+                reply.extend_from_slice(&buf[..n]);
+                let out = PeerMessage::new(MessageKind::Data, frame.session_id, reply);
+                if write_frame(&mut tx, &out).await.is_err() {
+                    return;
+                }
                 return;
             }
         }

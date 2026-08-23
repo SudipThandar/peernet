@@ -247,6 +247,44 @@ impl TunnelClient {
         bincode::deserialize(&reply.payload).map_err(|e| e.to_string())
     }
 
+    /// UDP relay over a length-framed QUIC stream — the deterministic
+    /// fallback path (constraint: datagram failures must never silently
+    /// drop packets). One request/response per stream.
+    pub async fn udp_exchange_via_stream(
+        &self,
+        src_port: u16,
+        dst: SocketAddr,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let (mut tx, mut rx) = self
+            .conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("stream open failed: {e}"))?;
+
+        let hdr = UdpRelayHeader {
+            session_id: self.session_id() as u32,
+            src_port,
+            dst_ip: dst.ip(),
+            dst_port: dst.port(),
+        };
+        let mut framed = hdr.encode(0);
+        framed.extend_from_slice(payload);
+        write_frame(
+            &mut tx,
+            &PeerMessage::new(MessageKind::Data, self.session_id(), framed),
+        )
+        .await
+        .map_err(|e| format!("udp stream send failed: {e}"))?;
+
+        let reply = read_frame(&mut rx)
+            .await
+            .map_err(|e| format!("udp stream reply failed: {e}"))?;
+        let (_, start) =
+            UdpRelayHeader::decode(&reply.payload).map_err(|e| format!("bad reply hdr: {e}"))?;
+        Ok(reply.payload[start..].to_vec())
+    }
+
     /// TCP relay (spec Section 9.6): opens a stream with a PN TCP header,
     /// sends `request`, half-closes, and reads the reply until EOF.
     pub async fn tcp_relay(
