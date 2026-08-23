@@ -78,6 +78,16 @@ class HostRuntime @Inject constructor(
     fun startSharing() {
         val shortId = HostIdentity.shortId(context)
 
+        // Wi-Fi Direct group creation is also gated on location *services*
+        // being on, not just the permission grant: with location off the
+        // platform accepts the call and then never creates a group, which is
+        // indistinguishable from a broken app.
+        if (!locationServicesEnabled()) {
+            engineError = "Turn on Location in system settings — Android blocks Wi-Fi Direct without it."
+            wifiDirect.reportError(engineError!!)
+            return
+        }
+
         // Brand the Wi-Fi Direct identity so clients see "PeerNet-xxxx",
         // not the owner's personal device name. Reflection-based; no-op where
         // the platform blocks it (API 33+ brands via explicit group SSID below).
@@ -161,6 +171,16 @@ class HostRuntime @Inject constructor(
         }
         return second
     }
+
+    /**
+     * Whether the system location toggle is on. Android requires it for
+     * Wi-Fi Direct group creation and peer discovery on every release that
+     * matters here, independent of the runtime permission grant.
+     */
+    private fun locationServicesEnabled(): Boolean = runCatching {
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        androidx.core.location.LocationManagerCompat.isLocationEnabled(lm)
+    }.getOrDefault(true)
 
     /**
      * This phone's real resolver ("ip:53"), taken from the network that

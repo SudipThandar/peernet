@@ -786,7 +786,44 @@ pub fn send_udp_relay(
     };
     let mut frame = hdr.encode(0);
     frame.extend_from_slice(payload);
-    let _ = client.connection().send_datagram(frame.into());
+
+    // QUIC datagrams are capped by the peer's advertised limit and are
+    // unreliable by design. Dropping the rejects silently made large UDP
+    // (QUIC/HTTP3 handshakes, big DNS answers) disappear, which looks like
+    // "some sites are slow" as browsers wait out a timeout and fall back to
+    // TCP. Anything the datagram path refuses goes over a stream instead.
+    if let Err(e) = client.connection().send_datagram(frame.clone().into()) {
+        jni_log(&format!("[udp] datagram rejected ({e}); relaying over stream"));
+        let Some(owned) = current_client() else { return };
+        let payload = payload.to_vec();
+        let dst = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
+        runtime().spawn(async move {
+            match owned.udp_exchange_via_stream(src_port, dst, &payload).await {
+                Ok(reply) => deliver_udp_reply(src_port, &reply),
+                Err(e) => jni_log(&format!("[udp] stream relay failed: {e}")),
+            }
+        });
+    }
+}
+
+/// Rebuilds a UDP reply for the phone's stack and writes it to the TUN, using
+/// the flow table so the packet appears to come from the address the app
+/// originally sent to (notably the virtual DNS IP).
+fn deliver_udp_reply(src_port: u16, payload: &[u8]) {
+    let flow = udp_flows()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&src_port)
+        .copied();
+    let Some(flow) = flow else { return };
+    let Some(tx) = tun_tx() else { return };
+    INBOUND.fetch_add(payload.len() as u64, Ordering::Relaxed);
+    let packet = build_udp_packet(
+        (Ipv4Addr::from(flow.dst_ip), flow.dst_port),
+        (Ipv4Addr::from(flow.local_ip), src_port),
+        payload,
+    );
+    let _ = tx.send(packet);
 }
 
 /// Test/advanced hook: publish a reply channel before starting a tunnel so

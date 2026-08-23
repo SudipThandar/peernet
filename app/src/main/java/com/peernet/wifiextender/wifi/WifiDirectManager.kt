@@ -231,6 +231,14 @@ class WifiDirectManager @Inject constructor(
     }
 
     /**
+     * Surfaces a precondition failure (e.g. location services off) through the
+     * same state the host card already renders, so callers never fail silently.
+     */
+    fun reportError(message: String) {
+        _state.update { it.copy(creating = false, hosting = false, error = message) }
+    }
+
+    /**
      * Reports a Wi-Fi Direct call rejected for a missing NEARBY_WIFI_DEVICES /
      * location grant. Every guarded call catches SecurityException explicitly:
      * the grant can be revoked mid-session, and an uncaught throw there looks
