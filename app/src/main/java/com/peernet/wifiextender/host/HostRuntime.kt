@@ -97,11 +97,7 @@ class HostRuntime @Inject constructor(
         // hand over is where client DNS queries (aimed at the tunnel's
         // virtual DNS address) get redirected — without it nothing resolves
         // on the client and browsing fails even with a healthy tunnel.
-        engineFingerprint = rustCore.startHost(
-            com.peernet.wifiextender.discovery.NsdHostAdvertiser.PNTP_PORT,
-            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim(),
-            systemDnsUpstream()
-        )
+        engineFingerprint = startEngine()
         if (engineFingerprint == null) {
             android.util.Log.w("HostRuntime", "QUIC engine unavailable; clients will not be able to tunnel")
         }
@@ -124,6 +120,29 @@ class HostRuntime @Inject constructor(
         rustCore.stopHost()
         engineFingerprint = null
         context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java))
+    }
+
+    /**
+     * True once the QUIC engine holds the tunnel port and has a certificate
+     * to pin. Clients cannot tunnel without it, so the UI shows this state
+     * instead of letting a share look healthy while it is useless.
+     */
+    val engineReady: Boolean
+        get() = !engineFingerprint.isNullOrBlank()
+
+    /**
+     * Starts the tunnel engine, retrying once through a stop: a leftover
+     * server from an earlier share still owns the port and would make every
+     * later share unusable (the engine refuses and clients get no pin).
+     */
+    private fun startEngine(): String? {
+        val port = NsdHostAdvertiser.PNTP_PORT
+        val name = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+        val dns = systemDnsUpstream()
+        rustCore.startHost(port, name, dns)?.let { return it }
+        android.util.Log.w("HostRuntime", "engine start refused; recycling previous instance")
+        rustCore.stopHost()
+        return rustCore.startHost(port, name, dns)
     }
 
     /**

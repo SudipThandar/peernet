@@ -293,6 +293,16 @@ fun HomeScreen(
                     InfoRow("Network", host.ssid ?: "—")
                     InfoRow("Password", host.passphrase ?: "unavailable — see Wi-Fi settings")
                     InfoRow("Address", host.groupOwnerAddress ?: "acquiring…")
+                    if (!host.engineReady) {
+                        // Without the engine there is no pin and no relay, so
+                        // a client would join the network and get nothing.
+                        Text(
+                            "Tunnel engine not running — clients cannot get internet. " +
+                                "Tap the button to stop sharing, then share again.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
                 }
             }
         }
