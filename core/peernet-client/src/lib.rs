@@ -317,8 +317,8 @@ impl TunnelClient {
         Ok(reply[start..].to_vec())
     }
 
-    /// Sends Bye and closes everything.
-    pub fn shutdown(self) {
+    /// Signals Bye and closes everything.
+    pub fn shutdown(&self) {
         let _ = self.state.send(ClientState::Disconnected);
         self.keepalive_handle.abort();
         self.endpoint.close(0u32.into(), b"bye");
