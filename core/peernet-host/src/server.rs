@@ -190,13 +190,20 @@ async fn handle_connection(
         let nat = nat.clone();
         let udp_readers = udp_readers.clone();
         let mut shutdown = shutdown.clone();
+        #[cfg(test)]
+        eprintln!("[nat-diag] udp task up");
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     dgram = conn.read_datagram() => match dgram {
                         Ok(data) => {
-                            #[allow(clippy::needless_borrows_for_generic_args)]
+                            #[cfg(test)]
+                            eprintln!(
+                                "[nat-diag] got dgram len={} head={:?}",
+                                data.len(),
+                                &data[..data.len().min(24)]
+                            );
                             let (hdr, start) = match peernet_proto::UdpRelayHeader::decode(&data) {
                                 Ok(x) => x,
                                 Err(e) => {
