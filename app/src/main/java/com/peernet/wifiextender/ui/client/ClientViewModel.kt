@@ -1,4 +1,4 @@
-ï»¿package com.peernet.wifiextender.ui.client
+package com.peernet.wifiextender.ui.client
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -38,7 +38,7 @@ data class ClientUiState(
 )
 
 /**
- * Client logic â€” discovery runs when the user taps CONNECT and automatically
+ * Client logic — discovery runs when the user taps CONNECT and automatically
  * whenever this device joins a Wi-Fi Direct network (reconnect case): once a
  * known host's network is joined, linking happens without further taps.
  */
@@ -51,6 +51,7 @@ class ClientViewModel @Inject constructor(
 ) : ViewModel() {
 
     private val discovery = NsdClientDiscovery(context)
+    private val appContext: Context = context.applicationContext
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private val busy = AtomicBoolean(false)
     private var livenessJob: Job? = null
@@ -76,10 +77,10 @@ class ClientViewModel @Inject constructor(
         // Wi-Fi picker (typing the passphrase) never fire Wi-Fi Direct
         // callbacks on the client side, so joinedAsClient stays false
         // forever. Poll the station SSID instead; DIRECT-*PeerNet* means
-        // someone joined our group manually â€” link exactly like a native
+        // someone joined our group manually — link exactly like a native
         // join would.
         viewModelScope.launch(Dispatchers.Default) {
-            val wm = context.applicationContext
+            val wm = appContext
                 .getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
             var wasLegacyJoined = false
             while (kotlinx.coroutines.currentCoroutineContext().isActive) {
@@ -109,7 +110,7 @@ class ClientViewModel @Inject constructor(
     /**
      * CONNECT button. Priority order:
      *  1. Learn the host id via mDNS, then JOIN its Wi-Fi Direct network with
-     *     the stable credentials (API 33+) â€” the phone actually associates
+     *     the stable credentials (API 33+) — the phone actually associates
      *     with DIRECT-PeerNet-xxxx, visible in Wi-Fi settings.
      *  2. Otherwise find a peer advertising a PeerNet name and invite it.
      *  3. Last resort: link over whatever network the phone is on right now
@@ -119,7 +120,7 @@ class ClientViewModel @Inject constructor(
     fun connectNow() {
         if (!busy.compareAndSet(false, true)) return
         _uiState.update {
-            it.copy(searching = true, status = "Searching this network for a PeerNet hostâ€¦")
+            it.copy(searching = true, status = "Searching this network for a PeerNet host…")
         }
         viewModelScope.launch(Dispatchers.Default) {
             var joined = false
@@ -132,21 +133,21 @@ class ClientViewModel @Inject constructor(
                         passphrase = "pn-$hid"
                     )
                 ) {
-                    _uiState.update { it.copy(status = "Joining the PeerNet networkâ€¦") }
+                    _uiState.update { it.copy(status = "Joining the PeerNet network…") }
                     joined = awaitJoined(JOIN_WAIT_MS)
                 }
 
                 if (!joined) {
                     val peer = findPeerNetPeer()
                     if (peer != null) {
-                        _uiState.update { it.copy(status = "Joining ${peer.deviceName}â€¦") }
+                        _uiState.update { it.copy(status = "Joining ${peer.deviceName}…") }
                         wifiDirect.connectToPeer(peer.deviceAddress)
                         joined = awaitJoined(JOIN_WAIT_MS)
                     }
                 }
 
                 if (joined) {
-                    _uiState.update { it.copy(status = "PeerNet network joined â€” establishing linkâ€¦") }
+                    _uiState.update { it.copy(status = "PeerNet network joined — establishing link…") }
                     val target = findVerifiedHost(rounds = AUTO_ROUNDS)
                     if (target != null) {
                         _uiState.update { it.copy(searching = false) }
@@ -219,7 +220,7 @@ class ClientViewModel @Inject constructor(
             try {
                 wifiDirect.acquireMulticast()
                 _uiState.update {
-                    it.copy(searching = true, status = "PeerNet network detected â€” looking for hostâ€¦")
+                    it.copy(searching = true, status = "PeerNet network detected — looking for host…")
                 }
                 val target = findVerifiedHost(rounds = AUTO_ROUNDS)
                 if (target != null) {
@@ -276,11 +277,11 @@ class ClientViewModel @Inject constructor(
      * (name starts with "p2p"); falls back to any plain Wi-Fi transport.
      * Critical because Android routes app traffic over the DEFAULT network,
      * and a "connected without internet" P2P Wi-Fi loses that role to
-     * cellular â€” where the host's private address is unreachable.
+     * cellular — where the host's private address is unreachable.
      */
     @SuppressLint("MissingPermission")
     private fun currentWifiNetwork(): android.net.Network? {
-        val cm = context.applicationContext
+        val cm = appContext
             .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
         val networks = cm.allNetworks.toList()
         val p2p = networks.firstOrNull { n ->
