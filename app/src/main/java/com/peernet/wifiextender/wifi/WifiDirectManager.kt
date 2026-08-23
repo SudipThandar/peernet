@@ -225,15 +225,38 @@ class WifiDirectManager @Inject constructor(
         }
     }
 
+    /**
+     * Runs a Wi-Fi Direct call that the platform guards with
+     * NEARBY_WIFI_DEVICES / location. Those throw SecurityException when the
+     * grant is missing or revoked mid-session, and an uncaught throw here
+     * looks to the user like the app doing nothing at all — so it becomes a
+     * visible error instead.
+     */
+    private inline fun p2pCall(what: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: SecurityException) {
+            Timber.w(e, "%s rejected for missing Wi-Fi Direct permission", what)
+            _state.update {
+                it.copy(
+                    creating = false,
+                    error = "Wi-Fi Direct permission was denied. Allow \"Nearby devices\" for PeerNet in Settings."
+                )
+            }
+        }
+    }
+
     /** Client-side leave: drops the Wi-Fi Direct connection to the host. */
     fun leaveCurrentGroup() {
         val mgr = manager ?: return
         val ch = channel ?: return
-        @Suppress("DEPRECATION")
-        mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {}
-            override fun onFailure(reason: Int) {}
-        })
+        p2pCall("removeGroup") {
+            @Suppress("DEPRECATION")
+            mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {}
+                override fun onFailure(reason: Int) {}
+            })
+        }
     }
 
     /**
@@ -260,10 +283,12 @@ class WifiDirectManager @Inject constructor(
         requestedPassphrase = passphrase
         pendingCreate = true
 
-        mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() = createGroup(mgr, ch)
-            override fun onFailure(reason: Int) = createGroup(mgr, ch)
-        })
+        p2pCall("removeGroup(before create)") {
+            mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() = createGroup(mgr, ch)
+                override fun onFailure(reason: Int) = createGroup(mgr, ch)
+            })
+        }
     }
 
     fun stopHosting() {
@@ -279,11 +304,13 @@ class WifiDirectManager @Inject constructor(
         val mgr = manager
         val ch = channel
         if (mgr == null || ch == null) return
-        @Suppress("DEPRECATION")
-        mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {}
-            override fun onFailure(reason: Int) {}
-        })
+        p2pCall("removeGroup(stop)") {
+            @Suppress("DEPRECATION")
+            mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {}
+                override fun onFailure(reason: Int) {}
+            })
+        }
     }
 
     private fun createGroup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel) {
@@ -307,11 +334,13 @@ class WifiDirectManager @Inject constructor(
             null
         }
 
-        if (customConfig != null) {
-            mgr.createGroup(ch, customConfig, groupListener(mgr, ch))
-        } else {
-            @Suppress("DEPRECATION")
-            mgr.createGroup(ch, groupListener(mgr, ch))
+        p2pCall("createGroup") {
+            if (customConfig != null) {
+                mgr.createGroup(ch, customConfig, groupListener(mgr, ch))
+            } else {
+                @Suppress("DEPRECATION")
+                mgr.createGroup(ch, groupListener(mgr, ch))
+            }
         }
     }
 
@@ -337,8 +366,10 @@ class WifiDirectManager @Inject constructor(
                 requestedSsid = null
                 requestedPassphrase = null
                 pendingCreate = true
-                @Suppress("DEPRECATION")
-                mgr.createGroup(ch, groupListener(mgr, ch))
+                p2pCall("createGroup(fallback)") {
+                    @Suppress("DEPRECATION")
+                    mgr.createGroup(ch, groupListener(mgr, ch))
+                }
                 return
             }
             Timber.w("createGroup failed: %d", reason)

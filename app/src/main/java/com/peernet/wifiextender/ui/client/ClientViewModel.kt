@@ -90,7 +90,11 @@ class ClientViewModel @Inject constructor(
                 if (_uiState.value.searching || busy.get()) continue
                 if (wifiDirect.state.value.hosting) continue
                 val ssid = runCatching {
+                    // Permission-guarded (and SecurityException-throwing when
+                    // location is revoked); the runCatching below is the
+                    // handler, and the SSID is only a log hint anyway.
                     @Suppress("DEPRECATION")
+                    @android.annotation.SuppressLint("MissingPermission")
                     wm.connectionInfo?.ssid?.removeSurrounding("\"")
                 }.getOrNull().orEmpty()
                 val candidate = gatewayCandidate() ?: continue

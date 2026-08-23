@@ -64,6 +64,9 @@ android {
         // invisible until a real device refuses to run the app. Restricted to
         // this set so unrelated style warnings can never block a release.
         abortOnError = true
+        // Print the whole report: CI logs otherwise show only "first failure",
+        // which turns each lint error into a separate 5-minute round trip.
+        textReport = true
         checkOnly += listOf(
             "ForegroundServicePermission",
             "ForegroundServiceType",
