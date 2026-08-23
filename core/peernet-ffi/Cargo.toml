@@ -17,5 +17,7 @@ peernet-core = { path = "../peernet-core" }
 peernet-proto = { path = "../peernet-proto" }
 peernet-host = { path = "../peernet-host" }
 peernet-client = { path = "../peernet-client" }
+peernet-tcp = { path = "../peernet-tcp" }
+quinn = { workspace = true }
 tokio = { workspace = true }
 libc = "0.2"

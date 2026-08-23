@@ -24,7 +24,10 @@ use jni::JNIEnv;
 use peernet_client::{ClientOptions, ClientState, TunnelClient};
 use peernet_core::SessionId;
 use peernet_host::HostServer;
-use peernet_proto::UdpRelayHeader;
+use peernet_proto::{
+    write_frame, MessageKind, PeerMessage, TcpRelayHeader, UdpRelayHeader,
+};
+use peernet_tcp::{FlowKey, FromUpstream, TcpStack, ToUpstream};
 use tokio::io::unix::AsyncFd;
 use std::io::{Read as _, Write as _};
 
@@ -86,10 +89,29 @@ fn tun_tx() -> Option<TunTx> {
         .map(|t| t.clone())
 }
 
-/// Outbound TCP is deferred (needs local termination); count instead of
-/// silently dropping so the UI can surface it later.
-static TCP_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Outbound TCP is terminated locally by the peernet-tcp engine; count the
+/// packets handed to it for visibility.
+static TCP_TERMINATED: AtomicU64 = AtomicU64::new(0);
 static UDP_FORWARDED: AtomicU64 = AtomicU64::new(0);
+
+/// Intake into the active session's TCP terminator engine. Present only
+/// while a tunnel owns an engine; teardown drops it, which lets the engine
+/// thread wind down.
+type TcpPktTx = std::sync::mpsc::Sender<Vec<u8>>;
+
+static TCP_PKT_TX: std::sync::RwLock<Option<TcpPktTx>> = std::sync::RwLock::new(None);
+
+fn tcp_pkt_in() -> Option<TcpPktTx> {
+    TCP_PKT_TX
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|t| t.clone())
+}
+
+fn tcp_teardown() {
+    *TCP_PKT_TX.write().unwrap_or_else(|p| p.into_inner()) = None;
+}
 
 // ---------- PNTP engine state (Milestone 7) ----------
 
@@ -317,6 +339,8 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel
                 // Reverse path: rebuild relay datagrams into TUN packets
                 // until this generation is superseded or the link dies.
                 tokio::spawn(pump_udp_replies(client.clone(), gen));
+                // Local TCP termination feeding QUIC relay streams.
+                spawn_tcp_termination(client.clone(), gen);
                 // Mirror watch-channel state into the atomic until the link dies.
                 loop {
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -329,6 +353,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel
                         break;
                     }
                 }
+                tcp_teardown();
                 *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
             }
             Err(e) => {
@@ -368,6 +393,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_stopTunnel<
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
+    tcp_teardown();
     // Clone the handle out before touching the slot again; shutdown() is
     // synchronous so it is safe outside the lock.
     let client = {
@@ -568,11 +594,15 @@ fn forward_outbound(packet: &[u8]) {
     }
     let proto = packet[9];
     if proto == 6 {
-        // TCP deferred: needs a local userspace termination to keep the
-        // phone's kernel TCP state consistent. Count for visibility.
-        let dropped = TCP_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-        if dropped == 1 {
-            crate::jni_log("[tun] tcp flows pending local termination (deferred)");
+        // Local userspace termination: hand the packet to the smoltcp-based
+        // engine, which turns flows into QUIC relay streams.
+        if let Some(tx) = tcp_pkt_in() {
+            if tx.send(packet[..end].to_vec()).is_ok() {
+                let n = TCP_TERMINATED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 {
+                    crate::jni_log("[tcp] first flow packet terminated locally");
+                }
+            }
         }
         return;
     }
@@ -703,6 +733,143 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
         if tx.send(packet).is_err() {
             return;
         }
+    }
+}
+
+// ---------- Local TCP termination -> QUIC relay streams ----------
+//
+// Data path for one phone TCP flow:
+//
+//   TUN (proto 6) -> engine pkt_in -> smoltcp socket (per-SYN listener)
+//   engine ToUpstream::Open/Data/Eof -> bridge thread -> orchestrator task
+//     Open: open a QUIC bi-stream, write the framed TcpRelayHeader, spawn
+//           a reader half that pumps internet bytes back into the engine
+//     Data: raw payload onto that stream
+//     Eof:  finish() = half-close toward the host
+//   engine pkt_out (SYN-ACKs, data, ACKs) -> forwarder thread -> TUN write
+//
+/// Spawns the whole termination pipeline for this tunnel generation.
+pub fn spawn_tcp_termination(client: std::sync::Arc<TunnelClient>, gen: u64) {
+    let (pkt_out_tx, pkt_out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (to_up_tx, to_up_rx) = std::sync::mpsc::channel::<ToUpstream>();
+    let (stack, pkt_in_tx, up_tx) = TcpStack::channels(pkt_out_tx, to_up_tx);
+
+    // Engine loop; exits when any channel side hangs up.
+    std::thread::spawn(move || stack.run());
+
+    // Publish the intake so forward_outbound can feed it; teardown drops it.
+    *TCP_PKT_TX.write().unwrap_or_else(|p| p.into_inner()) = Some(pkt_in_tx);
+
+    // Engine-emitted packets back into the TUN writer.
+    std::thread::spawn(move || {
+        while let Ok(pkt) = pkt_out_rx.recv() {
+            match tun_tx() {
+                Some(tx) => {
+                    if tx.send(pkt).is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    });
+
+    // Bridge the std receiver into the async world.
+    let (bridge_tx, bridge_rx) = tokio::sync::mpsc::unbounded_channel::<ToUpstream>();
+    std::thread::spawn(move || {
+        while let Ok(msg) = to_up_rx.recv() {
+            if bridge_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    runtime().spawn(run_tcp_relays(client, gen, bridge_rx, up_tx));
+}
+
+/// Per-flow relay orchestration on the engine runtime. One QUIC bi-stream
+/// carries one phone TCP flow; EOF in either direction propagates cleanly.
+async fn run_tcp_relays(
+    client: std::sync::Arc<TunnelClient>,
+    gen: u64,
+    mut upstream: tokio::sync::mpsc::UnboundedReceiver<ToUpstream>,
+    from_up: std::sync::mpsc::Sender<FromUpstream>,
+) {
+    let mut flows: HashMap<FlowKey, quinn::SendStream> = HashMap::new();
+
+    while ENGINE_GEN.load(Ordering::SeqCst) == gen {
+        let msg = match upstream.recv().await {
+            Some(m) => m,
+            None => break,
+        };
+        match msg {
+            ToUpstream::Open { flow } => {
+                let dst_ip = Ipv4Addr::from(flow.dst_ip);
+                let (mut tx, rx) = match client.connection().open_bi().await {
+                    Ok(pair) => pair,
+                    Err(_) => {
+                        let _ = from_up.send(FromUpstream::Eof { flow });
+                        continue;
+                    }
+                };
+                let frame = PeerMessage::new(
+                    MessageKind::Data,
+                    client.session_id(),
+                    TcpRelayHeader {
+                        src_port: flow.src_port,
+                        dst_ip: IpAddr::V4(dst_ip),
+                        dst_port: flow.dst_port,
+                    }
+                    .encode(),
+                );
+                if write_frame(&mut tx, &frame).await.is_err() {
+                    let _ = from_up.send(FromUpstream::Eof { flow });
+                    continue;
+                }
+                // Internet -> phone reader half.
+                let fu = from_up.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx;
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        match rx.read(&mut buf).await {
+                            Ok(Some(n)) if n > 0 => {
+                                let msg = FromUpstream::Data {
+                                    flow,
+                                    bytes: buf[..n].to_vec(),
+                                };
+                                if fu.send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    let _ = fu.send(FromUpstream::Eof { flow });
+                });
+                flows.insert(flow, tx);
+            }
+            ToUpstream::Data { flow, bytes } => {
+                let wrote = match flows.get_mut(&flow) {
+                    Some(tx) => tx.write_all(&bytes).await.is_ok(),
+                    None => false,
+                };
+                if !wrote {
+                    flows.remove(&flow);
+                }
+            }
+            ToUpstream::Eof { flow } => {
+                if let Some(mut tx) = flows.remove(&flow) {
+                    // Half-close toward the host; its reply path stays open.
+                    let _ = tx.finish();
+                }
+            }
+        }
+    }
+    // Session over: tell the engine every remaining relay died so the
+    // phone's sockets reset promptly instead of hanging until timeout.
+    for (flow, _) in flows.drain() {
+        let _ = from_up.send(FromUpstream::Eof { flow });
     }
 }
 
