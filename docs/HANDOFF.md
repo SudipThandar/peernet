@@ -67,7 +67,8 @@ is NOT in the repo — it lives outside. Docs only reveal M10/M11/M12 themes.
 | M6 | VpnService TUN + Rust async capture (fd ownership, protect-first) | Done |
 | **M7 part 1** | **Engine lifecycle via FFI + permission-at-launch + port split** | **Done** |
 | **M7 part 2** | **UDP/DNS data path end-to-end through TUN** | **Done** |
-| **M7 part 3+3b** | **TCP data path: smoltcp terminator + QUIC relay-stream wiring** | **Done (needs device test)** |
+| **M7 part 3+3b** | **TCP data path: smoltcp terminator + QUIC relay-stream wiring** | **Code done; device retest pending** |
+| **M7.5 fixes** | **Legacy-join detection, network pinning, logcat logging (first device test findings)** | **Done — awaiting retest** |
 
 This session's commits (oldest to newest):
 - `75b22e2` M6 fixes: stable branded SSID/passphrase, multicast locks both sides,
@@ -94,6 +95,21 @@ This session's commits (oldest to newest):
   ToUpstream::Open/Data/Eof onto one QUIC bi-stream per flow (framed TcpRelayHeader then
   raw bytes), reader halves pump internet->engine; Eof = half-close; teardown drops intake
   on stop/link-death.
+- `f19af26` HANDOFF refresh for M7 completion.
+
+First device test round (two Android phones, host on Wi-Fi) found two blockers, fixed in:
+- `375507c`+`51682d0`+`c959bb2` M7.5 device-test fixes:
+  1. **Legacy OS-picker joins were invisible.** Joining via Android's Wi-Fi settings
+     (typing the passphrase) never fires Wi-Fi Direct callbacks client-side, so
+     `joinedAsClient` stayed false and auto-link/tunnel never started ("stuck connecting").
+     Fix: `ClientViewModel` polls WiFi SSID every 4 s; `DIRECT-*PeerNet*` triggers `autoLink()`.
+  2. **Tunnel rode the cellular default route.** The P2P Wi-Fi is "no internet"-flagged,
+     so Android's default network (cellular) swallowed QUIC packets to the host's private IP.
+     Fix: capture the link `Network` at link time (prefers `p2p*` interface), pass via
+     `EXTRA_NETWORK`, call `setUnderlyingNetworks` in `PeerNetVpnService`.
+  3. **Real logcat logging**: `android_logger`, tag `PeerNet`; `jni_log` now writes to logcat.
+     Debug with `adb logcat -s PeerNet`. Init happens inside `runtime()` so any engine path logs.
+  - CI got `paths-ignore` for docs/** + **.md so handoff updates don't burn builds.
 
 ## 4. Current State — What Works vs What's Left
 
@@ -114,13 +130,27 @@ This session's commits (oldest to newest):
 6. **TCP forwarding (M7 part 3+3b)**: phone TCP flows are terminated locally by the
    peernet-tcp engine and carried as one QUIC bi-stream per flow (TcpRelayHeader + raw
    bytes) to the host, which splices them to real sockets (idle timeout, FIN both ways).
-   Full-duplex with backpressure. All CI-verified in loopback; NOT yet device-tested.
-7. Pure-Rust gates all green: handshake, relays, NAT, DNS redirect, concurrency, data-path roundtrip.
+   Full-duplex with backpressure. Loopback-verified; device retest in progress.
+7. **Legacy-join auto-link (M7.5)**: manual joins via Android's Wi-Fi picker are detected
+   by SSID polling (4 s cadence, `DIRECT-*PeerNet*` match) and trigger the normal
+   auto-link -> VPN -> tunnel chain. Native P2P joins keep using the event-driven path.
+8. **Network pinning**: `ClientLinkManager.linkedNetwork` (prefers `p2p*` interface,
+   falls back to any TRANSPORT_WIFI) is passed to `PeerNetVpnService` via
+   `EXTRA_NETWORK` and applied with `setUnderlyingNetworks`, keeping QUIC sockets off
+   the cellular default route.
+9. Pure-Rust gates all green: handshake, relays, NAT, DNS redirect, concurrency, data-path roundtrip.
 
 ### NOT yet done (the gap)
-- **Device test of the full internet path** (PC hosts group -> phone browses through it).
+- **Retest after M7.5 fixes** (APK from commit `c959bb2` or later) — verify: OS-picker
+  join auto-links within ~4 s, QUIC reaches Connected, browsing works.
+- Wi-Fi label may still read "connected without internet" while browsing works — that is
+  inherent to the VPN-overlay design (internet rides the VPN, not that network). Success
+  criterion = pages load, not the label.
+- Two-name confusion polish: Wi-Fi settings shows group SSID (`DIRECT-xx-PeerNet-…`),
+  app shows host device name — same thing twice; unify display later.
+- Host-side FGS notification reported flaky ("not everytime the bar shows up") — needs
+  investigation (battery optimization exemption / START_STICKY behavior).
 - No reconnect/backoff integration between tunnel drops and the Wi-Fi link state machine yet.
-- `jni_log()` still a no-op on device (counters are the observability story).
 - IPv6 dropped silently (TUN config v4-only).
 - UDP flow table never evicts (no LRU/timeout yet); engine `PENDING_CAP` is the only RAM guard.
 - docs/ARCHITECTURE.md, TESTING.md, PLAY_STORE_NOTES.md still placeholders.
@@ -149,7 +179,18 @@ This session's commits (oldest to newest):
 8. **Loopback gate:** `cargo test --release` in `core/` must pass before any device testing.
 9. Local builds intentionally unused — CI (GitHub Actions on push/PR to main) builds everything;
    artifact name `peernet-debug-apk`. Maven Central occasionally 429s during gradle dep
-   download: just `gh run rerun <id> --failed`.
+   download: just `gh run rerun <id> --failed`. Docs-only pushes (`docs/**`, `**.md`) skip CI
+   via `paths-ignore`.
+10. **Legacy joins are silent:** never rely on Wi-Fi Direct callbacks for clients that joined
+    through the OS Wi-Fi picker — poll SSID instead.
+11. **Pin tunnel sockets to the link network:** without `setUnderlyingNetworks`, a
+    "no internet"-flagged P2P Wi-Fi loses the default route to cellular and the QUIC
+    handshake can never reach the host's private IP.
+12. **Android target-only Rust deps** (`android_logger`, `log`) live in a
+    `[target.'cfg(target_os = "android")'.dependencies]` table inside
+    `core/peernet-ffi/Cargo.toml` — the workspace-root manifest REJECTS target tables.
+13. **Kotlin gotcha:** Hilt `@ApplicationContext context: Context` constructor params are
+    NOT visible in member functions — capture as `private val appContext` at construction.
 
 ## 6. Environment Notes
 
@@ -160,22 +201,25 @@ This session's commits (oldest to newest):
 
 ## 7. Suggested Plan Going Forward
 
-1. **Device test (next): full internet path.**
-   - Install latest CI APK (`peernet-debug-apk` artifact) on phone; run host on PC
-     (or PC-hosted group via the app's share mode on a second Android, per current flow).
-   - Verify: DNS resolves, browser loads sites over TCP through tunnel, Speedtest works.
-   - Watch `tunPacketCount()` counters; TCP_TERMINATED should climb while browsing.
+1. **Retest (next): full internet path with M7.5 fixes.**
+   - Install APK from commit `c959bb2` (or later) on both phones.
+   - Host: Share as before. Client: join via OS Wi-Fi picker + password (the preferred
+     flow), open the app, wait ~4 s for auto-link, confirm QUIC reaches Connected.
+   - Verify browsing/Speedtest through the tunnel; `adb logcat -s PeerNet` if it fails.
 2. **M8-ish: resilience.** Tunnel reconnect integration with ClientLinkManager backoff;
-   stop-tunnel on P2P disconnect; real logcat logging replacing no-op jni_log; tunnel stats
-   surfaced in UI.
-3. **M9-ish: hardening.** MTU review, IPv6 decision, UDP flow LRU/timeout (table never evicts),
+   stop-tunnel on P2P disconnect; tunnel stats surfaced in UI; host FGS notification
+   reliability (battery-optimization exemption prompt).
+3. **UX polish pass:** unify naming (one canonical label for the host network in app +
+   a hint showing the actual SSID to look for in Wi-Fi settings); explain the
+   "without internet" label behavior in-app so it never looks broken.
+4. **M9-ish: hardening.** MTU review, IPv6 decision, UDP flow LRU/timeout (table never evicts),
    battery/doze behavior, NAT port-collision fallback when port preservation fails,
    TCP idle-timeout tuning vs long-lived connections.
-4. M10: foreground-service ownership refinements. M11: TESTING.md + device matrix passes.
+5. M10: foreground-service ownership refinements. M11: TESTING.md + device matrix passes.
    M12: PLAY_STORE_NOTES.md, signing, listing. Backlog: Windows client (Phase 2).
 
-Immediate concrete next step: device test — CI APK on phone + host running, browse
-through the tunnel. Everything up to that point is loopback-verified.
+Immediate concrete next step: retest with the `c959bb2` APK using the OS-picker join flow;
+if anything still fails, capture `adb logcat -s PeerNet` from both phones.
 
 ## 8. Verification Checklist for Any Change
 
