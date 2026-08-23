@@ -314,3 +314,75 @@ applies the DNS upstream, and is what JNI now calls. Regression guard
 5. Browse. If it still fails, the red status line names the failing stage — report that
    line verbatim (it is the engine's own `lastError`).
 
+## 10. M7.7 — Platform-contract audit (Android APIs that fail only on devices)
+
+M7.6 was found by patching one report at a time, so before adding features the whole
+"phone refuses to run this" surface was audited. Everything below was found by reading
+code against platform contracts (no device involved) and is fixed unless marked.
+
+Ranked by severity, with the user-visible symptom each one produced:
+
+1. **VPN service declared `foregroundServiceType="systemExempted"` without
+   `FOREGROUND_SERVICE_SYSTEM_EXEMPTED`.** Android 14+ throws `SecurityException` from
+   `startForeground()`, killing the service in `onCreate` — the tunnel could never start
+   on a modern phone. Now `specialUse` (+ `PROPERTY_SPECIAL_USE_FGS_SUBTYPE`), whose
+   permission was already declared.
+2. **VpnService had no `<intent-filter android:name="android.net.VpnService">` and was
+   not exported.** The platform cannot bind an unadvertised VPN service, so
+   `establish()` returned null forever: "Android refused to create the vpn interface".
+3. **`protect()` was called on the TUN file descriptor.** `protect()` takes *sockets*;
+   on a TUN fd it fails (`ENOTSOCK`) and aborted every tunnel. The routing-loop guard is
+   `addDisallowedApplication(packageName)`, which was already in place.
+4. **`POST_NOTIFICATIONS` sat in the required-permission gate.** Two denials left SHARE
+   permanently disabled with no explanation. `Permissions` now splits
+   `required()` (nearby-devices/location) from `optional()` (notifications); only
+   `required()` gates hosting.
+5. **`startForegroundService` was called from composition/background.** Android 12+
+   throws `ForegroundServiceStartNotAllowedException`; a link event arriving while the
+   app was backgrounded crashed instead of reporting. Now wrapped and surfaced.
+6. **`HostForegroundService` self-stopped on the replayed `StateFlow` value**, so the
+   notification appeared and instantly vanished. Guarded with `sawHosting`.
+7. **Native libraries' page alignment was never checked.** A 4 KB-aligned `.so` will not
+   load on Android 15+ 16 KB-page devices. `core/.cargo/config.toml` passes
+   `-Wl,-z,max-page-size=16384`, and CI now *verifies* the LOAD alignment of every
+   shipped `.so` (a config file alone proves nothing).
+8. **Oversized UDP datagrams were dropped silently**
+   (`let _ = connection().send_datagram(..)`). QUIC datagrams are capped by the peer's
+   limit, so HTTP/3 and large DNS answers vanished and browsers looked "slow" while they
+   timed out into TCP. Rejects now go over the stream relay
+   (`udp_exchange_via_stream`) and the reply is rebuilt onto the TUN.
+9. **Wi-Fi Direct calls could throw `SecurityException` unhandled** (permission revoked
+   mid-session) and hosting silently did nothing. Every guarded call now catches it and
+   reports "Allow Nearby devices". Note lint only credits a `catch` in the *same method*
+   — an inline wrapper helper does not satisfy it.
+10. **Location services being off was never checked.** Wi-Fi Direct needs the system
+    location toggle on, not just the grant; without it group creation never completes.
+    `startSharing()` now refuses with "Turn on Location in system settings".
+
+Notification quality (also fixed): channels were `IMPORTANCE_LOW` with `setSilent(true)`,
+so the "hosting"/"tunnel" bars were easy to miss; the tunnel now has its own
+`CHANNEL_TUNNEL` at `IMPORTANCE_DEFAULT` with a Stop action.
+
+### Why CI never caught these
+
+`assembleDebug` + unit tests only prove the code compiles and the pure logic works —
+every defect above is a *manifest or platform-contract* violation. Two gates were added:
+
+- `./gradlew :app:lintDebug` with `abortOnError` and `checkOnly` limited to platform
+  contracts (`ForegroundServicePermission`, `ForegroundServiceType`, `MissingPermission`,
+  `ExportedService`, …), plus `textReport = true` so the log lists every error at once
+  instead of "first failure".
+- `app/src/test/.../ManifestContractTest.kt`: the VPN service stays bindable and
+  exported, every declared `foregroundServiceType` has its matching `uses-permission`,
+  and required permissions stay declared.
+
+Verified sound during the audit (no change needed): `NEARBY_WIFI_DEVICES` declared and
+requested, rustls ring provider installed on both host and client, arm64 ABI packaged,
+`PendingIntent` uses `FLAG_IMMUTABLE`, R8 keeps the JNI symbols, and the virtual DNS
+address is covered by the `0.0.0.0/0` route.
+
+Still unproven on hardware (never executed once): a QUIC handshake accepted over
+Wi-Fi Direct, the client's QUIC socket riding the p2p network via
+`bindProcessToNetwork`, the smoltcp terminator against Android's real TCP stack, and the
+host relaying to its own resolver.
+
