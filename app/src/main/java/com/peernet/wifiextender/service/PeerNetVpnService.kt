@@ -86,7 +86,8 @@ class PeerNetVpnService : VpnService() {
 
         val pfd: ParcelFileDescriptor = builder.establish() ?: return -1
         return try {
-            if (!protect(pfd.fileDescriptor)) {
+            val protected = runCatching { protect(pfd.fileDescriptor) }.getOrDefault(false)
+            if (!protected) {
                 Timber.w("protect(fd) failed — aborting tunnel to avoid routing loops")
                 runCatching { pfd.close() }
                 return -1
