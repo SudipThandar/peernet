@@ -141,8 +141,8 @@ First device test round (two Android phones, host on Wi-Fi) found two blockers, 
 9. Pure-Rust gates all green: handshake, relays, NAT, DNS redirect, concurrency, data-path roundtrip.
 
 ### NOT yet done (the gap)
-- **Retest after M7.5 fixes** (APK from commit `c959bb2` or later) — verify: OS-picker
-  join auto-links within ~4 s, QUIC reaches Connected, browsing works.
+- **Retest after M7.6 fixes** (APK from commit `f533bc2` or later) — see §9 for the
+  exact retest script and what the screen must show.
 - Wi-Fi label may still read "connected without internet" while browsing works — that is
   inherent to the VPN-overlay design (internet rides the VPN, not that network). Success
   criterion = pages load, not the label.
@@ -218,8 +218,9 @@ First device test round (two Android phones, host on Wi-Fi) found two blockers, 
 5. M10: foreground-service ownership refinements. M11: TESTING.md + device matrix passes.
    M12: PLAY_STORE_NOTES.md, signing, listing. Backlog: Windows client (Phase 2).
 
-Immediate concrete next step: retest with the `c959bb2` APK using the OS-picker join flow;
-if anything still fails, capture `adb logcat -s PeerNet` from both phones.
+Immediate concrete next step: retest with the M7.6 APK (commit `f533bc2` or later) using
+the OS-picker join flow — full script in §9. The on-screen red status line replaces logcat
+for a tester without adb.
 
 ## 8. Verification Checklist for Any Change
 
@@ -227,3 +228,59 @@ if anything still fails, capture `adb logcat -s PeerNet` from both phones.
 - [ ] New JNI symbols: update BOTH `NativeCore.kt` and `lib.rs` in the same commit.
 - [ ] Never close the TUN fd from Kotlin after successful capture.
 - [ ] Loopback tests still pass without a device (they are the gate).
+
+## 9. M7.6 — "linked but no internet" root causes and fixes
+
+Device test on the M7.5 APK: host shared, client joined `DIRECT-…` from Wi-Fi settings,
+app showed "PeerNet-432b connected" — but **zero internet in every app**, and sometimes
+"no PeerNet network found" while actually joined. Six independent defects, each alone
+enough to blackhole traffic:
+
+1. **DNS was never forwarded anywhere.** The client's TUN advertises virtual DNS
+   `10.215.17.1`; the host's NAT redirects `:53` to `dns_upstream`, but nothing ever
+   called `set_dns_upstream`, so it stayed `None` and every query was dropped — no name
+   resolution means no internet even with a perfect tunnel.
+   Fix: `HostServer::bind` defaults to `1.1.1.1:53`, `startHost(port, name, dnsUpstream)`
+   takes the real resolver, and `HostRuntime.systemDnsUpstream()` reads
+   `LinkProperties.dnsServers` from the host's internet-carrying network.
+2. **UDP NAT mapping keyed by the wrong port.** `get_or_create` inserted under
+   `actual_port` (the bound port) instead of `client_src_port`, so every packet created a
+   fresh socket and replies never matched a flow. Fix: key by `client_src_port`.
+3. **Reply source port was the host's local port.** `pump_udp_replies` echoed
+   `socket.local_addr().port()`; whenever port preservation failed the client's flow table
+   lookup missed and the reply was discarded. Fix: pass and echo `client_src_port`.
+4. **The certificate pin arrived late/empty.** It rode only in an mDNS TXT record, so
+   `startTunnel` often got `""`, failed silently — while the default-route TUN stayed
+   installed (fail-closed = total blackout). Fix: `LinkServer` banner is now
+   `PN-LINK-2 <hostId> <fp|-> <tunnelPort>` built per connection from live engine state;
+   the client reads the pin from the banner; mDNS re-registers when the fingerprint
+   changes; Rust validates 64 hex chars and records a readable error.
+5. **QUIC was routed over the wrong network.** `setUnderlyingNetworks` only *declares*
+   the underlying network; it does not bind sockets, so the Rust UDP socket followed the
+   default route (cellular) and never reached `192.168.49.1`.
+   Fix: `bindProcessToNetwork(link)` while the tunnel runs, unbound on teardown.
+6. **TUN came up before QUIC.** Order is now: bind process -> `startTunnel` -> wait for
+   Connected (20 s, 250 ms poll) -> `establish()` -> `startTunCapture`. A failure now
+   reports a reason and stops instead of leaving a blackhole interface.
+
+Plus visibility, because the tester has no adb: `lastError()` and `engineStats()`
+("tun=N udp=N tcp=N") over JNI, `ClientLinkManager.tunnelStatus`, both rendered on the
+one screen; host card warns "Tunnel engine not running" when the engine has no
+fingerprint; a stuck engine holding the port is recycled (`stopHost` + retry) on Share.
+
+Also fixed: "no PeerNet network found" while joined — discovery no longer depends on mDNS
+or SSID text; `gatewayCandidate()` probes the link's gateway (route gateway, or `x.y.z.1`
+derived from the interface prefix) first, and the legacy-join watcher polls it regardless
+of what the SSID string says.
+
+### Retest script (M7.6, CI runs `32649576378`)
+
+1. Install `peernet-debug-apk` on both phones.
+2. Host: tap SHARE. The card must show Network / Password / Address and **no**
+   "Tunnel engine not running" warning.
+3. Client: Wi-Fi settings -> join `DIRECT-…` with that password -> open the app.
+4. Expect: "PeerNet-xxxx connected", then a VPN consent dialog (first run only), then
+   status "tunnel up" and counters `tun=/udp=/tcp=` climbing.
+5. Browse. If it still fails, the red status line names the failing stage — report that
+   line verbatim (it is the engine's own `lastError`).
+
