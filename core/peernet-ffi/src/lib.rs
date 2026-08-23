@@ -803,3 +803,116 @@ pub(crate) fn jni_log(message: &str) {
     // packet counters surfaced through tunPacketCount().
     let _ = message;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLIENT_TUN_IP: [u8; 4] = [10, 215, 17, 2];
+    const CLIENT_SRC_PORT: u16 = 54321;
+
+    fn start_echo() -> SocketAddr {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind echo");
+        let addr = sock.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf) {
+                let _ = sock.send_to(&buf[..n], peer);
+            }
+        });
+        addr
+    }
+
+    /// Full UDP roundtrip without a TUN device: relay helper -> QUIC ->
+    /// host NAT -> echo socket -> reply pump -> rebuilt IPv4/UDP packet.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_roundtrip_through_host_nat() {
+        let echo_addr = start_echo();
+
+        let server =
+            HostServer::bind("127.0.0.1:0".parse().unwrap(), "test-host").unwrap();
+        let fp = server.fingerprint_hex().to_string();
+        let server_addr = server.local_addr();
+        let server = std::sync::Arc::new(server);
+        tokio::spawn({
+            let s = server.clone();
+            async move { s.run().await }
+        });
+
+        let opts = ClientOptions::new(server_addr, "peernet-host", fp, "test-client");
+        let client = std::sync::Arc::new(
+            TunnelClient::connect(opts).await.expect("client handshake"),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        install_reply_channel(tx);
+        let gen = engine_generation();
+        tokio::spawn(pump_udp_replies(client.clone(), gen));
+
+        register_flow(
+            CLIENT_SRC_PORT,
+            CLIENT_TUN_IP,
+            echo_addr.ip().octets(),
+            echo_addr.port(),
+        );
+        send_udp_relay(
+            &client,
+            CLIENT_SRC_PORT,
+            Ipv4Addr::LOCALHOST,
+            echo_addr.port(),
+            b"hello-pntp",
+        );
+
+        let packet = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("reply within timeout")
+            .expect("channel alive");
+
+        assert!(packet.len() >= 28);
+        // Source must be the flow's ORIGINAL destination (echo here), not
+        // whatever upstream actually answered - this is what makes the
+        // virtual DNS IP work.
+        assert_eq!(&packet[12..16], &echo_addr.ip().octets());
+        assert_eq!(&packet[16..20], &CLIENT_TUN_IP);
+        let src_port = u16::from_be_bytes([packet[20], packet[21]]);
+        let dst_port = u16::from_be_bytes([packet[22], packet[23]]);
+        assert_eq!(src_port, echo_addr.port());
+        assert_eq!(dst_port, CLIENT_SRC_PORT);
+
+        let mut header = packet[..20].to_vec();
+        let stored = u16::from_be_bytes([header[10], header[11]]);
+        header[10] = 0;
+        header[11] = 0;
+        assert_eq!(stored, internet_checksum(&header));
+
+        assert_eq!(&packet[28..], b"hello-pntp");
+    }
+
+    #[test]
+    fn rebuild_packet_is_self_consistent() {
+        let payload = vec![7u8; 100];
+        let p = build_udp_packet(
+            (Ipv4Addr::new(8, 8, 8, 8), 53),
+            (Ipv4Addr::from(CLIENT_TUN_IP), 40000),
+            &payload,
+        );
+        assert_eq!(p.len(), 28 + payload.len());
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), p.len() as u16);
+        assert_eq!(p[9], 17); // proto UDP
+        let declared = u16::from_be_bytes([p[24], p[25]]) as usize;
+        assert_eq!(declared, 8 + payload.len());
+
+        let mut header = p[..20].to_vec();
+        let stored = u16::from_be_bytes([header[10], header[11]]);
+        header[10] = 0;
+        header[11] = 0;
+        assert_eq!(stored, internet_checksum(&header));
+        assert_ne!(stored, 0);
+    }
+
+    #[test]
+    fn checksum_matches_rfc1071_example() {
+        let bytes = [0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
+        assert_eq!(internet_checksum(&bytes), 0x220d);
+    }
+}
