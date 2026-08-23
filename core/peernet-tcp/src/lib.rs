@@ -61,6 +61,9 @@ pub enum FromUpstream {
 
 const RX_BUF: usize = 64 * 1024;
 const TX_BUF: usize = 64 * 1024;
+/// Max bytes buffered for the phone across all flows before we stop
+/// draining the upstream channel for a while (backpressure).
+const PENDING_CAP: usize = 8 * RX_BUF;
 
 // ---------------------------------------------------------------------------
 // QueueDevice: smoltcp Device backed by plain packet queues.
@@ -365,19 +368,29 @@ impl TcpStack {
         }
     }
 
+    /// Bytes queued for the phone across all flows. Used to apply
+    /// backpressure when the phone's TCP window is smaller than what the
+    /// bridge has already pushed (e.g. full-duplex echo/bulk transfers).
+    fn total_pending(&self) -> usize {
+        self.flows.values().map(|f| f.pending_downstream.len()).sum()
+    }
+
     fn drain_from_upstream(&mut self) {
         loop {
+            // Backpressure: if we're already buffering plenty for slow
+            // phone-side windows, leave the rest queued in the channel and
+            // pick it up next iteration instead of ballooning RAM or
+            // dropping live flows.
+            if self.total_pending() >= PENDING_CAP {
+                return;
+            }
             match self.from_upstream.try_recv() {
                 Ok(msg) => match msg {
                     FromUpstream::Data { flow, bytes } => {
                         if let Some(f) = self.flows.get_mut(&flow) {
                             f.pending_downstream.extend_from_slice(&bytes);
-                            if f.pending_downstream.len() > RX_BUF * 2 {
-                                // Upstream is faster than the phone link can
-                                // drain; shed load rather than balloon RAM.
-                                f.pending_downstream.clear();
-                            }
                         }
+                        // Unknown flow: relay died before us; drop quietly.
                     }
                     FromUpstream::Eof { flow } => {
                         if let Some(f) = self.flows.get_mut(&flow) {
@@ -768,7 +781,14 @@ mod tests {
         h.run_for(600);
 
         assert!(h.bytes_through_bridge() >= payload.len(), "all bytes crossed");
-        let got = h.recv_phone_all(s);
+        // The echo comes back while our receive window is the bottleneck;
+        // keep interleaving reads with engine time slices until complete.
+        let mut got = Vec::with_capacity(payload.len());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while got.len() < payload.len() && Instant::now() < deadline {
+            got.extend_from_slice(&h.recv_phone_all(s));
+            h.run_for(40);
+        }
         assert_eq!(got.len(), payload.len(), "echo returned everything");
         assert_eq!(got, payload, "bulk payload intact");
         h.shutdown();
