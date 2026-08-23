@@ -9,6 +9,7 @@
 //! unreliable-datagram echo path (replaced by real relays in Milestone 5),
 //! and session bookkeeping through [`SessionManager`].
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,13 +17,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use peernet_core::cert::{generate_self_signed, HostIdentity};
 use peernet_core::{SessionId, TunnelStats};
 use peernet_proto::{
-    read_frame, write_frame, MessageKind, PeerMessage,
+    read_frame, write_frame, MessageKind, PeerMessage, TcpRelayHeader,
     ALPN, DATAGRAM_BUFFER_BYTES, IDLE_TIMEOUT_SECS, KEEPALIVE_INTERVAL_SECS,
+    TCP_CONNECT_TIMEOUT_SECS, TCP_IDLE_TIMEOUT_SECS, UDP_HEADER_BASE,
 };
 use quinn::{Connection, Endpoint};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-use crate::SessionManager;
+use crate::{SessionManager, UdpNat};
 
 #[derive(Clone)]
 pub struct HostServer {
@@ -32,6 +35,9 @@ pub struct HostServer {
     fingerprint_hex: String,
     sessions: Arc<SessionManager>,
     stats: Arc<TunnelStats>,
+    nat: Arc<UdpNat>,
+    /// Ports with an active UDP reply-pump task (prevents duplicate pumps).
+    udp_readers: Arc<Mutex<HashMap<u16, ()>>>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -81,8 +87,19 @@ impl HostServer {
             fingerprint_hex,
             sessions: Arc::new(SessionManager::new()),
             stats: Arc::new(TunnelStats::default()),
+            nat: Arc::new(UdpNat::new()),
+            udp_readers: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
         })
+    }
+
+    /// Points the DNS redirect at a custom upstream resolver.
+    pub fn set_dns_upstream(&self, addr: SocketAddr) {
+        self.nat.set_dns_upstream(addr);
+    }
+
+    pub fn nat(&self) -> Arc<UdpNat> {
+        self.nat.clone()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -127,12 +144,22 @@ impl HostServer {
                         Some(incoming) => {
                             let sessions = self.sessions.clone();
                             let stats = self.stats.clone();
+                            let nat = self.nat.clone();
+                            let udp_readers = self.udp_readers.clone();
                             let shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 match incoming.accept() {
                                     Ok(connecting) => match connecting.await {
                                         Ok(conn) => {
-                                            handle_connection(conn, sessions, stats, shutdown).await
+                                            handle_connection(
+                                                conn,
+                                                sessions,
+                                                stats,
+                                                nat,
+                                                udp_readers,
+                                                shutdown,
+                                            )
+                                            .await
                                         }
                                         Err(_) => {}
                                     },
@@ -152,12 +179,16 @@ async fn handle_connection(
     conn: Connection,
     sessions: Arc<SessionManager>,
     stats: Arc<TunnelStats>,
+    nat: Arc<UdpNat>,
+    udp_readers: Arc<Mutex<HashMap<u16, ()>>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Unreliable-datagram echo (loopback data plane until M5 relays land).
+    // Unreliable datagrams = UDP relay path (spec Section 9.7).
     {
         let conn = conn.clone();
         let stats = stats.clone();
+        let nat = nat.clone();
+        let udp_readers = udp_readers.clone();
         let mut shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
@@ -165,10 +196,37 @@ async fn handle_connection(
                     _ = shutdown.changed() => break,
                     dgram = conn.read_datagram() => match dgram {
                         Ok(data) => {
-                            stats.record_down(data.len() as u64);
-                            stats.record_up(data.len() as u64);
-                            if conn.send_datagram(data).is_err() {
-                                break;
+                            let (hdr, start) = match peernet_proto::UdpRelayHeader::decode(&data) {
+                                Ok(x) => x,
+                                Err(_) => continue, // not a relay datagram; ignore
+                            };
+                            let payload = &data[start..];
+                            stats.record_down(payload.len() as u64);
+
+                            let dst = SocketAddr::new(hdr.dst_ip, hdr.dst_port);
+                            let dst = nat.resolve_dst(dst);
+                            let socket = match nat.get_or_create(hdr.src_port).await {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            if socket.send_to(payload, dst).await.is_err() {
+                                continue;
+                            }
+
+                            // Spawn one reply pump per outbound local port.
+                            let local_port = match socket.local_addr() {
+                                Ok(a) => a.port(),
+                                Err(_) => continue,
+                            };
+                            let is_new = udp_readers
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(local_port, ())
+                                .is_none();
+                            if is_new {
+                                let conn = conn.clone();
+                                let stats = stats.clone();
+                                tokio::spawn(pump_udp_replies(socket, conn, stats));
                             }
                         }
                         Err(_) => break,
@@ -230,6 +288,15 @@ async fn service_stream(
 
         stats.record_up(frame.payload.len() as u64);
 
+        // TCP relay: first frame on a stream carries a PN TCP header; the
+        // rest of the stream is raw payload piped to the real destination.
+        if frame.kind == MessageKind::Data {
+            if let Ok((hdr, _start)) = TcpRelayHeader::decode(&frame.payload) {
+                tcp_relay(tx, rx, hdr, stats).await;
+                return;
+            }
+        }
+
         match frame.kind {
             MessageKind::Hello => {
                 let assigned = {
@@ -280,4 +347,88 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+async fn tcp_relay(
+    mut tx: quinn::SendStream,
+    mut rx: quinn::RecvStream,
+    hdr: TcpRelayHeader,
+    stats: Arc<TunnelStats>,
+) {
+    let addr = SocketAddr::new(hdr.dst_ip, hdr.dst_port);
+    let tcp = match tokio::time::timeout(
+        Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        // Connect failed/timed out: closing the stream signals the client.
+        _ => return,
+    };
+    let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
+
+    let up = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS), rx.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    stats.record_down(n as u64);
+                    if tcp_w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tcp_w.shutdown().await;
+    });
+
+    let down = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS), tcp_r.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    stats.record_up(n as u64);
+                    if tx.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.shutdown().await;
+    });
+
+    let _ = up.await;
+    let _ = down.await;
+}
+
+/// Forwards UDP responses arriving on a NAT socket back to the client as
+/// relay datagrams, preserving the outbound source port (spec 12.6).
+async fn pump_udp_replies(
+    socket: Arc<tokio::net::UdpSocket>,
+    conn: Connection,
+    stats: Arc<TunnelStats>,
+) {
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (n, peer) = match socket.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        stats.record_down(n as u64);
+        let src_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        let hdr = peernet_proto::UdpRelayHeader {
+            session_id: 0,
+            src_port,
+            dst_ip: peer.ip(),
+            dst_port: peer.port(),
+        };
+        let mut frame = hdr.encode(0);
+        frame.extend_from_slice(&buf[..n]);
+        if conn.send_datagram(frame.into()).is_err() {
+            break;
+        }
+    }
 }

@@ -1,7 +1,9 @@
-//! Host-side session bookkeeping and PNTP QUIC server.
+//! Host-side session bookkeeping, UDP NAT, and PNTP QUIC server.
 
+pub mod nat;
 pub mod server;
 
+pub use nat::UdpNat;
 pub use server::HostServer;
 
 use std::collections::HashMap;

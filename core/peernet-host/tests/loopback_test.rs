@@ -51,8 +51,23 @@ async fn handshake_heartbeat_and_stats() {
         let echoed = client.data_roundtrip(payload.clone()).await.expect("data roundtrip");
         assert_eq!(echoed, payload);
 
-        let dgram = vec![7u8; 1024];
-        let echoed = client.datagram_roundtrip(dgram).await.expect("datagram roundtrip");
+        // UDP relay roundtrip through the host NAT to a local echo socket.
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let (n, peer) = match echo.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+        let echoed = client
+            .udp_exchange(45987, echo_addr, &vec![7u8; 1024])
+            .await
+            .expect("udp relay roundtrip");
         assert_eq!(echoed.len(), 1024);
 
         let host_stats = server.stats_snapshot();

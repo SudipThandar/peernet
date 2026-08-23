@@ -12,11 +12,12 @@ use std::time::Duration;
 
 use peernet_core::TunnelStats;
 use peernet_proto::{
-    read_frame, write_frame, MessageKind, PeerMessage,
+    read_frame, write_frame, MessageKind, PeerMessage, TcpRelayHeader, UdpRelayHeader,
     ALPN, DATAGRAM_BUFFER_BYTES, IDLE_TIMEOUT_SECS, KEEPALIVE_INTERVAL_SECS,
 };
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 /// Mirrors the Kotlin client lifecycle.
@@ -244,6 +245,70 @@ impl TunnelClient {
             return Err("unexpected reply kind".into());
         }
         bincode::deserialize(&reply.payload).map_err(|e| e.to_string())
+    }
+
+    /// TCP relay (spec Section 9.6): opens a stream with a PN TCP header,
+    /// sends `request`, half-closes, and reads the reply until EOF.
+    pub async fn tcp_relay(
+        &self,
+        dst: SocketAddr,
+        request: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let (mut tx, mut rx) = self
+            .conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("stream open failed: {e}"))?;
+
+        let hdr = TcpRelayHeader { src_port: 0, dst_ip: dst.ip(), dst_port: dst.port() };
+        write_frame(
+            &mut tx,
+            &PeerMessage::new(MessageKind::Data, self.session_id(), hdr.encode()),
+        )
+        .await
+        .map_err(|e| format!("relay header send failed: {e}"))?;
+        tx.write_all(request)
+            .await
+            .map_err(|e| format!("payload send failed: {e}"))?;
+        let _ = tx.flush().await;
+        // Half-close so the remote side sees EOF and can finish its reply.
+        let _ = tx.shutdown().await;
+
+        let mut out = Vec::new();
+        rx.read_to_end(&mut out)
+            .await
+            .map_err(|e| format!("reply read failed: {e}"))?;
+        Ok(out)
+    }
+
+    /// UDP relay (spec Section 9.7): sends one relay datagram and waits for
+    /// the host's response datagram. `src_port` is requested for
+    /// endpoint-preserving NAT; the reply header carries the actual port.
+    pub async fn udp_exchange(
+        &self,
+        src_port: u16,
+        dst: SocketAddr,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let hdr = UdpRelayHeader {
+            session_id: self.session_id() as u32,
+            src_port,
+            dst_ip: dst.ip(),
+            dst_port: dst.port(),
+        };
+        let mut frame = hdr.encode(0);
+        frame.extend_from_slice(payload);
+        self.conn
+            .send_datagram(frame.into())
+            .map_err(|e| format!("udp send failed: {e}"))?;
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), self.conn.read_datagram())
+            .await
+            .map_err(|_| "udp reply timeout".to_string())?
+            .map_err(|e| format!("udp recv failed: {e}"))?;
+        let (_, start) =
+            UdpRelayHeader::decode(&reply).map_err(|e| format!("bad relay reply: {e}"))?;
+        Ok(reply[start..].to_vec())
     }
 
     /// Sends Bye and closes everything.

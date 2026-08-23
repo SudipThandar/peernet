@@ -22,6 +22,14 @@ const HEADER_LEN: usize = 4 + 1 + 4;
 /// Hard cap so a hostile peer cannot make us allocate gigabytes.
 const MAX_BODY_LEN: u32 = 8 * 1024 * 1024;
 
+pub mod relay;
+
+pub use relay::{
+    TcpRelayHeader, UdpRelayHeader,
+    FLAG_DNS, FLAG_IPV4, FLAG_IPV6, FLAG_RTC, FLAG_STUN,
+    RELAY_MAGIC, RELAY_TYPE_TCP, RELAY_TYPE_UDP,
+};
+
 /// QUIC ALPN protocol id. Mismatched connections are rejected by TLS itself.
 pub const ALPN: &[u8] = b"pn/1";
 
@@ -33,6 +41,13 @@ pub const KEEPALIVE_INTERVAL_SECS: u64 = 20;
 
 /// Datagram buffer size on both endpoints (user constraint).
 pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Relay timeouts (spec Sections 12.4/12.8).
+pub const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const TCP_IDLE_TIMEOUT_SECS: u64 = 120;
+pub const UDP_NAT_IDLE_TIMEOUT_SECS: u64 = 90;
+/// Max concurrent UDP mappings per client (spec 12.8).
+pub const MAX_UDP_MAPPINGS_PER_CLIENT: usize = 512;
 
 #[derive(Debug, Error)]
 pub enum PntpError {
