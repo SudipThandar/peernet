@@ -1,11 +1,11 @@
-//! Client-side PNTP QUIC tunnel (Milestone 4).
+﻿//! Client-side PNTP QUIC tunnel (Milestone 4).
 //!
 //! Connects to a host whose SHA-256 certificate fingerprint is pinned,
 //! performs the Hello handshake over the control stream, keeps the session
 //! alive with heartbeats, and can read host stats + roundtrip data/datagrams.
 //! Real TCP/UDP relays land in Milestone 5.
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,7 +62,7 @@ impl ClientOptions {
 pub struct TunnelClient {
     endpoint: Endpoint,
     conn: Connection,
-    session_cell: Cell<u64>,
+    session_id: AtomicU64,
     state: Arc<watch::Sender<ClientState>>,
     /// Must stay alive: dropping all receivers closes the watch channel and
     /// makes every subsequent send() fail silently.
@@ -113,7 +113,7 @@ impl TunnelClient {
         let mut client = Self {
             endpoint,
             conn,
-            session_cell: Cell::new(0),
+            session_id: AtomicU64::new(0),
             state: Arc::new(state_tx),
             _state_rx: Arc::new(state_rx),
             stats: Arc::new(TunnelStats::default()),
@@ -143,7 +143,7 @@ impl TunnelClient {
             return Err("unexpected handshake response".into());
         }
 
-        self.session_cell.set(ack.session_id);
+        self.session_id.store(ack.session_id, Ordering::Release);
         let _ = self.state.send(ClientState::Connected);
 
         // Heartbeat pump: one beat per interval; missing an echo flips us to
@@ -185,7 +185,7 @@ impl TunnelClient {
     }
 
     pub fn session_id(&self) -> u64 {
-        self.session_cell.get()
+        self.session_id.load(Ordering::Acquire)
     }
 
     pub fn state(&self) -> ClientState {
@@ -318,7 +318,7 @@ impl TunnelClient {
     }
 
     /// Sends Bye and closes everything.
-    pub fn shutdown(mut self) {
+    pub fn shutdown(self) {
         let _ = self.state.send(ClientState::Disconnected);
         self.keepalive_handle.abort();
         self.endpoint.close(0u32.into(), b"bye");
