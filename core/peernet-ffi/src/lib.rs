@@ -151,7 +151,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
         if TUN_STOP.load(Ordering::SeqCst) {
             break;
         }
-        let mut guard = match async_fd.readable().await {
+        let mut guard = match async_fd.readable_mut().await {
             Ok(g) => g,
             Err(_) => break,
         };
