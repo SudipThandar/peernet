@@ -73,6 +73,30 @@ jobs:
             -o ../app/src/main/jniLibs \
             build --release
 
+      # An .so linked for 4 KB pages will not load on Android 15+ devices that
+      # use 16 KB pages; the app then reports "native engine unavailable" with
+      # no other clue. core/.cargo/config.toml sets the link arg — this step
+      # proves it actually reached the linker.
+      - name: Verify 16 KB page alignment of native libraries
+        if: hashFiles('core/Cargo.toml') != ''
+        run: |
+          set -e
+          found=0
+          for so in app/src/main/jniLibs/*/*.so; do
+            found=1
+            bad=$(readelf -lW "$so" | awk '$1=="LOAD" { if (strtonum($NF) < 16384) print $NF }')
+            if [ -n "$bad" ]; then
+              echo "::error::$so has LOAD segments aligned below 16 KB: $bad"
+              readelf -lW "$so" | sed -n '1,25p'
+              exit 1
+            fi
+            echo "$so: LOAD segments aligned >= 16 KB"
+          done
+          if [ "$found" = "0" ]; then
+            echo "::error::no .so found to verify"
+            exit 1
+          fi
+
       - name: Grant execute permission to gradlew
         run: chmod +x gradlew
 
