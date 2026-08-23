@@ -1,0 +1,16 @@
+# Android 15+ ships devices with 16 KB memory pages. A .so linked with the
+# older 4 KB max-page-size fails to load there, and the app then silently
+# reports "native engine unavailable" — the exact class of invisible,
+# device-only failure this project keeps getting bitten by.
+#
+# NDK r27+ already defaults to 16 KB, but CI resolves whatever NDK the runner
+# image provides, so pin it explicitly rather than depend on the toolchain.
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

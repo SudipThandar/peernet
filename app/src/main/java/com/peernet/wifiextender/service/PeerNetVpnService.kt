@@ -130,7 +130,10 @@ class PeerNetVpnService : VpnService() {
 
         val fd = establishTun()
         if (fd < 0) {
-            fail("Android refused to create the VPN interface.")
+            fail(
+                "Android refused to create the VPN interface — " +
+                    "another VPN may be active, or VPN permission was withdrawn."
+            )
             return
         }
         tunFd = fd
@@ -230,14 +233,10 @@ class PeerNetVpnService : VpnService() {
 
         val pfd: ParcelFileDescriptor = builder.establish() ?: return -1
         return try {
-            // protect(int) before ownership transfer — routing-loop guard.
-            val currentFd: Int = pfd.fd
-            val ok: Boolean = protect(currentFd)
-            if (!ok) {
-                Timber.w("protect(fd) failed — aborting tunnel to avoid routing loops")
-                runCatching { pfd.close() }
-                return -1
-            }
+            // No protect() here: it applies to *sockets* and fails with
+            // ENOTSOCK on a TUN fd, which used to abort every tunnel. The
+            // routing-loop guard is addDisallowedApplication(packageName)
+            // above — our own QUIC socket never enters the tunnel.
             pfd.detachFd()
         } catch (t: Throwable) {
             Timber.w(t, "tun handoff failed")
@@ -280,19 +279,21 @@ class PeerNetVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val notification: Notification =
-            NotificationCompat.Builder(this, PeerNetApp.CHANNEL_HOST)
+            NotificationCompat.Builder(this, PeerNetApp.CHANNEL_TUNNEL)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("PeerNet tunnel active")
+                .setContentText("Internet is arriving through the host phone")
                 .setOngoing(true)
-                .setSilent(true)
                 .setContentIntent(openIntent)
                 .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // specialUse, matching the manifest: systemExempted needs a
+            // platform exemption and throws SecurityException on Android 14+.
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)

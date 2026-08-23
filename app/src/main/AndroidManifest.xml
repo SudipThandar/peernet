@@ -60,12 +60,25 @@
                 android:value="Keeps the local Wi-Fi Direct sharing network alive so nearby paired devices can bridge to this phone's internet connection." />
         </service>
 
-        <!-- Client VPN tunnel: system binds with its own permission. -->
+        <!-- Client VPN tunnel. The SERVICE_INTERFACE filter is mandatory: the
+             platform binds the VPN through it, and without it Builder.establish()
+             just returns null (consent is granted, then nothing works). It must
+             therefore be exported; BIND_VPN_SERVICE keeps it system-only.
+             Type is specialUse, not systemExempted: systemExempted additionally
+             requires FOREGROUND_SERVICE_SYSTEM_EXEMPTED plus a platform
+             exemption, and throws SecurityException on Android 14+ without it. -->
         <service
             android:name=".service.PeerNetVpnService"
-            android:exported="false"
+            android:exported="true"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="systemExempted" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Carries this phone's internet traffic through a paired host phone's local Wi-Fi Direct tunnel while the tunnel is active." />
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
 
         <!-- Notification Stop action: manifest receiver so delivery never
              depends on process state or OEM service-intent quirks. -->

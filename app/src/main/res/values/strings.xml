@@ -27,6 +27,8 @@
 
     <string name="channel_host_name">Hosting status</string>
     <string name="channel_host_description">Shows while this phone is sharing its internet connection</string>
+    <string name="channel_tunnel_name">Tunnel status</string>
+    <string name="channel_tunnel_description">Shows while this phone receives internet from a host phone</string>
 
     <!-- Onboarding -->
     <string name="onboarding_title">Welcome to PeerNet</string>

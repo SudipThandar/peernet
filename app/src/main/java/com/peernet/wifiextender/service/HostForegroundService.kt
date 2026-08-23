@@ -74,13 +74,19 @@ class HostForegroundService : Service() {
     private fun observeState() {
         scope.launch {
             var lastSsid: String? = null
+            // The state is a StateFlow, so collect() replays the CURRENT value
+            // immediately. Acting on it would stop the service the instant it
+            // starts (notification flashes and disappears) whenever hosting has
+            // not been flagged yet — so wait until hosting is actually seen.
+            var sawHosting = false
             wifiDirect.state.collect { s ->
+                if (s.hosting || s.creating) sawHosting = true
                 if (s.ssid != lastSsid) {
                     lastSsid = s.ssid
                     val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
                     nm.notify(NOTIFICATION_ID, buildNotification(s.ssid))
                 }
-                if (!s.hosting && !s.creating) {
+                if (sawHosting && !s.hosting && !s.creating) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
@@ -108,9 +114,8 @@ class HostForegroundService : Service() {
             .setContentTitle("PeerNet is sharing your internet")
             .setContentText(ssid?.let { "Network: $it" } ?: "Local network starting…")
             .setOngoing(true)
-            .setSilent(true)
             .setContentIntent(openIntent)
-            .addAction(0, "Stop", stopIntent)
+            .addAction(R.drawable.ic_notification, "Stop", stopIntent)
             .build()
     }
 

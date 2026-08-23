@@ -64,9 +64,12 @@ fun HomeScreen(
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { grants ->
+    ) { _ ->
+        // Re-read instead of trusting the result map: it only contains what was
+        // asked for, and only *required* permissions may gate sharing (a denied
+        // notification permission must never disable the app).
         missingPerms = Permissions.missing(context)
-        if (grants.values.all { it } && pendingStartSharing) {
+        if (missingPerms.isEmpty() && pendingStartSharing) {
             pendingStartSharing = false
             hostViewModel.startSharing()
         }
@@ -78,8 +81,9 @@ fun HomeScreen(
         missingPerms = Permissions.missing(context)
         // Ask for location/nearby-devices up front: first-run users grant
         // once here instead of being interrupted mid-SHARE or mid-CONNECT.
-        if (missingPerms.isNotEmpty()) {
-            permissionLauncher.launch(Permissions.runtimePermissions().toTypedArray())
+        val firstRunAsk = Permissions.missingAny(context)
+        if (firstRunAsk.isNotEmpty()) {
+            permissionLauncher.launch(firstRunAsk.toTypedArray())
         }
     }
 
@@ -114,11 +118,27 @@ fun HomeScreen(
                 )
             }
         }
+    /**
+     * Android 12+ throws ForegroundServiceStartNotAllowedException when a
+     * foreground service is started while the app is not visible, and the link
+     * event that triggers this can arrive from a background coroutine. A crash
+     * there looks exactly like "the app is broken", so it is reported instead.
+     */
+    fun startVpnService() {
+        try {
+            context.startForegroundService(vpnIntent())
+        } catch (t: Throwable) {
+            clientViewModel.reportTunnelStatus(
+                "Could not start the tunnel while the app was in the background — open PeerNet and reconnect."
+            )
+        }
+    }
+
     val vpnLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
-            context.startForegroundService(vpnIntent())
+            startVpnService()
         } else {
             // Silent denial used to look identical to a broken tunnel.
             clientViewModel.reportTunnelStatus(
@@ -144,7 +164,7 @@ fun HomeScreen(
         if (prepare != null) {
             vpnLauncher.launch(prepare)
         } else {
-            context.startForegroundService(vpnIntent())
+            startVpnService()
         }
         // Surface capture + tunnel proof in the status line.
         var silentSince = 0L
@@ -242,7 +262,7 @@ fun HomeScreen(
                     hostViewModel.stopSharing()
                 } else if (missingPerms.isNotEmpty()) {
                     pendingStartSharing = true
-                    permissionLauncher.launch(Permissions.runtimePermissions().toTypedArray())
+                    permissionLauncher.launch(missingPerms.toTypedArray())
                 } else {
                     hostViewModel.startSharing()
                 }

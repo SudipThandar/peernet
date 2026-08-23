@@ -59,6 +59,22 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+    lint {
+        // Fail the build on the platform-contract checks whose violations are
+        // invisible until a real device refuses to run the app. Restricted to
+        // this set so unrelated style warnings can never block a release.
+        abortOnError = true
+        checkOnly += listOf(
+            "ForegroundServicePermission",
+            "ForegroundServiceType",
+            "MissingPermission",
+            "ExportedService",
+            "ExportedReceiver",
+            "UnspecifiedRegisterReceiverFlag",
+            "ProtectedPermissions",
+            "InvalidWakeLockTag"
+        )
+    }
 }
 
 dependencies {
