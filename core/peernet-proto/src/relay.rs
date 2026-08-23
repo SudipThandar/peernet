@@ -27,8 +27,10 @@ pub const TCP_HEADER_LEN_V4: usize = 13;
 pub const TCP_HEADER_LEN_V6: usize = 25;
 /// Offset where the session field starts: magic(2)+ver(1)+type(1).
 pub const UDP_HEADER_BASE: usize = 4;
-pub const UDP_HEADER_LEN_V4: usize = UDP_HEADER_BASE + 2 + 4 + 2 + 1;
-pub const UDP_HEADER_LEN_V6: usize = UDP_HEADER_BASE + 2 + 16 + 2 + 1;
+/// magic(2)+ver(1)+type(1)+session(4)+src_port(2)+ip(4)+dst_port(2)+flags(1).
+pub const UDP_HEADER_LEN_V4: usize = 17;
+/// Same layout with a 16-byte IPv6 address.
+pub const UDP_HEADER_LEN_V6: usize = 29;
 
 fn encode_ip(ip: IpAddr, out: &mut Vec<u8>) -> u8 {
     match ip {
