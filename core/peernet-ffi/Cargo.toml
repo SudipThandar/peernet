@@ -7,6 +7,9 @@ license.workspace = true
 [lib]
 name = "peernet_core"
 crate-type = ["cdylib", "rlib"]
+# Doctest compilation trips over the dual cdylib/rlib artifacts (E0464);
+# this crate carries no doc examples.
+doctest = false
 
 [dependencies]
 jni = { workspace = true }
