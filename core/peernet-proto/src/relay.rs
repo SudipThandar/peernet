@@ -167,7 +167,8 @@ impl UdpRelayHeader {
         } else {
             return Err(PntpError::UnexpectedEof);
         };
-        Ok((Self { session_id, src_port, dst_ip, dst_port }, cur))
+        let start = if dst_ip.is_ipv4() { UDP_HEADER_LEN_V4 } else { UDP_HEADER_LEN_V6 };
+        Ok((Self { session_id, src_port, dst_ip, dst_port }, start))
     }
 }
 
@@ -209,11 +210,15 @@ mod tests {
             dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             dst_port: 53,
         };
-        let enc = h.encode(FLAG_DNS | FLAG_RTC);
-        assert_eq!(enc.len(), UDP_HEADER_LEN_V4);
-        let (dec, start) = UdpRelayHeader::decode(&enc).unwrap();
+        let mut datagram = h.encode(FLAG_DNS | FLAG_RTC);
+        let payload = b"dns-query-bytes".to_vec();
+        datagram.extend_from_slice(&payload);
+
+        let (dec, start) = UdpRelayHeader::decode(&datagram).unwrap();
         assert_eq!(h, dec);
-        assert!(start <= enc.len());
+        assert_eq!(start, UDP_HEADER_LEN_V4);
+        // Payload slicing must be exact: no header bytes may leak through.
+        assert_eq!(&datagram[start..], &payload[..]);
     }
 
     #[test]
