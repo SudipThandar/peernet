@@ -20,8 +20,7 @@
 //! `FromUpstream::Eof`.
 
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -69,8 +68,8 @@ const TX_BUF: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct QueueDevice {
-    rx_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
-    tx_queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    tx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 struct QdRx {
@@ -87,7 +86,7 @@ impl RxToken for QdRx {
 }
 
 struct QdTx {
-    queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 impl TxToken for QdTx {
@@ -97,7 +96,7 @@ impl TxToken for QdTx {
     {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf);
-        self.queue.borrow_mut().push_back(buf);
+        self.queue.lock().unwrap().push_back(buf);
         result
     }
 }
@@ -107,7 +106,7 @@ impl Device for QueueDevice {
     type TxToken<'a> = QdTx;
 
     fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let pkt = self.rx_queue.borrow_mut().pop_front()?;
+        let pkt = self.rx_queue.lock().unwrap().pop_front()?;
         Some((
             QdRx { pkt },
             QdTx {
@@ -208,8 +207,8 @@ impl TcpStack {
         let (upstream_tx, upstream_rx) = mpsc::channel::<FromUpstream>();
 
         let device = QueueDevice {
-            rx_queue: Rc::new(RefCell::new(VecDeque::new())),
-            tx_queue: Rc::new(RefCell::new(VecDeque::new())),
+            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
+            tx_queue: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let config = Config::new(HardwareAddress::Ip);
@@ -314,7 +313,7 @@ impl TcpStack {
                             self.add_listener(key);
                         }
                         if self.flows.contains_key(&key) {
-                            self.device.rx_queue.borrow_mut().push_back(pkt);
+                            self.device.rx_queue.lock().unwrap().push_back(pkt);
                         }
                         // Unknown non-SYN traffic has no flow; drop it.
                     }
@@ -357,7 +356,7 @@ impl TcpStack {
     }
 
     fn flush_device_output(&mut self) {
-        let mut queue = self.device.tx_queue.borrow_mut();
+        let mut queue = self.device.tx_queue.lock().unwrap();
         while let Some(pkt) = queue.pop_front() {
             if self.pkt_out.send(pkt).is_err() {
                 self.upstream_alive = false;
@@ -563,8 +562,8 @@ mod tests {
 
             // Phone-side stack: plain smoltcp interface over its own queues.
             let device = QueueDevice {
-                rx_queue: Rc::new(RefCell::new(VecDeque::new())),
-                tx_queue: Rc::new(RefCell::new(VecDeque::new())),
+                rx_queue: Arc::new(Mutex::new(VecDeque::new())),
+                tx_queue: Arc::new(Mutex::new(VecDeque::new())),
             };
             let mut probe = device.clone();
             let config = Config::new(HardwareAddress::Ip);
@@ -635,14 +634,14 @@ mod tests {
             while Instant::now() < deadline {
                 // Stack -> phone packets.
                 while let Ok(p) = self.pkt_out_rx.try_recv() {
-                    self.phone_dev.rx_queue.borrow_mut().push_back(p);
+                    self.phone_dev.rx_queue.lock().unwrap().push_back(p);
                 }
                 let now = SmolInstant::from_millis(
                     self.started.elapsed().as_millis() as i64
                 );
                 let _ = self.phone_iface.poll(now, &mut self.phone_dev, &mut self.phone_sockets);
                 // Phone -> stack packets.
-                let mut tx = self.phone_dev.tx_queue.borrow_mut();
+                let mut tx = self.phone_dev.tx_queue.lock().unwrap();
                 while let Some(p) = tx.pop_front() {
                     if let Some(sender) = &self.pkt_in_tx {
                         let _ = sender.send(p);
@@ -839,11 +838,11 @@ mod tests {
             .unwrap();
 
         st.step();
-        eprintln!("after step1: flows={:?} rxq={} listeners_ok", st.flows.keys().collect::<Vec<_>>(), st.device.rx_queue.borrow().len());
+        eprintln!("after step1: flows={:?} rxq={} listeners_ok", st.flows.keys().collect::<Vec<_>>(), st.device.rx_queue.lock().unwrap().len());
         for _ in 0..3 {
             st.step();
         }
-        eprintln!("txq after steps: {}", st.device.tx_queue.borrow().len());
+        eprintln!("txq after steps: {}", st.device.tx_queue.lock().unwrap().len());
 
         match pkt_out_rx.try_recv() {
             Ok(reply) => {
