@@ -169,6 +169,11 @@ First device test round (two Android phones, host on Wi-Fi) found two blockers, 
    lock access via `.unwrap_or_else(|p| p.into_inner())` everywhere.
 5. **Generation guard:** `ENGINE_GEN` bumps on stop/new-start; handshake tasks and the UDP reply
    pump check it and exit when superseded.
+5b. **Runtime context on JNI threads:** quinn resolves its async runtime *while constructing*
+   endpoints (`Handle::try_current()`), and JNI threads have none. Build any quinn/tokio
+   object inside `runtime().enter()` or `runtime().block_on(..)` — `bind_host_server()` is
+   the reference. `#[tokio::test]` hides this class of bug entirely; guard it with a test
+   that runs on a bare `std::thread`.
 6. **JNI specifics:** `JNIEnv::get_string(&mut self)` means helpers take `&mut JNIEnv` and
    callers need `mut env`. `compare_exchange` returns Result — never apply `!` to it. Symbols
    must match `NativeCore.kt`: `Java_com_peernet_wifiextender_core_NativeCore_*`.
@@ -265,15 +270,40 @@ enough to blackhole traffic:
 
 Plus visibility, because the tester has no adb: `lastError()` and `engineStats()`
 ("tun=N udp=N tcp=N") over JNI, `ClientLinkManager.tunnelStatus`, both rendered on the
-one screen; host card warns "Tunnel engine not running" when the engine has no
-fingerprint; a stuck engine holding the port is recycled (`stopHost` + retry) on Share.
+one screen; host card warns "Tunnel engine not running" **and names the engine's own
+reason**; a stuck engine holding the port is recycled (`stopHost` + retry) on Share.
 
 Also fixed: "no PeerNet network found" while joined — discovery no longer depends on mDNS
 or SSID text; `gatewayCandidate()` probes the link's gateway (route gateway, or `x.y.z.1`
 derived from the interface prefix) first, and the legacy-join watcher polls it regardless
 of what the SSID string says.
 
-### Retest script (M7.6, CI runs `32649576378`)
+### 7. The dominant defect: the host engine never started at all
+
+That new host warning immediately paid for itself — it exposed the real killer behind the
+whole "no internet" report:
+
+**`quinn::Endpoint::server()` resolves its async runtime while binding**
+(`default_runtime()` → `Handle::try_current()`), and `startHost` runs on a **JNI thread
+with no tokio context**. `HostServer::bind` therefore returned `no async runtime found` on
+every device, always: no certificate, an empty pin in both mDNS and the banner, and
+nothing listening on 4433. The client could never have tunnelled regardless of defects
+1–6 — those were real, but latent behind this one.
+
+Every `#[tokio::test]` passed because a test always supplies the runtime that production
+never has; the CI gate was structurally blind to it.
+
+Fix: `bind_host_server()` enters the engine runtime (`runtime().enter()`) before binding,
+applies the DNS upstream, and is what JNI now calls. Regression guard
+`tests::host_binds_from_a_thread_with_no_runtime` binds from a plain `std::thread`
+(asserting `Handle::try_current().is_err()` first) and *also* asserts the bare
+`HostServer::bind` still fails there, so the test cannot become vacuous.
+
+**Rule added:** anything quinn/tokio constructed on a JNI thread must be built inside
+`runtime().enter()` or `runtime().block_on(..)`. Client paths were already safe —
+`Endpoint::client` runs inside the spawned async connect.
+
+### Retest script (M7.6, CI run `32651274881` or later)
 
 1. Install `peernet-debug-apk` on both phones.
 2. Host: tap SHARE. The card must show Network / Password / Address and **no**

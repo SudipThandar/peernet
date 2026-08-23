@@ -1125,6 +1125,20 @@ mod tests {
         })
         .join()
         .expect("bind thread panicked");
+
+        // Proof the guard above is not vacuous: quinn resolves its async
+        // runtime while binding, so the bare call is what broke production.
+        // If this ever starts succeeding, quinn changed and the wrapper's
+        // comment (not the wrapper) is what needs updating.
+        let bare = std::thread::spawn(|| {
+            HostServer::bind(SocketAddr::from(([127, 0, 0, 1], 0)), "bare-host")
+        })
+        .join()
+        .expect("bare bind thread panicked");
+        assert!(
+            bare.is_err(),
+            "expected quinn to reject a runtime-less bind; got a live server"
+        );
     }
 
     fn start_echo() -> SocketAddr {
