@@ -190,40 +190,18 @@ async fn handle_connection(
         let nat = nat.clone();
         let udp_readers = udp_readers.clone();
         let mut shutdown = shutdown.clone();
-        #[cfg(test)]
-        eprintln!("[nat-diag] udp task up");
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     dgram = conn.read_datagram() => match dgram {
                         Ok(data) => {
-                            #[cfg(test)]
-                            eprintln!(
-                                "[nat-diag] got dgram len={} head={:?}",
-                                data.len(),
-                                &data[..data.len().min(24)]
-                            );
                             let (hdr, start) = match peernet_proto::UdpRelayHeader::decode(&data) {
                                 Ok(x) => x,
                                 Err(e) => {
-                                    #[cfg(test)]
-                                    eprintln!(
-                                        "[nat-diag] decode failed: {e} len={} head={:?}",
-                                        data.len(),
-                                        &data[..data.len().min(24)]
-                                    );
                                     continue;
                                 }
                             };
-                            #[cfg(test)]
-                            eprintln!(
-                                "[nat-diag] in len={} start={} hdr={:?} head={:?}",
-                                data.len(),
-                                start,
-                                hdr,
-                                &data[..data.len().min(20)]
-                            );
                             let payload = &data[start..];
                             stats.record_down(payload.len() as u64);
 
@@ -487,8 +465,6 @@ async fn pump_udp_replies(
             Ok(x) => x,
             Err(_) => break,
         };
-        #[cfg(test)]
-        eprintln!("[pump-diag] recv n={} peer={}", n, peer);
         stats.record_down(n as u64);
         let src_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let hdr = peernet_proto::UdpRelayHeader {

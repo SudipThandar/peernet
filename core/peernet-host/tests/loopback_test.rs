@@ -67,10 +67,7 @@ async fn handshake_heartbeat_and_stats() {
         let echoed = client
             .udp_exchange_via_stream(45987, echo_addr, &vec![7u8; 1024])
             .await
-            .expect("udp relay roundtrip");
-        if echoed.len() != 1024 {
-            eprintln!(
-                "[diag] echoed.len={} prefix={:?} suffix={:?}",
+            .expect("udp relay roundtrip"); prefix={:?} suffix={:?}",
                 echoed.len(),
                 &echoed[..16.min(echoed.len())],
                 &echoed[echoed.len().saturating_sub(16)..]
