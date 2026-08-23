@@ -852,7 +852,7 @@ mod tests {
         register_flow(
             CLIENT_SRC_PORT,
             CLIENT_TUN_IP,
-            echo_addr.ip().octets(),
+            Ipv4Addr::LOCALHOST.octets(),
             echo_addr.port(),
         );
         send_udp_relay(
@@ -872,7 +872,7 @@ mod tests {
         // Source must be the flow's ORIGINAL destination (echo here), not
         // whatever upstream actually answered - this is what makes the
         // virtual DNS IP work.
-        assert_eq!(&packet[12..16], &echo_addr.ip().octets());
+        assert_eq!(&packet[12..16], &Ipv4Addr::LOCALHOST.octets());
         assert_eq!(&packet[16..20], &CLIENT_TUN_IP);
         let src_port = u16::from_be_bytes([packet[20], packet[21]]);
         let dst_port = u16::from_be_bytes([packet[22], packet[23]]);
