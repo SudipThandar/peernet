@@ -26,7 +26,7 @@ use peernet_core::SessionId;
 use peernet_host::HostServer;
 use peernet_proto::UdpRelayHeader;
 use tokio::io::unix::AsyncFd;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 
 /// Dedicated engine runtime â€” JNI has no ambient tokio context.
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -83,7 +83,7 @@ fn tun_tx() -> Option<TunTx> {
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
-        .map(std::sync::Clone::clone)
+        .map(|t| t.clone())
 }
 
 /// Outbound TCP is deferred (needs local termination); count instead of
