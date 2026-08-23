@@ -368,7 +368,9 @@ async fn tcp_relay(
     };
     let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
 
+    let up_stats = stats.clone();
     let up = tokio::spawn(async move {
+        let stats = up_stats;
         let mut buf = vec![0u8; 8192];
         loop {
             // quinn RecvStream::read yields Option<usize> (None = FIN).

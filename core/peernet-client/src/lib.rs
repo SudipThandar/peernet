@@ -274,6 +274,7 @@ impl TunnelClient {
         // Half-close so the remote side sees EOF and can finish its reply.
         let _ = tx.shutdown().await;
 
+        let mut out = Vec::new();
         // quinn's inherent read_to_end drains until the host closes the stream.
         rx.read_to_end(&mut out)
             .await
