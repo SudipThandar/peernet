@@ -16,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jni::objects::{JClass, JString, JValue};
 use jni::sys::{jboolean, jint, jlong};
@@ -95,24 +95,173 @@ static CAPTURE_ALIVE: AtomicBool = AtomicBool::new(false);
 static PACKETS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// TUN flow table for the UDP reverse path. Keyed by the phone-side source
-/// port (the host preserves ports on its NAT sockets). We remember the
-/// ORIGINAL destination so replies can be rebuilt claiming to come from
-/// exactly where the phone sent them - required for the virtual DNS IP,
-/// whose replies physically originate from a different resolver address.
-/// Entries live for the capture session (no LRU in Phase 1).
-#[derive(Clone, Copy)]
-struct UdpFlow {
-    local_ip: [u8; 4],
+/// TUN flow table for the UDP reverse path.
+///
+/// Keyed by the FULL tuple (phone source port + the destination the app
+/// addressed), *not* by source port alone. One UDP source port routinely fans
+/// out to many destinations: that is precisely what ICE/WebRTC does when it
+/// probes STUN, TURN and peer candidates in parallel from a single socket.
+/// Keying by port alone let each new destination overwrite the previous one,
+/// so every reply was rebuilt claiming to come from whichever candidate was
+/// contacted last. ICE requires a response to arrive from the address the
+/// request was sent to (RFC 8445 symmetry check), so every connectivity check
+/// was discarded and calls never established - while single-destination UDP
+/// (one media server, plain DNS) worked perfectly and hid the defect.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpFlowKey {
+    src_port: u16,
     dst_ip: [u8; 4],
     dst_port: u16,
 }
 
-type UdpFlows = HashMap<u16, UdpFlow>;
+#[derive(Clone, Copy)]
+struct UdpFlow {
+    local_ip: [u8; 4],
+    /// Last packet seen on this flow, for idle expiry.
+    last_seen: Instant,
+}
 
-fn udp_flows() -> &'static Mutex<UdpFlows> {
-    static S: OnceLock<Mutex<UdpFlows>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(HashMap::new()))
+/// Upper bound on tracked flows. A tuple-keyed table grows with ICE fan-out,
+/// so it must be swept and capped instead of living for the whole session.
+const MAX_UDP_FLOWS: usize = 2048;
+
+/// Idle lifetime of a flow entry, matched to the host's NAT idle timeout so
+/// both ends forget a flow at roughly the same time.
+const UDP_FLOW_IDLE_SECS: u64 = peernet_proto::UDP_NAT_IDLE_TIMEOUT_SECS;
+
+struct FlowTable {
+    flows: HashMap<UdpFlowKey, UdpFlow>,
+    /// Most recent destination per source port. Covers the two cases where a
+    /// reply cannot be matched on the exact tuple:
+    /// - the host rewrote the destination (virtual DNS -> real resolver), so
+    ///   the peer that answers is not the address the phone addressed;
+    /// - the stream fallback path, which carries no peer address at all.
+    last_by_port: HashMap<u16, UdpFlowKey>,
+}
+
+fn flow_table() -> &'static Mutex<FlowTable> {
+    static S: OnceLock<Mutex<FlowTable>> = OnceLock::new();
+    S.get_or_init(|| {
+        Mutex::new(FlowTable {
+            flows: HashMap::new(),
+            last_by_port: HashMap::new(),
+        })
+    })
+}
+
+/// Record an outbound UDP flow before the payload is relayed.
+fn note_udp_flow(src_port: u16, local_ip: [u8; 4], dst_ip: [u8; 4], dst_port: u16) {
+    let key = UdpFlowKey {
+        src_port,
+        dst_ip,
+        dst_port,
+    };
+    let now = Instant::now();
+    let mut table = flow_table().lock().unwrap_or_else(|p| p.into_inner());
+    let fresh = table
+        .flows
+        .insert(
+            key,
+            UdpFlow {
+                local_ip,
+                last_seen: now,
+            },
+        )
+        .is_none();
+    let previous = table.last_by_port.insert(src_port, key);
+    if fresh {
+        UDP_FLOWS_OPENED.fetch_add(1, Ordering::Relaxed);
+        // One source port reaching a second destination is the ICE fan-out
+        // signature. Counted so the on-screen stats can prove the shape of
+        // the traffic without logging any payload.
+        if matches!(previous, Some(prev) if prev != key) {
+            let n = UDP_FANOUT_PORTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 {
+                jni_log("[udp] source port fanning out to multiple destinations (ICE-style)");
+            }
+        }
+    }
+    if table.flows.len() > MAX_UDP_FLOWS {
+        sweep_udp_flows(&mut table, now);
+    }
+}
+/// Drop flows idle past `UDP_FLOW_IDLE_SECS`, then the oldest survivors if the
+/// table is still over cap.
+fn sweep_udp_flows(table: &mut FlowTable, now: Instant) {
+    let FlowTable {
+        flows,
+        last_by_port,
+    } = table;
+    let idle = Duration::from_secs(UDP_FLOW_IDLE_SECS);
+    let before = flows.len();
+    flows.retain(|_, f| now.duration_since(f.last_seen) < idle);
+    if flows.len() > MAX_UDP_FLOWS {
+        // Trim below the cap rather than to it: trimming exactly to the cap
+        // would re-sort the whole table on every subsequent packet once it is
+        // full, turning a bounded table into a per-packet cost on the phone.
+        let target = MAX_UDP_FLOWS * 3 / 4;
+        let mut aged: Vec<(UdpFlowKey, Instant)> =
+            flows.iter().map(|(k, f)| (*k, f.last_seen)).collect();
+        aged.sort_by_key(|(_, seen)| *seen);
+        let excess = flows.len().saturating_sub(target);
+        for (key, _) in aged.into_iter().take(excess) {
+            flows.remove(&key);
+        }
+    }
+    let removed = before.saturating_sub(flows.len());
+    if removed > 0 {
+        UDP_FLOWS_EXPIRED.fetch_add(removed as u64, Ordering::Relaxed);
+        // A remap pointing at an evicted flow would resurrect a dead address.
+        last_by_port.retain(|_, key| flows.contains_key(&*key));
+    }
+}
+
+/// Resolve the source address a reply must appear to come from, refreshing the
+/// flow's idle timer. Returns `(reply_src_ip, reply_src_port, phone_ip)`.
+///
+/// `peer` is the real remote that produced the data, as reported by the host.
+/// Matching the exact tuple first keeps per-destination identity intact, which
+/// is what ICE verifies. Only when no such flow exists do we fall back to the
+/// most recent destination on that port - that is how a host-rewritten
+/// destination (virtual DNS -> real resolver) is mapped back to the address the
+/// phone actually addressed.
+fn resolve_reply_source(
+    src_port: u16,
+    peer: Option<([u8; 4], u16)>,
+) -> Option<(Ipv4Addr, u16, Ipv4Addr)> {
+    let now = Instant::now();
+    let mut table = flow_table().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((ip, port)) = peer {
+        let key = UdpFlowKey {
+            src_port,
+            dst_ip: ip,
+            dst_port: port,
+        };
+        if let Some(flow) = table.flows.get_mut(&key) {
+            flow.last_seen = now;
+            let local = Ipv4Addr::from(flow.local_ip);
+            UDP_REPLY_EXACT.fetch_add(1, Ordering::Relaxed);
+            return Some((Ipv4Addr::from(ip), port, local));
+        }
+    }
+    let key = *table.last_by_port.get(&src_port)?;
+    let flow = table.flows.get_mut(&key)?;
+    flow.last_seen = now;
+    let local = Ipv4Addr::from(flow.local_ip);
+    UDP_REPLY_REMAPPED.fetch_add(1, Ordering::Relaxed);
+    Some((Ipv4Addr::from(key.dst_ip), key.dst_port, local))
+}
+
+fn clear_udp_flows() {
+    let mut table = flow_table().lock().unwrap_or_else(|p| p.into_inner());
+    table.flows.clear();
+    table.last_by_port.clear();
+}
+
+/// Open flows and distinct source ports, for the diagnostics line.
+fn udp_flow_gauges() -> (usize, usize) {
+    let table = flow_table().lock().unwrap_or_else(|p| p.into_inner());
+    (table.flows.len(), table.last_by_port.len())
 }
 
 /// Write-back channel: the reply pump produces fully formed IPv4/UDP
@@ -145,6 +294,26 @@ static INBOUND: AtomicU64 = AtomicU64::new(0);
 /// is healthy and the *local* delivery path is broken — the two failures look
 /// identical on screen otherwise.
 static UNDELIVERED: AtomicU64 = AtomicU64::new(0);
+
+/// UDP reverse-path shape, all aggregate and payload-free. These exist because
+/// "UDP works" and "UDP works only for single-destination flows" are
+/// indistinguishable from the older counters, and the difference is exactly
+/// what decides whether a WebRTC call can establish.
+///
+/// - `UDP_FLOWS_OPENED`  distinct (port, destination) pairs ever tracked
+/// - `UDP_FLOWS_EXPIRED` entries dropped by the idle sweep / cap
+/// - `UDP_FANOUT_PORTS`  times a port reached an additional destination
+///   (nonzero = ICE-style fan-out is present)
+/// - `UDP_REPLY_EXACT`   replies matched on the full tuple (correct source)
+/// - `UDP_REPLY_REMAPPED` replies matched only by port, so the source had to
+///   be remapped (expected for the virtual DNS, and for the stream fallback)
+/// - `UDP_REPLY_UNMATCHED` replies with no flow at all: silently lost before
+static UDP_FLOWS_OPENED: AtomicU64 = AtomicU64::new(0);
+static UDP_FLOWS_EXPIRED: AtomicU64 = AtomicU64::new(0);
+static UDP_FANOUT_PORTS: AtomicU64 = AtomicU64::new(0);
+static UDP_REPLY_EXACT: AtomicU64 = AtomicU64::new(0);
+static UDP_REPLY_REMAPPED: AtomicU64 = AtomicU64::new(0);
+static UDP_REPLY_UNMATCHED: AtomicU64 = AtomicU64::new(0);
 
 /// How long the engine's packet forwarder waits for a TUN write channel
 /// (50 ms per try) before giving up on a packet.
@@ -267,6 +436,12 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunCap
     TCP_TERMINATED.store(0, Ordering::Relaxed);
     INBOUND.store(0, Ordering::Relaxed);
     UNDELIVERED.store(0, Ordering::Relaxed);
+    UDP_FLOWS_OPENED.store(0, Ordering::Relaxed);
+    UDP_FLOWS_EXPIRED.store(0, Ordering::Relaxed);
+    UDP_FANOUT_PORTS.store(0, Ordering::Relaxed);
+    UDP_REPLY_EXACT.store(0, Ordering::Relaxed);
+    UDP_REPLY_REMAPPED.store(0, Ordering::Relaxed);
+    UDP_REPLY_UNMATCHED.store(0, Ordering::Relaxed);
 
     let owned = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
     let mtu = mtu.clamp(1200, 1500) as usize;
@@ -510,10 +685,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_stopTunnel<
     TUNNEL_STATE.store(0, Ordering::SeqCst);
     // Invalidate any handshake still in flight.
     ENGINE_GEN.fetch_add(1, Ordering::SeqCst);
-    udp_flows()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
+    clear_udp_flows();
     tcp_teardown();
     // Clone the handle out before touching the slot again; shutdown() is
     // synchronous so it is safe outside the lock.
@@ -559,10 +731,23 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_lastError<
     create_string(env, &msg)
 }
 
-/// NativeCore.engineStats() -> String, e.g. "tun=1420 udp=310 tcp=88 in=402".
+/// NativeCore.engineStats() -> String, e.g.
+/// "tun=1420 udp=310 tcp=88 in=402 lost=0 cap=up eng=up
+///  flows=12/5 fnew=31 fexp=4 fanout=6 rok=280 rmap=25 rmiss=0".
+///
 /// Proves which half of the data path is moving when a user reports
 /// "connected but nothing loads": `in=0` with the others rising means the
 /// host is reachable but is not relaying (typically the host has no internet).
+///
+/// The flow gauges describe the UDP reverse path, which is what decides
+/// whether real-time calls can establish:
+/// - `flows=open/ports` currently tracked (port,destination) pairs / ports
+/// - `fnew`/`fexp`      flows ever opened / swept
+/// - `fanout`           times one port reached an extra destination; nonzero
+///                      means ICE-style multiplexing is in play
+/// - `rok`/`rmap`       replies matched exactly / remapped via the port
+///                      fallback (expected for the virtual DNS)
+/// - `rmiss`            replies no flow could claim - these never reach the app
 #[no_mangle]
 pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats<
     'local,
@@ -570,8 +755,10 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
+    let (flows_open, ports_open) = udp_flow_gauges();
     let stats = format!(
-        "tun={} udp={} tcp={} in={} lost={} cap={} eng={}",
+        "tun={} udp={} tcp={} in={} lost={} cap={} eng={} \
+         flows={}/{} fnew={} fexp={} fanout={} rok={} rmap={} rmiss={}",
         PACKETS.load(Ordering::Relaxed),
         UDP_FORWARDED.load(Ordering::Relaxed),
         TCP_TERMINATED.load(Ordering::Relaxed),
@@ -583,6 +770,17 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
         // Distinguishes "no TCP engine to feed" from "the phone sent no SYN"
         // when tcp= stays 0.
         if tcp_pkt_in().is_some() { "up" } else { "down" },
+        // UDP reverse-path shape. `fanout>0` means at least one app is
+        // multiplexing destinations over a single port (WebRTC/ICE); `rmiss>0`
+        // means replies arrived that no flow could claim.
+        flows_open,
+        ports_open,
+        UDP_FLOWS_OPENED.load(Ordering::Relaxed),
+        UDP_FLOWS_EXPIRED.load(Ordering::Relaxed),
+        UDP_FANOUT_PORTS.load(Ordering::Relaxed),
+        UDP_REPLY_EXACT.load(Ordering::Relaxed),
+        UDP_REPLY_REMAPPED.load(Ordering::Relaxed),
+        UDP_REPLY_UNMATCHED.load(Ordering::Relaxed),
     );
     create_string(env, &stats)
 }
@@ -831,17 +1029,7 @@ fn forward_outbound(packet: &[u8]) {
     }
     let payload = &packet[l4 + 8..payload_end];
 
-    udp_flows()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            sport,
-            UdpFlow {
-                local_ip: src_ip.octets(),
-                dst_ip: dst_ip.octets(),
-                dst_port: dport,
-            },
-        );
+    note_udp_flow(sport, src_ip.octets(), dst_ip.octets(), dport);
 
     let client = current_client();
     if let Some(client) = client {
@@ -893,28 +1081,22 @@ pub fn send_udp_relay(
     }
 }
 
-/// Rebuilds a UDP reply for the phone's stack and writes it to the TUN, using
-/// the flow table so the packet appears to come from the address the app
-/// originally sent to (notably the virtual DNS IP).
+/// Rebuilds a UDP reply for the phone's stack and writes it to the TUN.
+///
+/// Used by the stream fallback, which relays only (src_port, payload) and so
+/// carries no peer address - the flow table's per-port fallback is the only
+/// information available here.
 fn deliver_udp_reply(src_port: u16, payload: &[u8]) {
-    let flow = udp_flows()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&src_port)
-        .copied();
-    let Some(flow) = flow else {
+    let Some((src_ip, reply_port, local_ip)) = resolve_reply_source(src_port, None) else {
         UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+        UDP_REPLY_UNMATCHED.fetch_add(1, Ordering::Relaxed);
         return;
     };
     let Some(tx) = tun_tx() else {
         UNDELIVERED.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    let packet = build_udp_packet(
-        (Ipv4Addr::from(flow.dst_ip), flow.dst_port),
-        (Ipv4Addr::from(flow.local_ip), src_port),
-        payload,
-    );
+    let packet = build_udp_packet((src_ip, reply_port), (local_ip, src_port), payload);
     if tx.send(packet).is_err() {
         UNDELIVERED.fetch_add(1, Ordering::Relaxed);
         return;
@@ -930,17 +1112,7 @@ pub fn install_reply_channel(tx: TunTx) {
 
 /// Test/advanced hooks for flow-table and generation introspection.
 pub fn register_flow(src_port: u16, local_ip: [u8; 4], dst_ip: [u8; 4], dst_port: u16) {
-    udp_flows()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            src_port,
-            UdpFlow {
-                local_ip,
-                dst_ip,
-                dst_port,
-            },
-        );
+    note_udp_flow(src_port, local_ip, dst_ip, dst_port);
 }
 
 pub fn engine_generation() -> u64 {
@@ -963,16 +1135,18 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        // hdr.dst_* is the real remote peer that produced this data, but
-        // the phone must see replies from its ORIGINAL destination (the
-        // flow table records it) - critical for the virtual DNS IP.
-        let local_src = udp_flows()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&hdr.src_port)
-            .copied();
-        let Some(flow) = local_src else {
+        // hdr.dst_* is the real remote peer that produced this data. Preserve
+        // it: rebuilding the reply from a port-keyed guess breaks any app that
+        // multiplexes destinations over one socket (ICE/WebRTC). The flow table
+        // only supplies the phone-side address, and remaps the source when the
+        // host rewrote the destination (virtual DNS).
+        let peer = match hdr.dst_ip {
+            IpAddr::V4(ip) => Some((ip.octets(), hdr.dst_port)),
+            IpAddr::V6(_) => None,
+        };
+        let Some((src_ip, reply_port, local_ip)) = resolve_reply_source(hdr.src_port, peer) else {
             UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+            UDP_REPLY_UNMATCHED.fetch_add(1, Ordering::Relaxed);
             continue;
         };
         let Some(tx) = tun_tx() else {
@@ -980,11 +1154,8 @@ pub async fn pump_udp_replies(client: std::sync::Arc<TunnelClient>, gen: u64) {
             continue;
         };
         let packet = build_udp_packet(
-            (
-                Ipv4Addr::from(flow.dst_ip),
-                flow.dst_port,
-            ),
-            (Ipv4Addr::from(flow.local_ip), hdr.src_port),
+            (src_ip, reply_port),
+            (local_ip, hdr.src_port),
             &datagram[off..],
         );
         if tx.send(packet).is_err() {
@@ -1489,5 +1660,165 @@ mod tests {
     fn checksum_matches_rfc1071_example() {
         let bytes = [0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
         assert_eq!(internet_checksum(&bytes), 0x220d);
+    }
+
+    /// Isolate the flow table between the pure-logic tests below; the table is
+    /// a process-global, like the counters.
+    fn reset_flows() {
+        clear_udp_flows();
+    }
+
+    /// The defect that broke WhatsApp calling: one source port fanning out to
+    /// several destinations (ICE/STUN connectivity checks). A reply from each
+    /// peer must be rebuilt with THAT peer as its source. Port-only keying
+    /// rebuilt every reply from whichever destination was contacted last, so
+    /// ICE's symmetry check (RFC 8445) dropped them all.
+    #[test]
+    fn multi_destination_replies_keep_their_own_source() {
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_flows();
+
+        let port = 50000u16;
+        let stun_a = ([203, 0, 113, 10], 3478u16);
+        let stun_b = ([198, 51, 100, 7], 19302u16);
+        let peer_c = ([192, 0, 2, 55], 55000u16);
+
+        let fanout_before = UDP_FANOUT_PORTS.load(Ordering::Relaxed);
+        // Same local port, three different destinations, sent in sequence -
+        // exactly what a single ICE socket does.
+        note_udp_flow(port, CLIENT_TUN_IP, stun_a.0, stun_a.1);
+        note_udp_flow(port, CLIENT_TUN_IP, stun_b.0, stun_b.1);
+        note_udp_flow(port, CLIENT_TUN_IP, peer_c.0, peer_c.1);
+
+        // Each peer answers. The reply must be attributed to the peer that
+        // actually sent it, regardless of arrival order.
+        for (ip, prt) in [peer_c, stun_a, stun_b] {
+            let (src_ip, src_port, local) =
+                resolve_reply_source(port, Some((ip, prt))).expect("flow must resolve");
+            assert_eq!(
+                src_ip,
+                Ipv4Addr::from(ip),
+                "reply source IP must be the peer that answered, not the last dest"
+            );
+            assert_eq!(src_port, prt, "reply source port must be the peer's port");
+            assert_eq!(local, Ipv4Addr::from(CLIENT_TUN_IP));
+        }
+
+        // Fan-out must have been observed twice (the 2nd and 3rd destinations).
+        assert_eq!(
+            UDP_FANOUT_PORTS.load(Ordering::Relaxed) - fanout_before,
+            2,
+            "each additional destination on a live port is one fan-out event"
+        );
+        reset_flows();
+    }
+
+    /// The virtual-DNS contract must survive tuple keying: the phone addresses
+    /// 10.215.17.1:53, the host answers from a real resolver, and the reply
+    /// (which carries the resolver as its peer, not the virtual IP) must still
+    /// be rebuilt as coming from 10.215.17.1:53. This is the per-port fallback.
+    #[test]
+    fn host_rewritten_destination_falls_back_to_original() {
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_flows();
+
+        let port = 41000u16;
+        let virtual_dns = [10, 215, 17, 1];
+        note_udp_flow(port, CLIENT_TUN_IP, virtual_dns, 53);
+
+        // The real resolver (say 1.1.1.1) is what actually answered - a peer
+        // the phone never addressed, so no exact tuple can match.
+        let (src_ip, src_port, local) =
+            resolve_reply_source(port, Some(([1, 1, 1, 1], 53))).expect("fallback must resolve");
+        assert_eq!(
+            src_ip,
+            Ipv4Addr::from(virtual_dns),
+            "DNS reply must appear from the virtual IP the phone queried"
+        );
+        assert_eq!(src_port, 53);
+        assert_eq!(local, Ipv4Addr::from(CLIENT_TUN_IP));
+        assert!(
+            UDP_REPLY_REMAPPED.load(Ordering::Relaxed) >= 1,
+            "a fallback match must be counted as a remap"
+        );
+        reset_flows();
+    }
+
+    /// The stream fallback path carries no peer address at all; it must still
+    /// deliver via the per-port fallback.
+    #[test]
+    fn reply_with_no_peer_uses_last_destination() {
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_flows();
+
+        let port = 42000u16;
+        let dest = [93, 184, 216, 34];
+        note_udp_flow(port, CLIENT_TUN_IP, dest, 443);
+
+        let (src_ip, src_port, _local) =
+            resolve_reply_source(port, None).expect("peerless reply must resolve");
+        assert_eq!(src_ip, Ipv4Addr::from(dest));
+        assert_eq!(src_port, 443);
+        reset_flows();
+    }
+
+    /// A reply for a flow that was never opened must be reported, not
+    /// silently attributed to some unrelated port.
+    #[test]
+    fn unmatched_reply_is_counted_and_dropped() {
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_flows();
+
+        let before = UDP_REPLY_UNMATCHED.load(Ordering::Relaxed);
+        assert!(resolve_reply_source(60000, Some(([8, 8, 8, 8], 53))).is_none());
+        assert!(resolve_reply_source(60000, None).is_none());
+        // resolve_reply_source itself does not count; the delivery sites do.
+        // Drive one delivery site to prove the miss is surfaced.
+        deliver_udp_reply(60000, b"orphan");
+        assert!(
+            UDP_REPLY_UNMATCHED.load(Ordering::Relaxed) > before,
+            "an orphan reply must increment the unmatched gauge"
+        );
+        reset_flows();
+    }
+
+    /// Idle flows must be swept so a tuple-keyed table cannot grow without
+    /// bound under sustained ICE fan-out.
+    #[test]
+    fn idle_flows_are_swept_under_pressure() {
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_flows();
+
+        // Guard the monotonic clock: on a freshly booted machine the
+        // subtraction can underflow, in which case the cap path still bounds
+        // the table and the assertion below holds either way.
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(UDP_FLOW_IDLE_SECS + 5))
+            .unwrap_or_else(Instant::now);
+        {
+            let mut table = flow_table().lock().unwrap_or_else(|p| p.into_inner());
+            for i in 0..(MAX_UDP_FLOWS + 100) {
+                let key = UdpFlowKey {
+                    src_port: (i % 65535) as u16,
+                    dst_ip: [10, 0, (i >> 8) as u8, (i & 0xff) as u8],
+                    dst_port: 443,
+                };
+                table.flows.insert(
+                    key,
+                    UdpFlow {
+                        local_ip: CLIENT_TUN_IP,
+                        last_seen: old,
+                    },
+                );
+            }
+        }
+        // A fresh packet triggers the sweep; every stale entry is idle.
+        note_udp_flow(12345, CLIENT_TUN_IP, [1, 2, 3, 4], 443);
+        let (open, _) = udp_flow_gauges();
+        assert!(
+            open <= MAX_UDP_FLOWS,
+            "table must be bounded after sweep, was {open}"
+        );
+        reset_flows();
     }
 }

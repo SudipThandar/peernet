@@ -242,6 +242,8 @@ async fn handle_connection(
                                     conn,
                                     stats,
                                     hdr.src_port,
+                                    udp_readers.clone(),
+                                    local_port,
                                 ));
                             }
                         }
@@ -469,11 +471,17 @@ async fn tcp_relay(
 /// relay datagrams. The header always echoes the CLIENT's original source
 /// port (spec 12.6): the client keys its TUN flow table on it, so reporting
 /// our local port would strand every reply whenever port preservation failed.
+///
+/// `peer` is echoed as the datagram's dst_*, so the client can attribute each
+/// reply to the remote that actually sent it. That is what lets one client
+/// source port talk to several peers at once (ICE/WebRTC).
 async fn pump_udp_replies(
     socket: Arc<tokio::net::UdpSocket>,
     conn: Connection,
     stats: Arc<TunnelStats>,
     client_src_port: u16,
+    udp_readers: Arc<Mutex<HashMap<u16, ()>>>,
+    local_port: u16,
 ) {
     let mut buf = vec![0u8; 65536];
     loop {
@@ -494,4 +502,13 @@ async fn pump_udp_replies(
             break;
         }
     }
+    // The registration must not outlive the pump. get_or_create preserves the
+    // client's source port, so once the NAT sweeps an idle mapping the same
+    // local port comes back - and a stale entry would make the next flow skip
+    // spawning a pump, leaving that flow's UDP one-way with no symptom but
+    // silence.
+    udp_readers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&local_port);
 }
