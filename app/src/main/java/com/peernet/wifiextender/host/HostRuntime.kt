@@ -14,6 +14,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import android.os.Build
+import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -61,6 +62,83 @@ class HostRuntime @Inject constructor(
     /** Latches HOST_READY so it is reported on the edge, not on every emission. */
     @Volatile
     private var reportedReady = false
+
+    /** Monotonic sharing-session id, stamped on host diagnostics. */
+    private val sessions = java.util.concurrent.atomic.AtomicInteger(0)
+
+    @Volatile
+    private var sessionId = 0
+
+    /**
+     * Keeps the Wi-Fi radio out of power save while sharing.
+     *
+     * This is NOT a `PowerManager` wake lock: it does not keep the CPU or the
+     * screen awake, and the phone still sleeps normally. It tells the Wi-Fi
+     * driver not to park the radio, which is what stopped the client's internet
+     * when the host's screen turned off. A Wi-Fi Direct group owner is an access
+     * point plus a router; with the screen off the driver enters power save,
+     * stops servicing the group promptly, and both the QUIC tunnel and the
+     * plain TCP probes to :4434 start timing out. Nothing in the app stops when
+     * the screen turns off - the foreground service, the responder thread, the
+     * Rust engine and the P2P group all keep running - so the radio is the
+     * remaining mechanism.
+     *
+     * `WIFI_MODE_FULL_LOW_LATENCY` (API 29+) also disables power save; the older
+     * `WIFI_MODE_FULL_HIGH_PERF` is the equivalent below that.
+     */
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        val wm = context.getSystemService(Context.WIFI_SERVICE)
+            as? android.net.wifi.WifiManager ?: return
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            @Suppress("DEPRECATION")
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        try {
+            wifiLock = wm.createWifiLock(mode, "peernet-host").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Diagnostics.note("host", "WIFI_LOCK_ACQUIRED mode=$mode (radio stays out of power save)")
+        } catch (t: Throwable) {
+            // Never fail a share over this; it degrades screen-off behaviour
+            // only, and the report must say so rather than looking healthy.
+            Timber.w(t, "wifi lock unavailable")
+            Diagnostics.note(
+                "host",
+                "WIFI_LOCK_FAILED (${t.javaClass.simpleName}) — internet may pause when the screen sleeps"
+            )
+        }
+    }
+
+    private fun releaseWifiLock() {
+        val lock = wifiLock ?: return
+        runCatching { if (lock.isHeld) lock.release() }
+        wifiLock = null
+        Diagnostics.note("host", "WIFI_LOCK_RELEASED")
+    }
+
+    /**
+     * Reports what is still alive, so a screen-off failure can be attributed.
+     * Called from the screen-state receiver in [HostForegroundService].
+     */
+    fun reportAliveness(trigger: String) {
+        if (!sharingActive) return
+        val s = wifiDirect.state.value
+        Diagnostics.note(
+            "host",
+            "LINKSERVER_ALIVE ($trigger) id=$sessionId listening=${linkServer.listening} " +
+                "probes=${linkServer.probesAnswered} group=${s.hosting} ssid=${s.ssid ?: "?"} " +
+                "engine=$engineReady wifiLock=${wifiLock?.isHeld == true}"
+        )
+        linkServer.failure?.let {
+            Diagnostics.note("host", "LINKSERVER_STOPPED reason=$it ($trigger)")
+        }
+    }
 
     init {
         scope.launch {
@@ -162,11 +240,22 @@ class HostRuntime @Inject constructor(
         val shortId = HostIdentity.shortId(context)
 
         if (sharingActive) {
-            // A second SHARE tap (or a re-entrant call from the service) must
-            // not re-run any of this: it would remove and recreate the group,
-            // dropping every connected client for no reason.
-            Diagnostics.note("host", "SHARE_ALREADY_ACTIVE (ignored)")
-            return
+            // Distinguish a genuinely live share from a stale latch. If nothing
+            // is actually hosting, this flag is left over from a session that
+            // ended without stopSharing() - the group died on its own, or the
+            // foreground service stopped itself - and honouring it made SHARE
+            // permanently dead until the process restarted. That is precisely
+            // the "I had to clear app data" symptom.
+            val s = wifiDirect.state.value
+            if (s.hosting || s.creating) {
+                Diagnostics.note("host", "SHARE_ALREADY_ACTIVE (ignored, group is live)")
+                return
+            }
+            Diagnostics.note(
+                "host",
+                "SHARE_STALE_STATE_RECOVERED (sharingActive with no group) - restarting cleanly"
+            )
+            resetSessionState()
         }
         Diagnostics.note("host", "SHARE_START_REQUESTED id=$shortId")
 
@@ -183,6 +272,9 @@ class HostRuntime @Inject constructor(
 
         sharingActive = true
         reportedReady = false
+        val sid = sessions.incrementAndGet()
+        sessionId = sid
+        Diagnostics.note("host", "SHARE_SESSION_CREATED id=$sid")
 
         // Brand the Wi-Fi Direct identity so clients see "PeerNet-xxxx",
         // not the owner's personal device name. Reflection-based; no-op where
@@ -201,6 +293,11 @@ class HostRuntime @Inject constructor(
         // Keep mDNS queries from clients reachable: Wi-Fi power save drops
         // multicast frames on P2P groups otherwise.
         wifiDirect.acquireMulticast()
+
+        // Keep the radio itself out of power save, or the group stops being
+        // serviced when this phone's screen turns off and every client loses
+        // internet while the app still looks healthy.
+        acquireWifiLock()
 
         // PNTP QUIC engine (M7): owns the tunnel port; its certificate
         // fingerprint is advertised so clients can pin it. The resolver we
@@ -230,7 +327,7 @@ class HostRuntime @Inject constructor(
     }
 
     fun stopSharing() {
-        Diagnostics.note("host", "SHARE_STOP_REQUESTED")
+        Diagnostics.note("host", "SHARE_STOP_REQUESTED id=$sessionId")
         // Intent cleared first so nothing the teardown triggers (state
         // emissions, group-removal callbacks) can restart the responder or the
         // advertisement behind us.
@@ -240,13 +337,35 @@ class HostRuntime @Inject constructor(
         withdrawAdvert()
         wifiDirect.stopHosting()
         wifiDirect.releaseMulticast()
+        releaseWifiLock()
         rustCore.stopHost()
         engineFingerprint = null
+        engineError = null
         context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java))
         Diagnostics.note(
             "host",
-            "SHARE_STOP_COMPLETED link=${linkServer.listening} advert=${advertisedFingerprint != null}"
+            "SHARE_STOP_COMPLETED id=$sessionId link=${linkServer.listening} " +
+                "advert=${advertisedFingerprint != null}"
         )
+    }
+
+    /**
+     * Clears everything that belongs to one sharing session, leaving persistent
+     * device identity (host id, saved credentials) untouched.
+     *
+     * Reached when a share ended without [stopSharing] - the group was dropped
+     * by the platform, or the service stopped itself - so the next SHARE starts
+     * from a known state instead of requiring the app's data to be cleared.
+     */
+    private fun resetSessionState() {
+        sharingActive = false
+        reportedReady = false
+        stopResponder()
+        withdrawAdvert()
+        releaseWifiLock()
+        runCatching { rustCore.stopHost() }
+        engineFingerprint = null
+        engineError = null
     }
 
     /**

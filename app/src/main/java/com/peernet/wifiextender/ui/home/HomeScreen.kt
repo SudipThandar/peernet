@@ -164,12 +164,13 @@ fun HomeScreen(
     }
 
     LaunchedEffect(client.connectedHost?.hostId) {
-        if (client.connectedHost == null) {
-            // Covers host-initiated teardown, not just manual disconnect:
-            // a dead link must never keep the TUN up.
-            stopVpn()
-            return@LaunchedEffect
-        }
+        // Starting the tunnel needs an Activity (VPN consent is a dialog), so
+        // the UI still triggers it. Stopping it must NOT live here: this effect
+        // and `collectAsStateWithLifecycle` both stop when the Activity stops,
+        // so with the screen off nothing observed the link clearing and the TUN,
+        // the tunnel and the Android VPN key all outlived the session.
+        // `PeerNetVpnService` now watches `ClientLinkManager.linkedHost` itself.
+        if (client.connectedHost == null) return@LaunchedEffect
         val prepare = android.net.VpnService.prepare(context)
         if (prepare != null) {
             vpnLauncher.launch(prepare)

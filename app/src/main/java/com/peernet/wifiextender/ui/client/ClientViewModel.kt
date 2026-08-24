@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.peernet.wifiextender.client.ClientLinkManager
+import com.peernet.wifiextender.client.LinkPolicy
 import com.peernet.wifiextender.diag.Diagnostics
 import com.peernet.wifiextender.discovery.DiscoveredHost
 import com.peernet.wifiextender.discovery.NsdClientDiscovery
@@ -24,6 +25,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
@@ -155,9 +157,17 @@ class ClientViewModel @Inject constructor(
                     noteNetworkChange(networks, ssid)
                     val candidate = gatewayCandidate()
                     if (candidate == null) {
-                        // Not on a usable IPv4 network yet. Say so, with what we
-                        // actually saw, instead of retrying invisibly forever.
+                        // Not on a usable IPv4 network yet, or on plain Wi-Fi
+                        // with nothing to suggest a PeerNet host is there. Say
+                        // so instead of retrying invisibly forever.
                         pollMisses++
+                        if (pollMisses == MISS_BACKOFF_AFTER) {
+                            Diagnostics.note(
+                                "client",
+                                "AUTOCONNECT_RETRY s=$session backing off to ${LEGACY_POLL_IDLE_MS}ms " +
+                                    "after $pollMisses empty rounds"
+                            )
+                        }
                         reportLinkDiagnostic(
                             "Not on the host's network yet (try $linkAttempts). " +
                                 "Join the DIRECT-… Wi-Fi in settings. Seen: $networks"
@@ -333,7 +343,7 @@ class ClientViewModel @Inject constructor(
 
                 if (joined) {
                     _uiState.update { it.copy(status = "PeerNet network joined — establishing link…") }
-                    val target = findVerifiedHost(rounds = AUTO_ROUNDS)
+                    val target = findVerifiedHost(rounds = AUTO_ROUNDS, userInitiated = true)
                     if (target != null) {
                         _uiState.update { it.copy(searching = false) }
                         link(target, viaP2p = true)
@@ -341,7 +351,7 @@ class ClientViewModel @Inject constructor(
                     }
                 }
 
-                val fallback = findVerifiedHost(rounds = MANUAL_ROUNDS)
+                val fallback = findVerifiedHost(rounds = MANUAL_ROUNDS, userInitiated = true)
                 if (fallback != null) {
                     _uiState.update { it.copy(searching = false) }
                     link(fallback, viaP2p = joined)
@@ -438,8 +448,8 @@ class ClientViewModel @Inject constructor(
      * mDNS is blocked, slow, or answering on the wrong interface (the most
      * common cause of "no PeerNet network found" while actually connected).
      */
-    private suspend fun findVerifiedHost(rounds: Int): DiscoveredHost? {
-        gatewayCandidate()?.let { candidate ->
+    private suspend fun findVerifiedHost(rounds: Int, userInitiated: Boolean = false): DiscoveredHost? {
+        gatewayCandidate(userInitiated)?.let { candidate ->
             probeDetails(candidate)?.let { verified ->
                 Timber.i("Host found via link gateway %s", candidate.address)
                 return verified
@@ -455,7 +465,7 @@ class ClientViewModel @Inject constructor(
             if (attempt < rounds - 1) {
                 // A late-forming group can hand out its gateway between
                 // rounds; keep retrying the cheap path too.
-                gatewayCandidate()?.let { candidate ->
+                gatewayCandidate(userInitiated)?.let { candidate ->
                     probeDetails(candidate)?.let { return it }
                 }
                 delay(ROUND_GAP_MS)
@@ -468,12 +478,21 @@ class ClientViewModel @Inject constructor(
      * The Wi-Fi Direct group owner (= the host) derived from routing state:
      * the default gateway of the P2P/Wi-Fi link, typically 192.168.49.1.
      * Needs no callbacks, no mDNS and no permissions.
+     *
+     * Candidates are ranked and filtered by [LinkPolicy]. Build #106 took the
+     * first gateway it found, so a phone on an ordinary router probed
+     * `192.168.31.1:4434` every few seconds forever — a retry storm against the
+     * user's own router that also risked treating it as a host. Plain Wi-Fi is
+     * now only probed with corroborating evidence (a remembered host at that
+     * address, or an explicit CONNECT tap).
      */
     @SuppressLint("MissingPermission")
-    private fun gatewayCandidate(): DiscoveredHost? {
+    private fun gatewayCandidate(userInitiated: Boolean = false): DiscoveredHost? {
         val cm = appContext
             .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        val gateways = buildList {
+        val known = savedHostAddresses()
+        val ssid = currentSsid()
+        val candidates = buildList {
             for (network in runCatching { cm.allNetworks.toList() }.getOrDefault(emptyList())) {
                 val lp = runCatching { cm.getLinkProperties(network) }.getOrNull() ?: continue
                 val iface = lp.interfaceName.orEmpty()
@@ -481,9 +500,13 @@ class ClientViewModel @Inject constructor(
                 val isWifiLike = iface.startsWith("p2p", ignoreCase = true) ||
                     caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
                 if (!isWifiLike) continue
+                // Never treat our own tunnel as a route to the host.
+                if (caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true) continue
                 for (route in lp.routes) {
                     val gw = route.gateway ?: continue
-                    if (gw is java.net.Inet4Address && !gw.isAnyLocalAddress) add(gw.hostAddress)
+                    if (gw is java.net.Inet4Address && !gw.isAnyLocalAddress) {
+                        add(LinkPolicy.GatewayCandidate(gw.hostAddress ?: continue, iface, ssid, known))
+                    }
                 }
                 // A /24 P2P group has no default route entry on some OEM
                 // builds; the group owner still owns .1 of our own subnet.
@@ -491,24 +514,63 @@ class ClientViewModel @Inject constructor(
                     val ip = addr.address
                     if (ip is java.net.Inet4Address && addr.prefixLength >= 24) {
                         val o = ip.address
-                        add("${o[0].toInt() and 0xFF}.${o[1].toInt() and 0xFF}.${o[2].toInt() and 0xFF}.1")
+                        val guess = "${o[0].toInt() and 0xFF}.${o[1].toInt() and 0xFF}." +
+                            "${o[2].toInt() and 0xFF}.1"
+                        add(LinkPolicy.GatewayCandidate(guess, iface, ssid, known))
                     }
                 }
             }
-        }.filterNotNull().distinct()
+        }.distinctBy { it.address }
 
-        val gateway = gateways.firstOrNull() ?: return null
+        val ranked = LinkPolicy.rankGateways(candidates, userInitiated)
+        val best = ranked.firstOrNull()
+        if (best == null) {
+            if (candidates.isNotEmpty()) {
+                Diagnostics.note(
+                    "client",
+                    "AUTOCONNECT_IDLE s=$session no PeerNet evidence on " +
+                        candidates.joinToString(", ") { "${it.address}@${it.interfaceName}" }
+                )
+            }
+            return null
+        }
+        Diagnostics.note(
+            "client",
+            "P2P_NETWORK_SELECTED s=$session ${best.address}@${best.interfaceName} " +
+                "ssid=${ssid ?: "?"} direct=${LinkPolicy.isWifiDirectAddress(best.address)}"
+        )
         return DiscoveredHost(
             name = "PeerNet host",
             port = com.peernet.wifiextender.wifi.LinkServer.PORT,
-            address = gateway,
+            address = best.address,
             hostId = null
         )
     }
 
+    /** Addresses of hosts this phone has linked to before. */
+    private fun savedHostAddresses(): Set<String> {
+        val arr = JSONArray(prefs.getString(KEY_PROFILES, "[]") ?: "[]")
+        return buildSet {
+            for (i in 0 until arr.length()) {
+                arr.getJSONObject(i).optString("address").takeIf { it.isNotBlank() }?.let { add(it) }
+            }
+        }
+    }
+
+    /** Current Wi-Fi SSID, or null when unreadable (permission/OEM masking). */
+    private fun currentSsid(): String? = runCatching {
+        @Suppress("DEPRECATION")
+        @android.annotation.SuppressLint("MissingPermission")
+        val wm = appContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+        @Suppress("DEPRECATION")
+        wm.connectionInfo?.ssid?.removeSurrounding("\"")?.takeIf {
+            it.isNotBlank() && !it.contains("unknown", ignoreCase = true)
+        }
+    }.getOrNull()
+
     private fun link(host: DiscoveredHost, viaP2p: Boolean) {
         saveProfile(host)
-        linkManager.setLinked(host, currentWifiNetwork())
+        val gen = linkManager.setLinked(host, currentWifiNetwork())
         val pinMissing = host.fingerprint.isNullOrBlank()
         Diagnostics.note(
             "link",
@@ -516,8 +578,9 @@ class ClientViewModel @Inject constructor(
         )
         Diagnostics.note(
             "client",
-            "LINK_SUCCESS s=$session ${host.address}:${host.tunnelPort} " +
-                "p2p=$viaP2p pin=${if (pinMissing) "MISSING" else "yes"}"
+            "LINK_SUCCESS s=$session gen=$gen ${host.address}:${host.tunnelPort} " +
+                "p2p=$viaP2p direct=${LinkPolicy.isWifiDirectAddress(host.address)} " +
+                "pin=${if (pinMissing) "MISSING" else "yes"}"
         )
         _uiState.update {
             it.copy(
@@ -533,7 +596,7 @@ class ClientViewModel @Inject constructor(
                 }
             )
         }
-        startLiveness(host)
+        startLiveness(host, gen)
     }
 
     /** Live network for VPN socket pinning (null = let the system choose). */
@@ -568,29 +631,118 @@ class ClientViewModel @Inject constructor(
      * instead of showing a stale "Connected". P2P-backed links are owned by
      * the group-teardown watcher above and are left alone here.
      */
-    private fun startLiveness(host: DiscoveredHost) {
+    private fun startLiveness(host: DiscoveredHost, gen: Int) {
         livenessJob?.cancel()
         livenessJob = viewModelScope.launch(Dispatchers.Default) {
             var misses = 0
             while (isActive) {
                 delay(LIVENESS_INTERVAL_MS)
-                misses = if (probe(host)) 0 else misses + 1
-                val p2pBacked = wifiDirect.state.value.joinedAsClient
-                if (misses >= LIVENESS_MISSES && !p2pBacked && !tunnelDelivering()) {
-                    Diagnostics.note(
-                        "liveness",
-                        "dropping link after $misses missed probes " +
-                            "(${lastProbeFailure ?: "no reason recorded"})"
-                    )
-                    Diagnostics.note(
-                        "client",
-                        "HOST_LOST s=$session $misses missed probes, tunnel idle"
-                    )
-                    clearLink("Host disconnected.")
+                // Session guard: a job from a previous link must never judge
+                // (or tear down) the session that replaced it.
+                if (!linkManager.isCurrent(gen)) {
+                    Diagnostics.note("liveness", "probe abandoned: session $gen superseded")
                     break
                 }
+
+                val net = probeNetwork()
+                Diagnostics.note(
+                    "client",
+                    "LIVENESS_PROBE s=$session gen=$gen network=${net ?: "default"} " +
+                        "interface=${networkLabel(net)} dst=${host.address}:${host.port}"
+                )
+                val alive = probe(host)
+                if (!linkManager.isCurrent(gen)) break
+
+                if (alive) {
+                    misses = 0
+                    Diagnostics.note("client", "LIVENESS_PROBE_SUCCESS s=$session gen=$gen")
+                    continue
+                }
+                misses++
+                val p2p = wifiDirect.state.value.joinedAsClient
+                val hostIsDirect = LinkPolicy.isWifiDirectAddress(host.address)
+                val connected = tunnelState() == TUNNEL_CONNECTED
+                val delivering = tunnelDelivering()
+                val routed = hostNetworkPresent(host.address)
+                Diagnostics.note(
+                    "client",
+                    "LIVENESS_PROBE_TIMEOUT s=$session gen=$gen miss=$misses " +
+                        "dst=${host.address} interface=${networkLabel(net)} " +
+                        "p2p=$p2p directHost=$hostIsDirect quic=${tunnelState()} " +
+                        "tun=${linkManager.tunnelActive.value} routed=$routed " +
+                        "(${lastProbeFailure ?: "no reason recorded"})"
+                )
+
+                if (!LinkPolicy.shouldDropLink(
+                        consecutiveMisses = misses,
+                        missThreshold = LIVENESS_MISSES,
+                        tunnelConnected = connected,
+                        tunnelDelivering = delivering,
+                        joinedAsClient = p2p,
+                        hostIsWifiDirect = hostIsDirect,
+                        hostNetworkPresent = routed
+                    )
+                ) {
+                    LinkPolicy.keepReason(connected, delivering, p2p, hostIsDirect)?.let {
+                        Diagnostics.note("liveness", "keeping link despite $misses misses: $it")
+                    }
+                    continue
+                }
+
+                Diagnostics.note(
+                    "liveness",
+                    "dropping link after $misses missed probes " +
+                        "(${lastProbeFailure ?: "no reason recorded"})"
+                )
+                Diagnostics.note(
+                    "client",
+                    "HOST_LOST s=$session gen=$gen $misses missed probes, " +
+                        if (!routed) {
+                            "host network gone (group ended)"
+                        } else {
+                            "no tunnel, quic=${tunnelState()}"
+                        }
+                )
+                clearLink(
+                    if (!routed) "Host stopped sharing." else "Host disconnected."
+                )
+                break
             }
         }
+    }
+
+    /**
+     * Whether this phone still holds an address on the host's /24.
+     *
+     * This is the signal that a share genuinely ended: when the host taps STOP
+     * the group disappears, the client's Wi-Fi drops it, and the route into
+     * 192.168.49.x goes with it. Unlike a probe timeout it cannot be produced by
+     * a sleeping radio, so it is safe to act on immediately — and it is what
+     * makes the link (and therefore the VPN) clear on a real STOP even though
+     * probe failures alone no longer tear anything down.
+     *
+     * The tunnel's own interface is excluded: its 10.215.17.x address must never
+     * be mistaken for evidence that the host is reachable.
+     */
+    @SuppressLint("MissingPermission")
+    private fun hostNetworkPresent(hostAddress: String?): Boolean {
+        val subnet = hostAddress?.substringBeforeLast('.', "")?.takeIf { it.isNotBlank() }
+            ?: return true // Unknown address: do not invent a loss.
+        return runCatching {
+            val cm = appContext
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            cm.allNetworks.any { network ->
+                val caps = cm.getNetworkCapabilities(network)
+                if (caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true) {
+                    return@any false
+                }
+                val lp = cm.getLinkProperties(network) ?: return@any false
+                lp.linkAddresses.any { la ->
+                    la.address is java.net.Inet4Address &&
+                        la.address.hostAddress?.startsWith("$subnet.") == true
+                }
+            }
+        }.getOrDefault(true) // Never drop a link because the query failed.
     }
 
     /**
@@ -611,17 +763,50 @@ class ClientViewModel @Inject constructor(
         return progressed
     }
 
+    /**
+     * Ends the session: cancels liveness, clears the link (which is what
+     * `PeerNetVpnService` watches to tear the tunnel down) and reports
+     * completion only once the VPN has actually gone away.
+     *
+     * Build #106 logged `CLIENT_CLEANUP_COMPLETED` here immediately, while
+     * `tun0` and the Android VPN key were still up — the report claimed a
+     * cleanup that had not happened. Safe to call repeatedly.
+     */
     private fun clearLink(message: String) {
+        val had = _uiState.value.connectedHost != null
         Diagnostics.note("link", "cleared: $message")
         livenessJob?.cancel()
         livenessJob = null
+        // Invalidates the generation, so every in-flight probe, retry and VPN
+        // bring-up belonging to this session abandons itself.
         linkManager.setLinked(null)
         _uiState.update { it.copy(connectedHost = null, status = message) }
         // Re-arm auto-connect: the next poll should probe immediately rather
         // than inherit the backoff from whatever ended the previous session.
         pollMisses = 0
         lastNetworkFingerprint = null
-        Diagnostics.note("client", "CLIENT_CLEANUP_COMPLETED s=$session ($message)")
+        lastInboundSeen = 0L
+        Diagnostics.note("client", "AUTOCONNECT_RESET s=$session ($message)")
+
+        if (!had) return
+        viewModelScope.launch {
+            // The service tears down asynchronously; wait for its own report
+            // rather than assuming. Bounded so a wedged service cannot hide the
+            // fact that cleanup did not finish.
+            val stopped = withTimeoutOrNull(CLEANUP_WAIT_MS) {
+                linkManager.tunnelActive.first { !it }
+                true
+            } != null
+            Diagnostics.note(
+                "client",
+                if (stopped) {
+                    "CLIENT_CLEANUP_COMPLETED s=$session ($message) tun=closed"
+                } else {
+                    "CLIENT_CLEANUP_INCOMPLETE s=$session ($message) " +
+                        "VPN still active after ${CLEANUP_WAIT_MS}ms"
+                }
+            )
+        }
     }
 
     /** Drops the link and leaves any joined Wi-Fi Direct group. */
@@ -801,5 +986,15 @@ class ClientViewModel @Inject constructor(
          */
         private const val LEGACY_POLL_IDLE_MS = 15_000L
         private const val MISS_BACKOFF_AFTER = 5
+
+        /** `RustCoreBridge.tunnelState()` value meaning the QUIC tunnel is up. */
+        private const val TUNNEL_CONNECTED = 2
+
+        /**
+         * How long cleanup waits for the VPN service to confirm the TUN is
+         * closed. Bounded so a wedged service is reported rather than hiding
+         * behind a cleanup message that never arrives.
+         */
+        private const val CLEANUP_WAIT_MS = 5_000L
     }
 }

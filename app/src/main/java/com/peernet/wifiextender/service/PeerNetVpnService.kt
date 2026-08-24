@@ -13,6 +13,11 @@ import com.peernet.wifiextender.R
 import com.peernet.wifiextender.core.RustCoreBridge
 import com.peernet.wifiextender.diag.Diagnostics
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
 
@@ -38,11 +43,46 @@ class PeerNetVpnService : VpnService() {
 
     @Volatile private var bringUp: Thread? = null
 
+    /**
+     * The link generation this tunnel belongs to. A bring-up thread from an
+     * earlier session must not install a TUN for a host the client has already
+     * abandoned.
+     */
+    @Volatile private var generation: Int = -1
+
+    /** Guards [teardown] so repeated calls are safe and do the work once. */
+    private val tornDown = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     override fun onBind(intent: Intent?) = super.onBind(intent)
 
     override fun onCreate() {
         super.onCreate()
         startAsForeground()
+        watchLink()
+    }
+
+    /**
+     * Ends the tunnel as soon as the client link is gone.
+     *
+     * This used to live in a Compose `LaunchedEffect` reading
+     * `collectAsStateWithLifecycle()`, which stops collecting when the Activity
+     * stops — so with the screen off or the app backgrounded nothing observed
+     * the link clearing and the TUN, the tunnel and the Android VPN key all
+     * outlived the session. The service now owns its own death: no UI required.
+     */
+    private fun watchLink() {
+        scope.launch {
+            // Ignore the replayed initial value: the link is published before
+            // this service is started, so the first emission is our own host.
+            linkManager.linkedHost.collect { host ->
+                if (host == null && tunFd != -1) {
+                    Diagnostics.note("vpn", "VPN_STOP_REQUESTED reason=link cleared")
+                    stopTunnel("link cleared")
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -52,7 +92,8 @@ class PeerNetVpnService : VpnService() {
         )
         when (intent?.action) {
             ACTION_STOP -> {
-                stopTunnel()
+                Diagnostics.note("vpn", "VPN_STOP_REQUESTED reason=explicit stop")
+                stopTunnel("explicit stop")
                 return START_NOT_STICKY
             }
         }
@@ -62,6 +103,16 @@ class PeerNetVpnService : VpnService() {
         intent?.getStringExtra(EXTRA_HOST_ADDR)?.let { hostAddr = it }
         intent?.getStringExtra(EXTRA_HOST_FP)?.let { hostFp = it }
         readUnderlyingNetwork(intent)?.let { underlying = it }
+
+        // A start with no live link can only install a TUN that swallows
+        // traffic. Happens on the START_STICKY restart path after a process
+        // kill, where the intent is null and the session is long gone.
+        if (linkManager.linkedHost.value == null) {
+            fail("No host link — reconnect once the host is sharing.")
+            return START_NOT_STICKY
+        }
+        generation = linkManager.generation
+        tornDown.set(false)
 
         if (tunFd != -1) {
             // Already capturing; just refresh socket pinning in case the
@@ -132,6 +183,15 @@ class PeerNetVpnService : VpnService() {
             return
         }
 
+        // The link may have been cleared (host stopped sharing, user
+        // disconnected, network changed) during the handshake. Installing a
+        // default-route TUN for a dead session takes the phone offline.
+        if (!linkManager.isCurrent(generation) || linkManager.linkedHost.value == null) {
+            Diagnostics.note("vpn", "bring-up abandoned: link gen=$generation is stale")
+            teardown("stale session")
+            return
+        }
+
         val fd = establishTun()
         if (fd < 0) {
             fail(
@@ -157,6 +217,7 @@ class PeerNetVpnService : VpnService() {
 
         pinSocketsToUnderlying()
         linkManager.setTunnelStatus("Tunnel active")
+        linkManager.setTunnelActive(true)
         Diagnostics.note("vpn", "TUN capture started (fd=$fd mtu=$MTU)")
         Timber.i("TUN capture started (fd=%d mtu=%d)", fd, MTU)
     }
@@ -166,10 +227,37 @@ class PeerNetVpnService : VpnService() {
         Diagnostics.note("vpn", "bring-up failed: $reason")
         Timber.w("VPN bring-up failed: %s", reason)
         linkManager.setTunnelStatus(reason)
+        teardown("bring-up failed")
+    }
+
+    /**
+     * Releases everything this service owns, exactly once, in the order the
+     * resources depend on each other:
+     *
+     *   stop QUIC -> stop capture (closes the TUN fd in Rust) -> unbind the
+     *   process -> drop the notification -> stop the service.
+     *
+     * Idempotent: [tornDown] makes repeated calls (link cleared *and* explicit
+     * stop *and* onDestroy, which routinely overlap) safe.
+     *
+     * Note the TUN fd is not closed here. Rust took ownership of it in
+     * `startTunCapture`, and `stopTunCapture` closes it (and its two dups)
+     * exactly once — closing it here as well would be a double close.
+     */
+    private fun teardown(reason: String) {
+        if (!tornDown.compareAndSet(false, true)) return
+        val hadTun = tunFd != -1
+        bringUp?.interrupt()
+        bringUp = null
         runCatching { rustCore.stopTunnel() }
+        runCatching { rustCore.stopTunCapture() }
+        tunFd = -1
+        if (hadTun) Diagnostics.note("vpn", "TUN_CLOSED ($reason)")
+        linkManager.setTunnelActive(false)
         unbindProcessFromLink()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        Diagnostics.note("vpn", "VPN_SERVICE_STOPPED ($reason)")
     }
 
     @Volatile private var underlying: android.net.Network? = null
@@ -251,33 +339,30 @@ class PeerNetVpnService : VpnService() {
         }
     }
 
-    private fun stopTunnel() {
-        Diagnostics.note("vpn", "stopTunnel (tunnel torn down)")
-        bringUp?.interrupt()
-        bringUp = null
-        rustCore.stopTunnel()
-        rustCore.stopTunCapture()
-        tunFd = -1
-        unbindProcessFromLink()
+    private fun stopTunnel(reason: String) {
+        Diagnostics.note("vpn", "stopTunnel ($reason)")
         linkManager.setTunnelStatus("")
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        teardown(reason)
     }
 
     override fun onRevoke() {
-        // User revoked VPN permission from system settings.
-        Diagnostics.note("vpn", "permission revoked by the user or another VPN app")
+        // User revoked VPN permission from system settings, or another VPN app
+        // took over. The link is dead either way, so clear it too - otherwise
+        // the client keeps reporting "Connected" with no tunnel underneath.
+        Diagnostics.note("vpn", "VPN_STOP_REQUESTED reason=permission revoked")
         Timber.i("VPN permission revoked by user")
-        stopTunnel()
+        linkManager.setLinked(null)
+        stopTunnel("permission revoked")
         super.onRevoke()
     }
 
     override fun onDestroy() {
         Diagnostics.note("vpn", "service destroyed")
-        rustCore.stopTunnel()
-        rustCore.stopTunCapture()
-        tunFd = -1
-        unbindProcessFromLink()
+        // Safety net: a system-initiated destroy (task removed, low memory)
+        // never goes through stopTunnel, and skipping this is what left tun0
+        // and the VPN key alive after the session ended.
+        teardown("service destroyed")
+        scope.cancel()
         super.onDestroy()
     }
 
