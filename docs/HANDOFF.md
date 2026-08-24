@@ -558,3 +558,132 @@ Rule going forward: a gate that has never been seen to fail is not evidence.
 5. On any failure tap **SHARE DIAGNOSTICS** and send the whole report: it contains the probe
    attempts with interfaces, every VPN lifecycle event, and every link drop with its reason.
 
+
+---
+
+## 13. Build #105 host/client lifecycle post-mortem (M7.10, `0700af9`)
+
+Four defects reported from build #105. All four were reproduced by reading the code paths,
+not guessed; the port bug is now covered by a **validated** JVM gate (see the table below).
+
+### 1. `LinkServer` :4434 `BindException: EADDRINUSE`, permanently
+
+`HostRuntime.init` started the responder from inside a `wifiDirect.state` collector, so
+`start()` ran **once per state emission** - and the framework emits several times while a
+group forms. `start()` began with an unconditional `stop()` and then bound the socket
+**asynchronously, inside the accept thread**. Two overlapping starts therefore raced:
+
+* start A calls `stop()` (nothing bound yet), spawns thread A, returns;
+* start B calls `stop()` - `serverSocket` is still `null` because thread A has not published
+  it - so it closes nothing, spawns thread B;
+* one thread binds, the other throws `EADDRINUSE`, and its `catch` sets `serverSocket = null`,
+  discarding the **winner's** reference.
+
+The winner is left parked in `accept()` on a socket no one can reach: the port stays bound,
+`listening` is false forever, and the host card reads "port 4434 unavailable" for the rest of
+the process's life. `SO_REUSEADDR` was already set and does not help - it applies to
+`TIME_WAIT`, not to a live listener - and using `SO_REUSEPORT`-style tricks would only hide
+the leak.
+
+Fix (`LinkServer.kt`, rewritten): one lock guards `start`/`stop`; the **bind happens on the
+caller's thread** so a concurrent `stop()` can always see the socket; `start()` is idempotent
+(`LINKSERVER_ALREADY_RUNNING`); each socket carries a `generation` and only the current
+generation may publish state; the accept loop closes its own socket in `finally`, so a socket
+can never outlive its loop; `stop()` closes, interrupts and joins (bounded, 500 ms) and clears
+everything. `HostRuntime` now starts it exactly once per share.
+
+### 2. Client auto-connect broken
+
+`WifiDirectManager.refreshGroupInfo()` set `hosting = true` whenever `requestGroupInfo`
+returned a group. That call returns the group to **both** members, so a phone that had just
+joined a host reported `hosting = true` *and* `joinedAsClient = true`. Everything on the
+client is gated on NOT hosting:
+
+* `ClientViewModel`'s join edge is `s.joinedAsClient && !s.hosting` - never true, so
+  `autoLink()` never ran;
+* the legacy poll bails at `if (state.value.hosting) continue` - forever;
+* and the client started a `LinkServer` and an mDNS advertisement of its own.
+
+So *joining the group* was precisely what disabled auto-connect. Fix: `classifyGroup()`, a
+pure function returning `OWNER` / `CLIENT` / `STALE_OWNER` from the group-owner flag plus the
+user's intent, unit-tested in `GroupRoleTest`.
+
+### 3. STOP SHARE left the `DIRECT-...` network alive
+
+Three separate leaks: a late `CONNECTION_CHANGED` broadcast re-entered `refreshGroupInfo()`
+and resurrected `hosting = true`; the `createGroup` failure path could retry **after** stop,
+recreating the group; and `clearGroupState()` never reset `joinedAsClient` /
+`joinedGroupOwnerAddress`, so a client kept a link to a host that no longer existed. Fix: a
+`@Volatile hostingRequested` intent gates every `createGroup` path, a group that arrives after
+stop is removed immediately, removal is **verified** with `requestGroupInfo` instead of
+trusting the callback (bounded to 3 attempts), and `clearGroupState()` clears the client
+fields too.
+
+One case is not fixable from an app: a client that joined by typing the passphrase in Android's
+Wi-Fi picker has the SSID saved as a *user-added network*, which no app may remove. The report
+now distinguishes that from a live P2P group rather than pretending the network is gone.
+
+### 4. `SecurityException` in `acquireMulticast()`
+
+`CHANGE_WIFI_MULTICAST_STATE` was genuinely missing from the manifest. Added. The catch is now
+specific, records `MULTICAST_LOCK_DENIED` once, and `releaseMulticast()` nulls the lock so a
+failed release cannot make every later acquire return a stale `isHeld`.
+
+### Gate validation (rule from 12: a gate that has never failed is not evidence)
+
+Bug reintroduced on throwaway branch `verify/linkserver-gate`, run `32697481344`:
+
+| Assertion | With bug restored |
+| --- | --- |
+| `binds and answers a probe with the versioned banner` | **failed** (async bind: probe arrives before the socket exists) |
+| `repeated start is idempotent and keeps serving` | **failed** |
+| `stop releases the port so the same instance can rebind it` | **failed** |
+| `concurrent starts never orphan the port` | **failed** |
+| `a taken port is reported as a failure instead of looking healthy` | **failed** (old code returned success optimistically) |
+| `probe counter resets per session and counts answers` | **failed** |
+| `stop actually frees the port for an unrelated listener` | passed - single start/stop does not race |
+
+6 of 7 catch it; the branch is deleted. Green run on `main`: `32697004993`.
+
+### Diagnostics tags added
+
+Host: `SHARE_START_REQUESTED`, `SHARE_ALREADY_ACTIVE`, `SHARE_ABORTED`, `ENGINE_STARTED`,
+`ENGINE_START_FAILED`, `HOST_READY`, `ADVERT_REPUBLISH`, `LINK_RESPONDER_RESTART`,
+`SHARE_STOP_REQUESTED`, `SHARE_STOP_COMPLETED`; `LINKSERVER_START_REQUESTED`,
+`LINKSERVER_ALREADY_RUNNING`, `LINKSERVER_BOUND`, `LINKSERVER_BIND_FAILED`,
+`LINKSERVER_SOCKET_CLOSED`, `LINKSERVER_LOOP_ENDED`, `LINKSERVER_STOP_REQUESTED`,
+`LINKSERVER_STOP_COMPLETED`; `WIFI_DIRECT_CREATE_REQUESTED`, `WIFI_DIRECT_GROUP_CREATED`,
+`WIFI_DIRECT_CREATE_ABORTED`, `WIFI_DIRECT_STOP_REQUESTED`,
+`WIFI_DIRECT_REMOVE_GROUP_REQUESTED`, `WIFI_DIRECT_GROUP_REMOVED`,
+`WIFI_DIRECT_GROUP_STILL_PRESENT`, `WIFI_DIRECT_GROUP_STUCK`, `WIFI_DIRECT_SESSION_CLEARED`,
+`MULTICAST_LOCK_DENIED`.
+
+Client (all stamped `s=<session>`): `AUTOCONNECT_START`, `AUTOCONNECT_STOP`,
+`NETWORK_DETECTED`, `DIRECT_NETWORK_DETECTED`, `HOST_IP_DETECTED`, `LINK_ATTEMPT`,
+`LINK_SUCCESS`, `LINK_FAILED`, `HOST_LOST`, `CLIENT_CLEANUP_COMPLETED`.
+
+### Deliberately NOT changed
+
+QUIC/`peernet-core` protocol, UDP framing, TUN setup, `VpnService` architecture, NAT,
+forwarding, DNS, routing, encryption, the Windows client, and all Rust networking. None of the
+four defects reached those layers - all four are Android-side lifecycle. Port 4434 was kept.
+No `SO_REUSEADDR` band-aid. No state-machine framework: the existing collector plus an explicit
+intent flag was enough.
+
+### Retest script (M7.10, run `32697004993` / `0700af9` or later)
+
+Internet is **not** expected to work yet - this build is about lifecycle stability.
+
+* **A. Fresh share.** Host: SHARE. Expect no red line and "Clients probed: 0".
+* **B. Auto-connect.** Client: join `DIRECT-PeerNet-...` from Wi-Fi settings, open PeerNet.
+  Expect a link within ~5 s and a VPN consent dialog, with mobile data left ON.
+* **C. Stop/restart (the port bug).** Host: STOP SHARE, then SHARE again, twice.
+  Every share must come up clean - any "port 4434 unavailable" is a regression.
+* **D. Teardown.** Host: STOP SHARE. On the client the `DIRECT-...` network must disappear
+  from Wi-Fi settings (if the client joined via the picker, the *saved entry* remains - that is
+  a system limitation; the group itself must be gone).
+* **E. Double tap.** Host: tap SHARE twice quickly - the second must log `SHARE_ALREADY_ACTIVE`
+  and must not drop a connected client.
+
+On any failure tap **SHARE DIAGNOSTICS** and send the whole report; every tag above carries a
+session/generation id, so overlapping attempts can be told apart.
