@@ -401,3 +401,81 @@ Wi-Fi Direct, the client's QUIC socket riding the p2p network via
 `bindProcessToNetwork`, the smoltcp terminator against Android's real TCP stack, and the
 host relaying to its own resolver.
 
+## 11. M7.8 — the two defects that actually caused "tunnel up, no internet"
+
+Both were invisible to CI and to reasoning about the code; both were found by reading the
+on-screen counters from a real session (`tun=3/1/5 udp=1/5/3 in=89/96/92` — numbers that
+went *down* between polls).
+
+### 1. The capture loop died on the first EAGAIN (fixed, `32c7645`)
+
+`AsyncFd::try_io` intercepts `WouldBlock` itself: when the closure returns `EAGAIN`, the
+call reports `Err(TryIoError)` **after clearing readiness** — it does *not* surface as
+`Ok(Err(WouldBlock))`. The reader matched `Ok(Err(_)) | Err(_) => break`, so the first
+empty TUN read (normal, one poll after the first packet burst) ended the capture for the
+rest of the session. Every later DNS retry and every TCP SYN then sat unread in the TUN
+queue: `tun` froze at a handful of packets and `tcp` stayed `0` forever. The writer had the
+identical bug, which stranded inbound replies.
+
+Now `Err(_) => continue` (readiness was cleared, so the next `await` blocks until real
+data), `Interrupted => continue`, and a single rejected packet no longer ends the loop —
+`READ_FAILURE_LIMIT` / `WRITE_FAILURE_LIMIT` (16 consecutive) separate "one bad packet"
+from "the interface is gone". Regression test:
+`capture_survives_an_idle_gap_between_packets` pushes three packets through a real
+`SOCK_SEQPACKET` socketpair with idle gaps in between, which fails on the old code.
+
+### 2. `startForeground` crashed the client on Android 10–13 (fixed, `9bab7f9`)
+
+Both services passed `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` whenever `SDK_INT >= Q` (29).
+`specialUse` — the constant `1 shl 30` and the manifest value — **only exists from API 34**.
+On 29–33 the manifest attribute parses to `0x0`, so the platform threw
+`IllegalArgumentException: foregroundServiceType 0x40000000 is not a subset of ... 0x0`.
+The service is sticky, so Android restarted it, it crashed again, and the engine counters
+reset on every restart — exactly the *decreasing* numbers seen on the Galaxy M11.
+
+`service/ForegroundServiceType.kt` is now the single source of truth (`forSdk()` returns
+the type only at API >= 34, else `null` -> 2-arg `startForeground`), gated by
+`ForegroundServiceTypeTest`, which pins the behaviour for 26–33 vs 34–36 against the
+literal `1 shl 30`. Both services also wrap the call: the VPN reports
+"Android refused to start the tunnel service (...)" on screen instead of dying silently.
+
+### Diagnostics added because the tester has no adb
+
+- `engineStats()` is now `tun= udp= tcp= in= lost= cap= eng=`. `in=` counts replies only
+  **after** the TUN write succeeds (it used to count arrivals, so it lied), `lost=`
+  counts replies that arrived but could not be delivered, `cap=` is the capture loop and
+  `eng=` the TCP terminator intake — with `eng=up` a stuck `tcp=0` means the phone sent no
+  SYN, not a dead engine.
+- Uncaught JVM exceptions are persisted to `SharedPreferences` and shown on the next
+  launch as "Recovered from a crash: ...", so a crash loop names itself.
+- Rust panics go through a hook into `lastError()` instead of vanishing into logcat.
+- The TCP engine's device MTU now equals the VpnService MTU (1280) — `bulk_transfer_256k`
+  asserts the largest packet handed to the TUN is `> 1000` and `<= 1280`, so the bound
+  cannot pass vacuously.
+
+### What is verified vs still unproven
+
+Verified in CI: the rebuilt UDP reply keeps the flow's original source address (that is
+what makes the virtual DNS IP work), swaps ports correctly, carries a correct IPv4 header
+checksum and an intact payload (`udp_roundtrip_through_host_nat`,
+`rebuild_packet_is_self_consistent`, `checksum_matches_rfc1071_example`).
+
+Still unproven on hardware: TCP through the smoltcp terminator (`tcp=0` in every session
+so far, fully explained by defect 1 — the phone was still waiting on DNS and never sent a
+SYN), and sustained throughput.
+
+### Retest script (M7.8, CI run `32682848115` / `0968b98` or later)
+
+1. **Uninstall the old build on both phones** (the crash-looping service can survive an
+   upgrade in a bad state).
+2. Host: open PeerNet, tap SHARE. Expect no red line. Keep the host's own internet on.
+3. Client: join the `DIRECT-...` network from Wi-Fi settings with the shown password,
+   then open PeerNet and allow the VPN request.
+4. Read the counter line. Expected: `cap=up eng=up`, `tun=` and `udp=` climbing while
+   browsing, `in=` climbing, `lost=0`.
+5. If it still fails, report the counter line, any red line, and any
+   "Recovered from a crash: ..." line **verbatim** — each now points at a distinct cause:
+   `cap=down` capture died, `lost>0` replies could not reach the phone, `in=0` with
+   `udp>0` the host cannot reach the internet, `tcp=0` with DNS working the phone never
+   sent a SYN.
+
