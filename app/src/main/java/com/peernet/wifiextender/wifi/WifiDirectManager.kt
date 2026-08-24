@@ -13,6 +13,7 @@ import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Looper
 import android.util.Log
+import com.peernet.wifiextender.diag.Diagnostics
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -44,6 +45,34 @@ data class WifiDirectState(
     val joinedGroupOwnerAddress: String? = null
 )
 
+/**
+ * What a P2P group report means for this device.
+ *
+ * Kept as a pure function because getting it wrong is what broke client
+ * auto-connect: `requestGroupInfo` returns a group for *both* roles, and the
+ * old code set `hosting = true` for any non-null group. A phone that had just
+ * joined a host therefore reported `hosting = true` **and**
+ * `joinedAsClient = true` at the same time, and every client auto-link path is
+ * gated on NOT hosting — so joining the group was exactly what disabled
+ * auto-connect.
+ */
+internal enum class GroupRole {
+    /** We own the group and the user asked for it: real hosting. */
+    OWNER,
+
+    /** We joined someone else's group: a client, never a host. */
+    CLIENT,
+
+    /** We own a group nobody asked for — left over after STOP SHARE. */
+    STALE_OWNER
+}
+
+internal fun classifyGroup(isGroupOwner: Boolean, hostingRequested: Boolean): GroupRole = when {
+    !isGroupOwner -> GroupRole.CLIENT
+    hostingRequested -> GroupRole.OWNER
+    else -> GroupRole.STALE_OWNER
+}
+
 @Singleton
 class WifiDirectManager @Inject constructor(
     @ApplicationContext private val context: Context
@@ -57,6 +86,19 @@ class WifiDirectManager @Inject constructor(
     private var requestedSsid: String? = null
     private var requestedPassphrase: String? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    /**
+     * Whether the user currently wants this phone to host. This is the *intent*,
+     * as opposed to what the framework happens to report: without it a late
+     * `WIFI_P2P_CONNECTION_CHANGED` broadcast arriving after STOP SHARE (group
+     * removal is asynchronous) put `hosting = true` back, which restarted the
+     * link responder and the mDNS advertisement behind the user's back.
+     */
+    @Volatile
+    private var hostingRequested = false
+
+    /** Bounded re-removal attempts for a group that outlives STOP SHARE. */
+    private var staleRemovals = 0
 
     private val _state = MutableStateFlow(WifiDirectState(p2pSupported = manager != null))
     val state: StateFlow<WifiDirectState> = _state.asStateFlow()
@@ -291,6 +333,9 @@ class WifiDirectManager @Inject constructor(
             return
         }
         Timber.i("Starting Wi-Fi Direct hosting (ssid=%s)", ssid ?: "<system>")
+        Diagnostics.note("wifidirect", "WIFI_DIRECT_CREATE_REQUESTED ssid=${ssid ?: "<system>"}")
+        hostingRequested = true
+        staleRemovals = 0
         _state.update { it.copy(error = null, creating = true) }
         requestedSsid = ssid
         requestedPassphrase = passphrase
@@ -308,7 +353,13 @@ class WifiDirectManager @Inject constructor(
 
     fun stopHosting() {
         Timber.i("Stopping Wi-Fi Direct hosting")
+        Diagnostics.note("wifidirect", "WIFI_DIRECT_STOP_REQUESTED")
+        // Intent first: every asynchronous callback still in flight (a group
+        // that is mid-creation, a late CONNECTION_CHANGED broadcast) checks this
+        // and must not re-enter or re-create hosting after this point.
+        hostingRequested = false
         pendingCreate = false
+        staleRemovals = 0
         requestedSsid = null
         requestedPassphrase = null
 
@@ -316,21 +367,53 @@ class WifiDirectManager @Inject constructor(
         // if the platform removeGroup callback never arrives (OEM quirk guard).
         clearGroupState()
 
-        val mgr = manager
-        val ch = channel
-        if (mgr == null || ch == null) return
+        requestRemoveGroup("stop")
+    }
+
+    /**
+     * Asks the framework to tear the group down and then *verifies* it, instead
+     * of trusting the callback. A silently-failed removal is what left the
+     * DIRECT-… network in the client's Wi-Fi list after STOP SHARE: the host
+     * believed it had stopped while the group was still up and advertising.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestRemoveGroup(reason: String) {
+        val mgr = manager ?: return
+        val ch = channel ?: return
+        Diagnostics.note("wifidirect", "WIFI_DIRECT_REMOVE_GROUP_REQUESTED ($reason)")
         try {
             @Suppress("DEPRECATION")
             mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {}
-                override fun onFailure(reason: Int) {}
+                override fun onSuccess() {
+                    Diagnostics.note("wifidirect", "WIFI_DIRECT_GROUP_REMOVED ($reason)")
+                    // Confirm: on several OEM builds the call reports success
+                    // while requestGroupInfo still returns the group.
+                    refreshGroupInfo()
+                }
+
+                override fun onFailure(failureReason: Int) {
+                    Diagnostics.note(
+                        "wifidirect",
+                        "WIFI_DIRECT_REMOVE_GROUP_FAILED ($reason: ${reasonText(failureReason)})"
+                    )
+                    refreshGroupInfo()
+                }
             })
         } catch (e: SecurityException) {
-            reportP2pDenied("removeGroup(stop)", e)
+            reportP2pDenied("removeGroup($reason)", e)
         }
     }
 
     private fun createGroup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel) {
+        // STOP raced ahead of the removeGroup callback that leads here. Creating
+        // now would produce a group the app does not consider itself to own —
+        // visible to clients forever, removable by nobody.
+        if (!hostingRequested) {
+            Diagnostics.note("wifidirect", "WIFI_DIRECT_CREATE_ABORTED (stop requested first)")
+            pendingCreate = false
+            return
+        }
+
         // Local copies: mutable properties cannot be smart-cast to non-null.
         val ssid = requestedSsid
         val passphrase = requestedPassphrase
@@ -375,11 +458,30 @@ class WifiDirectManager @Inject constructor(
         override fun onSuccess() {
             Timber.i("Wi-Fi Direct group created")
             pendingCreate = false
+            if (!hostingRequested) {
+                // STOP arrived while the group was forming. Remove it at once:
+                // otherwise it stays up with nobody tracking it, which is
+                // exactly how a DIRECT-… network outlived STOP SHARE.
+                Diagnostics.note(
+                    "wifidirect",
+                    "WIFI_DIRECT_GROUP_CREATED after stop — removing immediately"
+                )
+                clearGroupState()
+                requestRemoveGroup("created-after-stop")
+                return
+            }
+            Diagnostics.note("wifidirect", "WIFI_DIRECT_GROUP_CREATED")
             _state.update { it.copy(creating = false, hosting = true, error = null) }
             refreshGroupInfo()
         }
 
         override fun onFailure(reason: Int) {
+            if (!hostingRequested) {
+                Diagnostics.note("wifidirect", "WIFI_DIRECT_CREATE_ABANDONED (stop requested)")
+                pendingCreate = false
+                clearGroupState()
+                return
+            }
             if (requestedSsid != null || requestedPassphrase != null) {
                 Timber.w("createGroup(custom) failed: %d — retrying with system credentials", reason)
                 requestedSsid = null
@@ -411,20 +513,68 @@ class WifiDirectManager @Inject constructor(
         val ch = channel ?: return
         mgr.requestGroupInfo(ch) { group ->
             if (group == null) {
-                if (_state.value.hosting && !pendingCreate) clearGroupState()
+                // No group at all: this is the only authoritative "session is
+                // over" signal, and it must also clear the *client* fields —
+                // leaving joinedAsClient=true kept a dead host linked forever.
+                if (!pendingCreate) clearGroupState()
                 return@requestGroupInfo
             }
-            val passphrase = readPassphrase(group)
-            _state.update {
-                it.copy(
-                    hosting = true,
-                    creating = false,
-                    ssid = group.networkName,
-                    passphrase = passphrase,
-                    passphraseAvailable = !passphrase.isNullOrEmpty(),
-                    error = null
-                )
+
+            val isOwner = runCatching { group.isGroupOwner }.getOrDefault(hostingRequested)
+            when (classifyGroup(isOwner, hostingRequested)) {
+                GroupRole.STALE_OWNER -> {
+                    // The user stopped sharing but the framework still has our
+                    // group. Never re-enter hosting here; remove it again (and
+                    // keep the network from lingering in the client's Wi-Fi
+                    // list) with a bounded number of attempts.
+                    clearGroupState()
+                    if (staleRemovals < MAX_STALE_REMOVALS) {
+                        staleRemovals++
+                        Diagnostics.note(
+                            "wifidirect",
+                            "WIFI_DIRECT_GROUP_STILL_PRESENT ${group.networkName} " +
+                                "after stop (removal try $staleRemovals)"
+                        )
+                        requestRemoveGroup("stale-group")
+                    } else {
+                        Diagnostics.note(
+                            "wifidirect",
+                            "WIFI_DIRECT_GROUP_STUCK ${group.networkName} — " +
+                                "survived $MAX_STALE_REMOVALS removals"
+                        )
+                    }
+                    return@requestGroupInfo
+                }
+
+                GroupRole.CLIENT -> {
+                    // Member of someone else's group. Explicitly NOT hosting.
+                    _state.update {
+                        it.copy(
+                            hosting = false,
+                            creating = false,
+                            ssid = null,
+                            passphrase = null,
+                            passphraseAvailable = true,
+                            error = null
+                        )
+                    }
+                }
+
+                GroupRole.OWNER -> {
+                    val passphrase = readPassphrase(group)
+                    _state.update {
+                        it.copy(
+                            hosting = true,
+                            creating = false,
+                            ssid = group.networkName,
+                            passphrase = passphrase,
+                            passphraseAvailable = !passphrase.isNullOrEmpty(),
+                            error = null
+                        )
+                    }
+                }
             }
+
             mgr.requestConnectionInfo(ch) { info ->
                 val formed = info?.groupFormed == true
                 val owner = info?.groupOwnerAddress?.hostAddress
@@ -456,7 +606,16 @@ class WifiDirectManager @Inject constructor(
         }
     }
 
+    /**
+     * Resets everything derived from a live group — host *and* client fields.
+     *
+     * The client fields used to survive here, so after the host tore the group
+     * down the client still reported `joinedAsClient = true`: it never saw the
+     * falling edge, never cleared `connectedHost`, and kept probing a host that
+     * no longer existed.
+     */
     private fun clearGroupState() {
+        val had = _state.value
         _state.update {
             it.copy(
                 creating = false,
@@ -464,7 +623,15 @@ class WifiDirectManager @Inject constructor(
                 ssid = null,
                 passphrase = null,
                 passphraseAvailable = true,
-                groupOwnerAddress = null
+                groupOwnerAddress = null,
+                joinedAsClient = false,
+                joinedGroupOwnerAddress = null
+            )
+        }
+        if (had.hosting || had.joinedAsClient) {
+            Diagnostics.note(
+                "wifidirect",
+                "WIFI_DIRECT_SESSION_CLEARED (was hosting=${had.hosting} joined=${had.joinedAsClient})"
             )
         }
     }
@@ -474,6 +641,10 @@ class WifiDirectManager @Inject constructor(
      * mDNS frames on P2P groups and discovery "randomly" finds nothing.
      * Non-refcounted: acquire/release are idempotent across both roles
      * (host advertises, client discovers) which never run simultaneously.
+     *
+     * Requires CHANGE_WIFI_MULTICAST_STATE. A missing grant must never break
+     * hosting or linking — mDNS is an accelerator, and the gateway probe finds
+     * the host without it — so the failure is recorded and swallowed.
      */
     fun acquireMulticast(): Boolean {
         multicastLock?.let { return it.isHeld }
@@ -485,8 +656,19 @@ class WifiDirectManager @Inject constructor(
             }
             multicastLock = lock
             true
+        } catch (e: SecurityException) {
+            // Explicit catch in the same method as the guarded call: lint only
+            // credits it here, and the grant can be absent on OEM builds.
+            Timber.w(e, "multicast lock denied")
+            Diagnostics.note(
+                "wifidirect",
+                "MULTICAST_LOCK_DENIED (${e.javaClass.simpleName}) — mDNS may be slower, " +
+                    "gateway probing still works"
+            )
+            false
         } catch (t: Throwable) {
             Timber.w(t, "multicast lock unavailable")
+            Diagnostics.note("wifidirect", "MULTICAST_LOCK_UNAVAILABLE (${t.javaClass.simpleName})")
             false
         }
     }
@@ -498,6 +680,9 @@ class WifiDirectManager @Inject constructor(
         } catch (t: Throwable) {
             Timber.w(t, "multicast lock release failed")
         }
+        // Drop the reference: a lock kept here after a failed release made every
+        // later acquire() return a stale isHeld instead of retrying.
+        multicastLock = null
     }
 
     private fun reasonText(reason: Int) = when (reason) {
@@ -510,5 +695,15 @@ class WifiDirectManager @Inject constructor(
     companion object {
         private const val TAG = "WifiDirectManager"
         private val MAC_REGEX = Regex("^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+        /**
+         * How many times a group that survives STOP SHARE is re-removed before
+         * giving up and saying so. Bounded because each attempt is driven by a
+         * `requestGroupInfo` callback, and an unbounded retry would spin
+         * forever against a group the platform refuses to drop (for example a
+         * network the *user* added by hand from Wi-Fi settings, which no app is
+         * allowed to remove).
+         */
+        private const val MAX_STALE_REMOVALS = 3
     }
 }

@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- Required by WifiManager.createMulticastLock().acquire(). Without it the
+         acquire throws SecurityException, Wi-Fi power save keeps dropping mDNS
+         frames on the P2P group, and discovery "randomly" finds nothing. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- Wi-Fi Direct / nearby discovery -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />

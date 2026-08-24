@@ -70,6 +70,24 @@ class ClientViewModel @Inject constructor(
     /** Counts auto-link attempts so the user can see the app is still trying. */
     private var linkAttempts = 0
 
+    /**
+     * Monotonic auto-connect session id, stamped on every client diagnostic as
+     * `s=<n>`. Reports mixed several join/leave cycles together and there was
+     * no way to tell which attempt a line belonged to.
+     */
+    private val sessions = java.util.concurrent.atomic.AtomicInteger(0)
+
+    @Volatile
+    private var session = 0
+
+    /** Consecutive polls with no usable network, driving the backoff. */
+    @Volatile
+    private var pollMisses = 0
+
+    /** Last reported network picture, so only changes are recorded. */
+    @Volatile
+    private var lastNetworkFingerprint: String? = null
+
     private val _uiState = MutableStateFlow(ClientUiState())
     val uiState: StateFlow<ClientUiState> = _uiState.asStateFlow()
 
@@ -78,10 +96,23 @@ class ClientViewModel @Inject constructor(
         viewModelScope.launch {
             var wasJoined = false
             wifiDirect.state.collect { s ->
+                // `!s.hosting` is essential and was the bug: a phone that joined
+                // a group used to report hosting=true as well (see
+                // WifiDirectManager.classifyGroup), so `joined` never became
+                // true and auto-link never ran on the client.
                 val joined = s.joinedAsClient && !s.hosting
-                if (joined && !wasJoined) autoLink()
+                if (joined && !wasJoined) {
+                    session = sessions.incrementAndGet()
+                    pollMisses = 0
+                    Diagnostics.note(
+                        "client",
+                        "DIRECT_NETWORK_DETECTED s=$session p2p join go=${s.joinedGroupOwnerAddress ?: "?"}"
+                    )
+                    autoLink()
+                }
                 if (!joined && wasJoined && !s.hosting && _uiState.value.connectedHost != null) {
                     // Host tore down the group; drop the stale link.
+                    Diagnostics.note("client", "HOST_LOST s=$session p2p group gone")
                     clearLink("Host disconnected.")
                 }
                 wasJoined = joined
@@ -98,52 +129,94 @@ class ClientViewModel @Inject constructor(
         viewModelScope.launch(Dispatchers.Default) {
             val wm = appContext
                 .getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-            while (kotlinx.coroutines.currentCoroutineContext().isActive) {
-                delay(LEGACY_POLL_MS)
-                if (_uiState.value.connectedHost != null) continue
-                if (_uiState.value.searching || busy.get()) continue
-                if (wifiDirect.state.value.hosting) continue
-                val ssid = runCatching {
-                    // Permission-guarded (and SecurityException-throwing when
-                    // location is revoked); the runCatching below is the
-                    // handler, and the SSID is only a log hint anyway.
-                    @Suppress("DEPRECATION")
-                    @android.annotation.SuppressLint("MissingPermission")
-                    wm.connectionInfo?.ssid?.removeSurrounding("\"")
-                }.getOrNull().orEmpty()
-                linkAttempts++
-                val networks = describeNetworks()
-                val candidate = gatewayCandidate()
-                if (candidate == null) {
-                    // Not on a usable IPv4 network yet. Say so, with what we
-                    // actually saw, instead of retrying invisibly forever.
-                    reportLinkDiagnostic(
-                        "Not on the host's network yet (try $linkAttempts). " +
-                            "Join the DIRECT-… Wi-Fi in settings. Seen: $networks"
+            Diagnostics.note("client", "AUTOCONNECT_START poll=${LEGACY_POLL_MS}ms")
+            try {
+                while (kotlinx.coroutines.currentCoroutineContext().isActive) {
+                    // Back off once it is clear nothing is there: at a fixed 4 s
+                    // the log filled with identical failures, which buried the
+                    // one line that mattered and kept probing the radio.
+                    delay(if (pollMisses >= MISS_BACKOFF_AFTER) LEGACY_POLL_IDLE_MS else LEGACY_POLL_MS)
+                    if (_uiState.value.connectedHost != null) continue
+                    if (_uiState.value.searching || busy.get()) continue
+                    // Only a real host skips the poll. Previously this also
+                    // matched a client that had been mislabelled as hosting,
+                    // which disabled auto-connect permanently.
+                    if (wifiDirect.state.value.hosting) continue
+                    val ssid = runCatching {
+                        // Permission-guarded (and SecurityException-throwing when
+                        // location is revoked); the runCatching below is the
+                        // handler, and the SSID is only a log hint anyway.
+                        @Suppress("DEPRECATION")
+                        @android.annotation.SuppressLint("MissingPermission")
+                        wm.connectionInfo?.ssid?.removeSurrounding("\"")
+                    }.getOrNull().orEmpty()
+                    linkAttempts++
+                    val networks = describeNetworks()
+                    noteNetworkChange(networks, ssid)
+                    val candidate = gatewayCandidate()
+                    if (candidate == null) {
+                        // Not on a usable IPv4 network yet. Say so, with what we
+                        // actually saw, instead of retrying invisibly forever.
+                        pollMisses++
+                        reportLinkDiagnostic(
+                            "Not on the host's network yet (try $linkAttempts). " +
+                                "Join the DIRECT-… Wi-Fi in settings. Seen: $networks"
+                        )
+                        continue
+                    }
+                    pollMisses = 0
+                    Diagnostics.note(
+                        "client",
+                        "HOST_IP_DETECTED s=$session ${candidate.address}:${candidate.port} ssid=$ssid"
                     )
-                    continue
-                }
-                lastProbeFailure = null
-                val verified = probeDetails(candidate)
-                if (verified == null) {
-                    reportLinkDiagnostic(
-                        "On ${networks.ifBlank { "the network" }}, but " +
-                            "${candidate.address}:${candidate.port} " +
-                            (lastProbeFailure ?: "did not verify") +
-                            " (try $linkAttempts)"
+                    lastProbeFailure = null
+                    Diagnostics.note(
+                        "client",
+                        "LINK_ATTEMPT s=$session try=$linkAttempts ${candidate.address}:${candidate.port}"
                     )
-                    continue
-                }
-                Timber.i("Host detected on joined network (ssid=%s, gw=%s)", ssid, candidate.address)
-                Diagnostics.note("link", "host verified at ${candidate.address} (ssid=$ssid)")
-                if (busy.compareAndSet(false, true)) {
-                    try {
-                        link(verified, viaP2p = true)
-                    } finally {
-                        busy.set(false)
+                    val verified = probeDetails(candidate)
+                    if (verified == null) {
+                        Diagnostics.note(
+                            "client",
+                            "LINK_FAILED s=$session try=$linkAttempts " +
+                                (lastProbeFailure ?: "did not verify")
+                        )
+                        reportLinkDiagnostic(
+                            "On ${networks.ifBlank { "the network" }}, but " +
+                                "${candidate.address}:${candidate.port} " +
+                                (lastProbeFailure ?: "did not verify") +
+                                " (try $linkAttempts)"
+                        )
+                        continue
+                    }
+                    Timber.i("Host detected on joined network (ssid=%s, gw=%s)", ssid, candidate.address)
+                    Diagnostics.note("link", "host verified at ${candidate.address} (ssid=$ssid)")
+                    if (busy.compareAndSet(false, true)) {
+                        try {
+                            link(verified, viaP2p = true)
+                        } finally {
+                            busy.set(false)
+                        }
                     }
                 }
+            } finally {
+                Diagnostics.note("client", "AUTOCONNECT_STOP s=$session (scope ended)")
             }
+        }
+    }
+
+    /**
+     * Records the network picture only when it changes. Emitting it every poll
+     * turned the report into noise; the transition is the diagnostic.
+     */
+    private fun noteNetworkChange(networks: String, ssid: String) {
+        val fingerprint = "$networks|$ssid"
+        if (fingerprint == lastNetworkFingerprint) return
+        lastNetworkFingerprint = fingerprint
+        Diagnostics.note("client", "NETWORK_DETECTED s=$session ssid=${ssid.ifBlank { "?" }} [$networks]")
+        val looksDirect = ssid.startsWith("DIRECT-", ignoreCase = true) || networks.contains("p2p")
+        if (looksDirect) {
+            Diagnostics.note("client", "DIRECT_NETWORK_DETECTED s=$session via=${if (ssid.startsWith("DIRECT-", true)) "ssid" else "iface"}")
         }
     }
 
@@ -441,6 +514,11 @@ class ClientViewModel @Inject constructor(
             "link",
             "linked to ${host.address}:${host.tunnelPort} pin=${if (pinMissing) "MISSING" else "yes"}"
         )
+        Diagnostics.note(
+            "client",
+            "LINK_SUCCESS s=$session ${host.address}:${host.tunnelPort} " +
+                "p2p=$viaP2p pin=${if (pinMissing) "MISSING" else "yes"}"
+        )
         _uiState.update {
             it.copy(
                 connectedHost = host,
@@ -504,6 +582,10 @@ class ClientViewModel @Inject constructor(
                         "dropping link after $misses missed probes " +
                             "(${lastProbeFailure ?: "no reason recorded"})"
                     )
+                    Diagnostics.note(
+                        "client",
+                        "HOST_LOST s=$session $misses missed probes, tunnel idle"
+                    )
                     clearLink("Host disconnected.")
                     break
                 }
@@ -535,6 +617,11 @@ class ClientViewModel @Inject constructor(
         livenessJob = null
         linkManager.setLinked(null)
         _uiState.update { it.copy(connectedHost = null, status = message) }
+        // Re-arm auto-connect: the next poll should probe immediately rather
+        // than inherit the backoff from whatever ended the previous session.
+        pollMisses = 0
+        lastNetworkFingerprint = null
+        Diagnostics.note("client", "CLIENT_CLEANUP_COMPLETED s=$session ($message)")
     }
 
     /** Drops the link and leaves any joined Wi-Fi Direct group. */
@@ -705,5 +792,14 @@ class ClientViewModel @Inject constructor(
         private const val LIVENESS_INTERVAL_MS = 5_000L
         private const val LIVENESS_MISSES = 2
         private const val LEGACY_POLL_MS = 4_000L
+
+        /**
+         * Slower cadence once the phone is clearly not on any host network.
+         * A fixed 4 s retry produced a wall of identical diagnostics that hid
+         * real failures and kept waking the Wi-Fi stack; the fast cadence is
+         * restored the moment a candidate gateway or a join edge appears.
+         */
+        private const val LEGACY_POLL_IDLE_MS = 15_000L
+        private const val MISS_BACKOFF_AFTER = 5
     }
 }

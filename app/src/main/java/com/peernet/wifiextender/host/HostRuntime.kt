@@ -1,6 +1,7 @@
 package com.peernet.wifiextender.host
 
 import android.content.Context
+import com.peernet.wifiextender.diag.Diagnostics
 import com.peernet.wifiextender.discovery.HostIdentity
 import com.peernet.wifiextender.discovery.NsdHostAdvertiser
 import com.peernet.wifiextender.util.Permissions
@@ -10,6 +11,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import android.os.Build
 import javax.inject.Inject
@@ -42,32 +44,73 @@ class HostRuntime @Inject constructor(
     @Volatile
     private var engineError: String? = null
 
+    /**
+     * Whether the user asked *this* phone to share. Single source of truth for
+     * the responder's lifetime.
+     *
+     * Before this existed the responder was started from inside the
+     * `wifiDirect.state` collector, i.e. once per state emission — and because
+     * the framework emits several times while a group forms, two starts
+     * overlapped and fought over port 4434 (see [LinkServer]). It also meant a
+     * *client* phone, which the old code mislabelled as hosting, started a
+     * responder and an mDNS advertisement of its own.
+     */
+    @Volatile
+    private var sharingActive = false
+
+    /** Latches HOST_READY so it is reported on the edge, not on every emission. */
+    @Volatile
+    private var reportedReady = false
+
     init {
         scope.launch {
             wifiDirect.state.collect { s ->
-                if (s.hosting && s.ssid != null) {
-                    val fp = engineFingerprint ?: ""
-                    // The engine can finish binding after the group appears;
-                    // re-publish so clients never read an empty/stale pin.
-                    if (advertisedFingerprint != null && advertisedFingerprint != fp) {
-                        advertiser.unregister()
-                        advertisedFingerprint = null
-                    }
-                    advertiser.register(
-                        displayName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
-                        fingerprint = fp
-                    )
-                    advertisedFingerprint = fp
-                    linkServer.start(hostId) {
-                        com.peernet.wifiextender.wifi.HostLinkDetails(
-                            fingerprint = engineFingerprint ?: "",
-                            tunnelPort = NsdHostAdvertiser.PNTP_PORT
+                val groupUp = s.hosting && s.ssid != null
+                if (sharingActive && groupUp) {
+                    publishAdvert()
+                    // Idempotent: no-op while already bound. Present so a
+                    // responder that died on its own is revived as soon as the
+                    // group reports in, rather than leaving a share that
+                    // clients can see but never link to.
+                    ensureResponder()
+                    if (!reportedReady) {
+                        reportedReady = true
+                        Diagnostics.note(
+                            "host",
+                            "HOST_READY ssid=${s.ssid} go=${s.groupOwnerAddress ?: "?"} " +
+                                "link=${linkServer.listening} engine=$engineReady"
                         )
                     }
-                } else if (!s.hosting && !s.creating) {
-                    linkServer.stop()
-                    advertiser.unregister()
-                    advertisedFingerprint = null
+                } else if (!groupUp) {
+                    // The advertisement must never outlive the group it points
+                    // at; the responder is tied to intent, not to this signal,
+                    // so a group blip does not churn the port.
+                    reportedReady = false
+                    withdrawAdvert()
+                    if (!sharingActive && !s.creating) stopResponder()
+                }
+            }
+        }
+
+        // Supervision tick. The collector only runs on state *changes*, so two
+        // things would otherwise go unnoticed for the rest of the share:
+        // a responder whose accept loop died (clients silently stop linking),
+        // and an engine that finished starting after the group appeared, leaving
+        // the advertised pin empty forever.
+        scope.launch {
+            while (true) {
+                delay(SUPERVISE_MS)
+                if (!sharingActive) continue
+                if (!wifiDirect.state.value.hosting) continue
+                if (!linkServer.listening) {
+                    Diagnostics.note(
+                        "host",
+                        "LINK_RESPONDER_RESTART (${linkServer.failure ?: "not listening"})"
+                    )
+                    ensureResponder()
+                }
+                if (advertisedFingerprint != null && advertisedFingerprint != (engineFingerprint ?: "")) {
+                    publishAdvert()
                 }
             }
         }
@@ -75,8 +118,57 @@ class HostRuntime @Inject constructor(
 
     fun canStart(): Boolean = Permissions.missing(context).isEmpty()
 
+    /** Binds the banner responder unless it is already bound. Idempotent. */
+    private fun ensureResponder() {
+        linkServer.start(hostId) {
+            com.peernet.wifiextender.wifi.HostLinkDetails(
+                fingerprint = engineFingerprint ?: "",
+                tunnelPort = NsdHostAdvertiser.PNTP_PORT
+            )
+        }
+    }
+
+    private fun stopResponder() {
+        linkServer.stop()
+    }
+
+    /**
+     * Publishes (or re-publishes) the mDNS record. The engine can finish
+     * binding after the group appears, so a record carrying an empty or stale
+     * pin is replaced once the real fingerprint is known — otherwise clients
+     * read a pin that never matches and the tunnel silently never opens.
+     */
+    private fun publishAdvert() {
+        val fp = engineFingerprint ?: ""
+        if (advertisedFingerprint != null && advertisedFingerprint != fp) {
+            advertiser.unregister()
+            advertisedFingerprint = null
+            Diagnostics.note("host", "ADVERT_REPUBLISH pin changed")
+        }
+        advertiser.register(
+            displayName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+            fingerprint = fp
+        )
+        advertisedFingerprint = fp
+    }
+
+    private fun withdrawAdvert() {
+        if (advertisedFingerprint == null) return
+        advertiser.unregister()
+        advertisedFingerprint = null
+    }
+
     fun startSharing() {
         val shortId = HostIdentity.shortId(context)
+
+        if (sharingActive) {
+            // A second SHARE tap (or a re-entrant call from the service) must
+            // not re-run any of this: it would remove and recreate the group,
+            // dropping every connected client for no reason.
+            Diagnostics.note("host", "SHARE_ALREADY_ACTIVE (ignored)")
+            return
+        }
+        Diagnostics.note("host", "SHARE_START_REQUESTED id=$shortId")
 
         // Wi-Fi Direct group creation is also gated on location *services*
         // being on, not just the permission grant: with location off the
@@ -85,8 +177,12 @@ class HostRuntime @Inject constructor(
         if (!locationServicesEnabled()) {
             engineError = "Turn on Location in system settings — Android blocks Wi-Fi Direct without it."
             wifiDirect.reportError(engineError!!)
+            Diagnostics.note("host", "SHARE_ABORTED location services off")
             return
         }
+
+        sharingActive = true
+        reportedReady = false
 
         // Brand the Wi-Fi Direct identity so clients see "PeerNet-xxxx",
         // not the owner's personal device name. Reflection-based; no-op where
@@ -114,7 +210,15 @@ class HostRuntime @Inject constructor(
         engineFingerprint = startEngine()
         if (engineFingerprint == null) {
             android.util.Log.w("HostRuntime", "QUIC engine unavailable; clients will not be able to tunnel")
+            Diagnostics.note("host", "ENGINE_START_FAILED ${engineError ?: "unknown"}")
+        } else {
+            Diagnostics.note("host", "ENGINE_STARTED port=${NsdHostAdvertiser.PNTP_PORT}")
         }
+
+        // Bind the banner responder here, exactly once per share, on a known
+        // thread — not from the state collector, which fires repeatedly while
+        // the group forms and used to race itself for the port.
+        ensureResponder()
 
         // Stable group credentials (honored on API 33+): the network always
         // appears as DIRECT-PeerNet-xxxx with an unchanging passphrase, so a
@@ -126,14 +230,23 @@ class HostRuntime @Inject constructor(
     }
 
     fun stopSharing() {
-        linkServer.stop()
-        advertiser.unregister()
-        advertisedFingerprint = null
+        Diagnostics.note("host", "SHARE_STOP_REQUESTED")
+        // Intent cleared first so nothing the teardown triggers (state
+        // emissions, group-removal callbacks) can restart the responder or the
+        // advertisement behind us.
+        sharingActive = false
+        reportedReady = false
+        stopResponder()
+        withdrawAdvert()
         wifiDirect.stopHosting()
         wifiDirect.releaseMulticast()
         rustCore.stopHost()
         engineFingerprint = null
         context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.HostForegroundService::class.java))
+        Diagnostics.note(
+            "host",
+            "SHARE_STOP_COMPLETED link=${linkServer.listening} advert=${advertisedFingerprint != null}"
+        )
     }
 
     /**
@@ -212,5 +325,14 @@ class HostRuntime @Inject constructor(
             val v4 = dns.firstOrNull { it is java.net.Inet4Address }?.hostAddress
             if (v4.isNullOrBlank()) fallback else "$v4:53"
         }.getOrDefault(fallback)
+    }
+
+    private companion object {
+        /**
+         * Supervision cadence. Cheap (two volatile reads and a boolean) and
+         * fast enough that a dead responder is revived well inside the client's
+         * own retry window instead of stranding the share.
+         */
+        const val SUPERVISE_MS = 2_000L
     }
 }
