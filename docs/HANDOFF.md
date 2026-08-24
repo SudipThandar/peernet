@@ -424,20 +424,31 @@ from "the interface is gone". Regression test:
 `capture_survives_an_idle_gap_between_packets` pushes three packets through a real
 `SOCK_SEQPACKET` socketpair with idle gaps in between, which fails on the old code.
 
-### 2. `startForeground` crashed the client on Android 10–13 (fixed, `9bab7f9`)
+### 2. `startForeground` on Android 10–13 — DIAGNOSIS RETRACTED (`9bab7f9`, harmless)
 
-Both services passed `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` whenever `SDK_INT >= Q` (29).
-`specialUse` — the constant `1 shl 30` and the manifest value — **only exists from API 34**.
-On 29–33 the manifest attribute parses to `0x0`, so the platform threw
-`IllegalArgumentException: foregroundServiceType 0x40000000 is not a subset of ... 0x0`.
-The service is sticky, so Android restarted it, it crashed again, and the engine counters
-reset on every restart — exactly the *decreasing* numbers seen on the Galaxy M11.
+**This section previously claimed a crash loop. That claim was wrong; an emulator test
+disproved it. Do not repeat the reasoning.**
 
-`service/ForegroundServiceType.kt` is now the single source of truth (`forSdk()` returns
-the type only at API >= 34, else `null` -> 2-arg `startForeground`), gated by
-`ForegroundServiceTypeTest`, which pins the behaviour for 26–33 vs 34–36 against the
-literal `1 shl 30`. Both services also wrap the call: the VPN reports
-"Android refused to start the tunnel service (...)" on screen instead of dying silently.
+The original claim was: both services passed `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` whenever
+`SDK_INT >= Q`, `specialUse` only exists from API 34, so on 29–33 the manifest attribute
+parses to `0x0` and the platform throws `IllegalArgumentException: foregroundServiceType
+0x40000000 is not a subset of ... 0x0`.
+
+Why it is false: `android:foregroundServiceType="specialUse"` is compiled by **AAPT2 against
+compileSdk 36**, so the binary manifest stores the *integer* `0x40000000`. Old platforms read
+that int verbatim (`PackageParser` does not validate it against types it knows), so the
+declared mask is `0x40000000` on API 29 too and the type **is** a subset. Nothing throws.
+
+Proof, not reasoning: on branch `verify/gates-fail-on-old-bugs` the old behaviour was
+reintroduced (`forSdk` returning the type from `Q`) and run `32687459491` was dispatched.
+On the **API 29** emulator `host_service_reaches_the_foreground_on_this_api_level` **passed**.
+Had the exception been real the service would have caught it and called `stopSelf()`, and the
+test would have failed.
+
+Consequences to keep in mind:
+- `ForegroundServiceType.kt` and its unit test are still correct and are kept (the 2-arg call
+  below API 34 is the documented approach), but they **fixed no user-visible defect**.
+- The *decreasing* counters on the Galaxy M11 were therefore **not** a crash loop. See §12.
 
 ### Diagnostics added because the tester has no adb
 
@@ -478,4 +489,72 @@ SYN), and sustained throughput.
    `cap=down` capture died, `lost>0` replies could not reach the phone, `in=0` with
    `udp>0` the host cannot reach the internet, `tcp=0` with DNS working the phone never
    sent a SYN.
+
+## 12. M7.9 — why it "stopped connecting automatically", and the approach change
+
+The tester's report was "not auto connecting; entered the password manually; still no
+internet". Three distinct causes were found. Only the first was ever a Rust bug.
+
+### 1. Unbound probe sockets (fixed, `2ec0dba`) — the likely cause of no auto-connect
+
+`probeHost()` used a bare `Socket()`. Android routes an unbound socket over the **default**
+network. A Wi-Fi Direct group is flagged "no internet", so on any phone with mobile data the
+default is **cellular**, where the host's `192.168.49.x` address does not exist. The probe
+times out although the host is one hop away, `probeDetails()` returns null, no link is made,
+and the VPN consent dialog is never shown.
+
+`PeerNetVpnService.bindProcessToLink()` does bind the whole process — but only *after* the
+tunnel starts, which is after linking. Discovery and auto-link run unprotected.
+
+Fix: `probeNetwork()` prefers the linked/P2P network and `openProbeSocket()` builds every
+host-facing socket from `network.socketFactory`, independent of any process-wide binding.
+Failures now name the interface they used ("tried over the default network" vs
+"tried over p2p-p2p0-6"), which is what distinguishes this from a host that is simply off.
+
+### 2. The link-flap loop (fixed, `2ec0dba`) — explains the decreasing counters
+
+`startLiveness()` cleared the link after 2 missed probes whenever
+`joinedAsClient == false`. A join made through the **Wi-Fi picker never sets that flag**
+(no Wi-Fi Direct callback fires), so for the tester it was always false. With cause 1 making
+every probe miss, the sequence was: link -> VPN starts -> 10 s -> link cleared -> VPN
+stopped -> legacy poll re-links -> VPN restarts. Each restart calls `startTunCapture`, which
+**resets the engine counters** — the `tun=3` then `tun=1` then `tun=5` readings were
+successive short-lived tunnels, not a crash loop.
+
+Fix: a missed probe alone can no longer drop the link — `tunnelDelivering()` keeps it while
+`in=` is still climbing. Every drop and every `onStartCommand`/`stopTunnel`/`onDestroy`/
+`onRevoke` is now written to the diagnostics buffer, so a flap is unmistakable in the report.
+
+### 3. Corrupted status strings (fixed, `2ec0dba`)
+
+Five on-screen strings rendered as "Searching this network for a PeerNet host?" because an
+earlier edit was written in the shell's ANSI codepage, turning every `…` and `—` into U+FFFD.
+It compiles, lint is silent, and only a human reading the screen notices.
+`SourceEncodingTest` now fails the build on any U+FFFD in Kotlin sources.
+
+### Approach change: gates that run on Android, not just on the JVM
+
+Two of these three bugs are invisible to JVM unit tests, and one of my earlier "fixes" was
+based on reasoning that turned out to be false. So the workflow gained a `device` job
+(`reactivecircus/android-emulator-runner`, API **29** and **34**, `x86_64`) running real
+instrumentation tests, and every gate is validated by **reintroducing the bug and watching it
+fail** before being trusted:
+
+| Gate | Bug reintroduced | Result |
+| --- | --- | --- |
+| `capture_keeps_reading_across_idle_gaps` | reader `Err(_) => break` | **failed on API 29 and 34** — real gate |
+| `host_service_reaches_the_foreground_on_this_api_level` | `forSdk` from `Q` | **passed** — bug is not real (see §11) |
+
+Rule going forward: a gate that has never been seen to fail is not evidence.
+
+### Retest script (M7.9, CI run `32691790001` / `2ec0dba` or later)
+
+1. Uninstall on both phones, install the new APK.
+2. Host: SHARE. The card must show "Clients probed: 0" and no red line.
+3. Client: join `DIRECT-...` from Wi-Fi settings, open PeerNet, **leave mobile data ON**
+   (that is the configuration that used to fail).
+4. Expect the link within ~5 s and a VPN consent dialog. If not, the red line now says which
+   interface was tried.
+5. On any failure tap **SHARE DIAGNOSTICS** and send the whole report: it contains the probe
+   attempts with interfaces, every VPN lifecycle event, and every link drop with its reason.
 
