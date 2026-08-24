@@ -855,3 +855,68 @@ SharedPreferences or app-data clearing: persistent device identity survives ever
   ordinary network expect `AUTOCONNECT_IDLE` and **no** probes to the router's gateway.
 
 On any failure tap **SHARE DIAGNOSTICS** and send the whole report.
+
+---
+
+## 15. Build #108 regression: "tapping SHARE but not sharing" (run #110, `490cf8b`)
+
+Build #108's own fix for the stale `sharingActive` latch broke SHARE outright. Worth
+recording because the mistake was a category error, not a typo.
+
+### What I did wrong
+
+To clear the latch when a share ended without `stopSharing()`, I made
+`HostForegroundService` call `hostRuntime.stopSharing()` whenever its state collector saw
+`sawHosting && !hosting && !creating`. I treated "hosting ended" as a fact. It is not:
+
+1. **A successful group formation publishes it.** `groupListener.onSuccess()` sets
+   `pendingCreate = false` and then calls `refreshGroupInfo()`. `requestGroupInfo` can
+   return null for the brand-new group before the framework has registered it, and
+   `refreshGroupInfo()`'s null branch is `if (!pendingCreate) clearGroupState()` - which
+   publishes `hosting=false, creating=false` **while the group is fine**. #108 removed the
+   group on that signal, so SHARE created a group and immediately destroyed it.
+2. **`stopService()` is asynchronous.** A previous service instance's `onDestroy` can be
+   delivered after the user has started a new share, and #108 had `onDestroy` call
+   `stopSharing()` unconditionally - tearing down the new session.
+
+In #106 the same collector branch only called `stopForeground` + `stopSelf()`. That was
+harmless: the notification vanished but `HostRuntime` kept hosting, so the bug was invisible.
+Making the path destructive is what exposed it.
+
+### Fix
+
+`HostSessionPolicy` (new, pure, unit-tested). A service instance may release the sharing
+latch only if **all** of: it still belongs to the current session; no group is live or
+forming; and the user's hosting intent (`WifiDirectManager.hostingIntended`, newly exposed)
+is cleared. `HostRuntime.noteHostingEnded()` replaces the `stopSharing()` call and **returns
+whether hosting really ended**, so the service only stops itself when the runtime agrees.
+
+The stale-latch fix stays in `startSharing()` via `HostSessionPolicy.shouldStartFresh()`,
+which is where it belongs: evaluated against live group state at the moment of the tap, so it
+cannot fire spuriously the way a background signal can. The service call was always redundant.
+
+### Gate validation
+
+Bug reintroduced on throwaway branch `verify/host-session-gate`, run #111
+(`32742909395`): **Unit tests failed**.
+
+| Assertion | With bug restored |
+| --- | --- |
+| `transient no-group during formation must not end the share` | **failed** |
+| `a dying service instance cannot end a newer share` | **failed** |
+
+Branch deleted. Green run on `main`: #110 (`32742208703`).
+
+### Lesson for this codebase
+
+Wi-Fi Direct state from `WifiP2pManager` is **eventually** consistent. A single emission is
+never proof a session ended. Anything destructive must be driven by explicit user intent
+(`hostingRequested` / `sharingActive`) plus a session id, never by an observed state edge.
+Where a signal is genuinely ambiguous, prefer reconciling at the next user action over acting
+on a guess in the background.
+
+### Build numbering
+
+GitHub run numbers are authoritative from here on. Earlier notes used internal build numbers
+that drifted: the "#106 post-mortem" in section 14 shipped as run **#108**, and its
+gate-validation failure was run **#109**.
