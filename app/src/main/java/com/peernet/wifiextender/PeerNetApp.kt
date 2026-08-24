@@ -21,6 +21,13 @@ class PeerNetApp : Application() {
         if (BuildConfig.DEBUG) {
             Timber.plant(Timber.DebugTree())
         }
+        // Always planted, debug or not: this is the only log the tester can
+        // reach without adb.
+        Timber.plant(com.peernet.wifiextender.diag.Diagnostics.Tree())
+        com.peernet.wifiextender.diag.Diagnostics.note(
+            "app",
+            "started, Android ${android.os.Build.VERSION.SDK_INT} on ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}"
+        )
 
         recordCrashesForNextLaunch()
 

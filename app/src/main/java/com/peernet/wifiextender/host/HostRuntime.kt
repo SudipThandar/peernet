@@ -153,6 +153,20 @@ class HostRuntime @Inject constructor(
         get() = if (engineReady) null else (engineError ?: "tunnel engine did not start")
 
     /**
+     * Whether the link responder clients probe on 4434 is actually bound, and
+     * how many probes it has answered. A share with a dead responder is
+     * invisible otherwise: clients simply never link.
+     */
+    val linkServerListening: Boolean
+        get() = linkServer.listening
+
+    val linkServerFailure: String?
+        get() = linkServer.failure
+
+    val probesAnswered: Int
+        get() = linkServer.probesAnswered
+
+    /**
      * Starts the tunnel engine, retrying once through a stop: a leftover
      * server from an earlier share still owns the port and would make every
      * later share unusable (the engine refuses and clients get no pin).

@@ -5,8 +5,10 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.peernet.wifiextender.client.ClientLinkManager
+import com.peernet.wifiextender.diag.Diagnostics
 import com.peernet.wifiextender.discovery.DiscoveredHost
 import com.peernet.wifiextender.discovery.NsdClientDiscovery
+import com.peernet.wifiextender.wifi.LinkServer
 import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -34,7 +36,13 @@ data class ClientUiState(
     val status: String = "",
     val searching: Boolean = false,
     val connectedHost: DiscoveredHost? = null,
-    val savedHostIds: Set<String> = emptySet()
+    val savedHostIds: Set<String> = emptySet(),
+    /**
+     * Why linking has not happened yet, in plain language, refreshed on every
+     * attempt. Empty once linked. Silence here was the single biggest obstacle
+     * to diagnosing "it just doesn't connect".
+     */
+    val linkDiagnostic: String = ""
 )
 
 /**
@@ -55,6 +63,12 @@ class ClientViewModel @Inject constructor(
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private val busy = AtomicBoolean(false)
     private var livenessJob: Job? = null
+
+    /** Reason the most recent link probe failed, for the on-screen diagnostic. */
+    private var lastProbeFailure: String? = null
+
+    /** Counts auto-link attempts so the user can see the app is still trying. */
+    private var linkAttempts = 0
 
     private val _uiState = MutableStateFlow(ClientUiState())
     val uiState: StateFlow<ClientUiState> = _uiState.asStateFlow()
@@ -97,9 +111,31 @@ class ClientViewModel @Inject constructor(
                     @android.annotation.SuppressLint("MissingPermission")
                     wm.connectionInfo?.ssid?.removeSurrounding("\"")
                 }.getOrNull().orEmpty()
-                val candidate = gatewayCandidate() ?: continue
-                val verified = probeDetails(candidate) ?: continue
+                linkAttempts++
+                val networks = describeNetworks()
+                val candidate = gatewayCandidate()
+                if (candidate == null) {
+                    // Not on a usable IPv4 network yet. Say so, with what we
+                    // actually saw, instead of retrying invisibly forever.
+                    reportLinkDiagnostic(
+                        "Not on the host's network yet (try $linkAttempts). " +
+                            "Join the DIRECT-… Wi-Fi in settings. Seen: $networks"
+                    )
+                    continue
+                }
+                lastProbeFailure = null
+                val verified = probeDetails(candidate)
+                if (verified == null) {
+                    reportLinkDiagnostic(
+                        "On ${networks.ifBlank { "the network" }}, but " +
+                            "${candidate.address}:${candidate.port} " +
+                            (lastProbeFailure ?: "did not verify") +
+                            " (try $linkAttempts)"
+                    )
+                    continue
+                }
                 Timber.i("Host detected on joined network (ssid=%s, gw=%s)", ssid, candidate.address)
+                Diagnostics.note("link", "host verified at ${candidate.address} (ssid=$ssid)")
                 if (busy.compareAndSet(false, true)) {
                     try {
                         link(verified, viaP2p = true)
@@ -109,6 +145,31 @@ class ClientViewModel @Inject constructor(
                 }
             }
         }
+    }
+
+    /** Publishes a link-stage reason to the screen and to the shared report. */
+    private fun reportLinkDiagnostic(message: String) {
+        Diagnostics.note("link", message)
+        _uiState.update { it.copy(linkDiagnostic = message) }
+    }
+
+    /**
+     * Interfaces with an IPv4 address, as the system sees them. This is the
+     * evidence needed to tell "the phone never joined the group" apart from
+     * "joined, but the host is not answering".
+     */
+    private fun describeNetworks(): String {
+        val cm = appContext
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val parts = buildList {
+            for (network in runCatching { cm.allNetworks.toList() }.getOrDefault(emptyList())) {
+                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull() ?: continue
+                val v4 = lp.linkAddresses.firstOrNull { it.address is java.net.Inet4Address }
+                    ?: continue
+                add("${lp.interfaceName.orEmpty()}=${v4.address.hostAddress}/${v4.prefixLength}")
+            }
+        }
+        return if (parts.isEmpty()) "no IPv4 network" else parts.joinToString(", ")
     }
 
     /** Live TUN capture counter for the UI (0 when not capturing). */
@@ -278,8 +339,14 @@ class ClientViewModel @Inject constructor(
                     _uiState.update { it.copy(searching = false) }
                     link(target, viaP2p = true)
                 } else {
-                    // Stay quiet: the user can always tap CONNECT manually.
+                    // Used to go silent here ("the user can always tap
+                    // CONNECT"), which hid every real cause. Report the last
+                    // probe reason instead; the poll keeps retrying.
                     _uiState.update { it.copy(searching = false, status = "") }
+                    reportLinkDiagnostic(
+                        "Joined the PeerNet network but no host verified: " +
+                            (lastProbeFailure ?: "no host answered on port ${LinkServer.PORT}")
+                    )
                 }
             } finally {
                 wifiDirect.releaseMulticast()
@@ -370,10 +437,15 @@ class ClientViewModel @Inject constructor(
         saveProfile(host)
         linkManager.setLinked(host, currentWifiNetwork())
         val pinMissing = host.fingerprint.isNullOrBlank()
+        Diagnostics.note(
+            "link",
+            "linked to ${host.address}:${host.tunnelPort} pin=${if (pinMissing) "MISSING" else "yes"}"
+        )
         _uiState.update {
             it.copy(
                 connectedHost = host,
                 savedHostIds = loadSavedHostIds(),
+                linkDiagnostic = "",
                 status = when {
                     pinMissing ->
                         "Linked to ${host.name}, but the host's tunnel engine is not ready. " +
@@ -465,37 +537,77 @@ class ClientViewModel @Inject constructor(
      * tunnel port, which is the authoritative source: mDNS TXT records are
      * often stale (engine started after advertising) or dropped entirely,
      * and a client without the pin cannot open the tunnel at all.
+     *
+     * Every failure is recorded with its reason: a bare null here used to make
+     * "not on the host's network", "host app not running" and "host engine not
+     * ready" look identical on screen, which is precisely what made the
+     * no-internet reports impossible to act on.
      */
     private suspend fun probeDetails(host: DiscoveredHost): DiscoveredHost? =
+        when (val outcome = probeHost(host)) {
+            is ProbeOutcome.Verified -> outcome.host
+            is ProbeOutcome.Failed -> {
+                lastProbeFailure = outcome.reason
+                Diagnostics.note("probe", "${host.address}:${host.port} ${outcome.reason}")
+                null
+            }
+        }
+
+    private sealed interface ProbeOutcome {
+        data class Verified(val host: DiscoveredHost) : ProbeOutcome
+        data class Failed(val reason: String) : ProbeOutcome
+    }
+
+    private suspend fun probeHost(host: DiscoveredHost): ProbeOutcome =
         withContext(Dispatchers.IO) {
-            runCatching {
+            try {
                 Socket().use { s ->
                     s.soTimeout = 3_000
                     s.connect(InetSocketAddress(host.address, host.port), 3_000)
-                    val banner = s.getInputStream().bufferedReader().readLine() ?: ""
+                    val banner = s.getInputStream().bufferedReader().readLine()
                     Timber.d("Probe banner from %s: %s", host.address, banner)
+                    if (banner.isNullOrBlank()) {
+                        return@withContext ProbeOutcome.Failed(
+                            "connected but the host sent no banner"
+                        )
+                    }
                     if (!banner.startsWith(com.peernet.wifiextender.wifi.LinkServer.BANNER_PREFIX)) {
-                        return@runCatching null
+                        return@withContext ProbeOutcome.Failed(
+                            "answered with something else: ${banner.take(40)}"
+                        )
                     }
                     val parts = banner.trim().split(" ")
                     val bannerHid = parts.getOrNull(1)?.takeIf { it.isNotBlank() }
                     val bannerFp = parts.getOrNull(2)
                         ?.takeIf { it.length == 64 && it.all { c -> c.isDigit() || c in 'a'..'f' } }
                     val bannerPort = parts.getOrNull(3)?.toIntOrNull()
-                    host.copy(
-                        hostId = host.hostId ?: bannerHid,
-                        fingerprint = bannerFp ?: host.fingerprint,
-                        tunnelPort = bannerPort ?: host.tunnelPort,
-                        name = if (host.name == "PeerNet host" && bannerHid != null) {
-                            "PeerNet-${bannerHid.takeLast(4)}"
-                        } else {
-                            host.name
-                        }
+                    Diagnostics.note(
+                        "probe",
+                        "${host.address}:${host.port} banner ok, " +
+                            "pin=${if (bannerFp != null) "yes" else "MISSING"}, " +
+                            "tunnelPort=${bannerPort ?: host.tunnelPort}"
+                    )
+                    ProbeOutcome.Verified(
+                        host.copy(
+                            hostId = host.hostId ?: bannerHid,
+                            fingerprint = bannerFp ?: host.fingerprint,
+                            tunnelPort = bannerPort ?: host.tunnelPort,
+                            name = if (host.name == "PeerNet host" && bannerHid != null) {
+                                "PeerNet-${bannerHid.takeLast(4)}"
+                            } else {
+                                host.name
+                            }
+                        )
                     )
                 }
-            }.getOrElse {
-                Timber.d("Probe failed for %s: %s", host.address, it.message)
-                null
+            } catch (e: java.net.ConnectException) {
+                // Reachable address, nothing accepting: the host app is not
+                // sharing (or was killed).
+                ProbeOutcome.Failed("refused the connection — is SHARE on, on the host phone?")
+            } catch (e: java.net.SocketTimeoutException) {
+                ProbeOutcome.Failed("did not answer within 3s — wrong network, or the host app is asleep")
+            } catch (e: java.io.IOException) {
+                ProbeOutcome.Failed("unreachable (${e.javaClass.simpleName}: ${e.message.orEmpty().take(60)})")
             }
         }
 

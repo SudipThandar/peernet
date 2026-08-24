@@ -17,6 +17,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -354,6 +355,45 @@ fun HomeScreen(
             )
         }
 
+        // ---- Why linking has not happened (never stay silent) ----
+        if (client.linkDiagnostic.isNotBlank() && linkedHost == null && !isHosting) {
+            Text(
+                client.linkDiagnostic,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+
+        // ---- Diagnostics out of the app (the tester has no adb) ----
+        TextButton(onClick = {
+            val report = buildString {
+                appendLine("PeerNet diagnostics")
+                appendLine("device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.SDK_INT}")
+                appendLine("engine: ${home.engineVersion ?: "unknown"}")
+                appendLine("stats: ${engineStats.ifBlank { "(none)" }}")
+                appendLine("quicState=$quicState tunPackets=$tunPackets")
+                appendLine("hostState=${host.hostState} engineReady=${host.engineReady} engineFailure=${host.engineFailure ?: "-"}")
+                appendLine("linkedHost=${linkedHost?.address ?: "-"}:${linkedHost?.tunnelPort ?: 0}")
+                appendLine("tunnelStatus=${tunnelStatus.ifBlank { "-" }}")
+                appendLine("lastCrash=${lastCrash ?: "-"}")
+                appendLine("linkDiagnostic=${client.linkDiagnostic.ifBlank { "-" }}")
+                appendLine()
+                append(com.peernet.wifiextender.diag.Diagnostics.snapshot())
+            }
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(android.content.Intent.EXTRA_SUBJECT, "PeerNet diagnostics")
+                putExtra(android.content.Intent.EXTRA_TEXT, report)
+            }
+            runCatching {
+                context.startActivity(
+                    android.content.Intent.createChooser(send, "Share PeerNet diagnostics")
+                )
+            }
+        }) {
+            Text("SHARE DIAGNOSTICS", style = MaterialTheme.typography.labelSmall)
+        }
+
         // ---- Errors ----
         host.error?.let {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
@@ -368,6 +408,21 @@ fun HomeScreen(
                     InfoRow("Network", host.ssid ?: "—")
                     InfoRow("Password", host.passphrase ?: "unavailable — see Wi-Fi settings")
                     InfoRow("Address", host.groupOwnerAddress ?: "acquiring…")
+                    InfoRow(
+                        "Clients probed",
+                        "${host.probesAnswered}" +
+                            if (host.probesAnswered == 0) " — no client has reached this phone yet" else ""
+                    )
+                    if (!host.linkServerListening) {
+                        // Clients look for this responder to learn the pin; a
+                        // dead one means they never link, with no other symptom.
+                        Text(
+                            "Clients cannot reach this phone: ${host.linkServerFailure ?: "link responder down"}.\n" +
+                                "Tap STOP SHARING then SHARE again.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
                     if (!host.engineReady) {
                         // Without the engine there is no pin and no relay, so
                         // a client would join the network and get nothing.

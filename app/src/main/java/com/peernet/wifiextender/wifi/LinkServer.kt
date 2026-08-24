@@ -1,5 +1,6 @@
 package com.peernet.wifiextender.wifi
 
+import com.peernet.wifiextender.diag.Diagnostics
 import timber.log.Timber
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -30,9 +31,30 @@ class LinkServer(private val port: Int = PORT) {
     @Volatile
     private var serverSocket: ServerSocket? = null
 
+    @Volatile
+    private var bindError: String? = null
+
+    /** True once the socket is bound and accepting. */
+    val listening: Boolean
+        get() = running && serverSocket != null
+
+    /**
+     * Why the responder is not listening, or null. Without this a failed bind
+     * looked like a healthy host: the card said READY while every client got
+     * "connection refused" on 4434.
+     */
+    val failure: String?
+        get() = if (listening) null else (bindError ?: "link responder not started")
+
+    /** Probes answered so far — proof a client actually reached this host. */
+    @Volatile
+    var probesAnswered: Int = 0
+        private set
+
     fun start(hostId: String, details: () -> HostLinkDetails) {
         stop()
         running = true
+        bindError = null
         Thread {
             try {
                 val ss = ServerSocket()
@@ -40,6 +62,7 @@ class LinkServer(private val port: Int = PORT) {
                 ss.bind(InetSocketAddress(port))
                 serverSocket = ss
                 Timber.i("Link server listening on :%d", port)
+                Diagnostics.note("linkserver", "listening on :$port")
                 while (running) {
                     val client = try {
                         ss.accept()
@@ -49,7 +72,12 @@ class LinkServer(private val port: Int = PORT) {
                     handle(client, hostId, details)
                 }
             } catch (t: Throwable) {
-                if (running) Timber.w(t, "Link server stopped unexpectedly")
+                bindError = "port $port unavailable (${t.javaClass.simpleName})"
+                serverSocket = null
+                if (running) {
+                    Timber.w(t, "Link server stopped unexpectedly")
+                    Diagnostics.note("linkserver", "failed: $bindError")
+                }
             }
         }.apply {
             name = "peernet-link"
@@ -67,6 +95,11 @@ class LinkServer(private val port: Int = PORT) {
                     write("PN-LINK-2 $hostId $fp ${d.tunnelPort}\n".toByteArray())
                     flush()
                 }
+                probesAnswered++
+                Diagnostics.note(
+                    "linkserver",
+                    "answered ${client.inetAddress?.hostAddress} pin=${if (fp == "-") "MISSING" else "yes"}"
+                )
             }
             runCatching { client.close() }
         }.apply {
