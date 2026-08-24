@@ -25,7 +25,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+};
+
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
@@ -64,6 +67,13 @@ const TX_BUF: usize = 64 * 1024;
 /// Max bytes buffered for the phone across all flows before we stop
 /// draining the upstream channel for a while (backpressure).
 const PENDING_CAP: usize = 8 * RX_BUF;
+
+/// MTU of the phone-facing interface. This MUST match the MTU the VpnService
+/// builder sets (`PeerNetVpnService.MTU`): every packet this engine emits is
+/// written straight into that TUN, and the kernel rejects anything larger.
+/// It also fixes the MSS we advertise to the phone (MTU - 20 IP - 20 TCP).
+pub const TUN_MTU: usize = 1280;
+
 
 // ---------------------------------------------------------------------------
 // QueueDevice: smoltcp Device backed by plain packet queues.
@@ -128,11 +138,23 @@ impl Device for QueueDevice {
         // non_exhaustive: start from default and override.
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1500;
+        // Must equal the VpnService MTU; a larger value would let smoltcp
+        // build segments the TUN refuses to accept, stalling downloads.
+        caps.max_transmission_unit = TUN_MTU;
         caps.max_burst_size = None;
-        caps.checksum = Default::default(); // verify rx / emit tx checksums
+        // Compute checksums on transmit (the phone verifies them), but do not
+        // verify on receive. Packets arrive from the local kernel over a TUN,
+        // where corruption is not a real risk, and a checksum smoltcp dislikes
+        // would be dropped invisibly - every SYN lost with no way to see why.
+        let mut sums = ChecksumCapabilities::default();
+        sums.ipv4 = Checksum::Tx;
+        sums.tcp = Checksum::Tx;
+        sums.udp = Checksum::Tx;
+        sums.icmpv4 = Checksum::Tx;
+        caps.checksum = sums;
         caps
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +558,10 @@ mod tests {
         stack_handle: Option<std::thread::JoinHandle<()>>,
         bridge: Bridge,
         started: Instant,
+        /// Largest packet the engine handed to the TUN writer.
+        max_to_phone: usize,
     }
+
 
     impl Harness {
         fn new() -> Self {
@@ -607,8 +632,10 @@ mod tests {
                     handle: Some(bridge_thread),
                 },
                 started: Instant::now(),
+                max_to_phone: 0,
             }
         }
+
 
         fn add_phone_socket(&mut self) -> smoltcp::iface::SocketHandle {
             let sock = tcp::Socket::new(
@@ -647,8 +674,10 @@ mod tests {
             while Instant::now() < deadline {
                 // Stack -> phone packets.
                 while let Ok(p) = self.pkt_out_rx.try_recv() {
+                    self.max_to_phone = self.max_to_phone.max(p.len());
                     self.phone_dev.rx_queue.lock().unwrap().push_back(p);
                 }
+
                 let now = SmolInstant::from_millis(
                     self.started.elapsed().as_millis() as i64
                 );
@@ -705,6 +734,11 @@ mod tests {
         fn bytes_through_bridge(&self) -> usize {
             *self.bridge.bytes_up.lock().unwrap()
         }
+
+        fn largest_packet_to_phone(&self) -> usize {
+            self.max_to_phone
+        }
+
 
         fn shutdown(mut self) {
             // Dropping senders terminates the stack loop and the bridge.
@@ -791,8 +825,24 @@ mod tests {
         }
         assert_eq!(got.len(), payload.len(), "echo returned everything");
         assert_eq!(got, payload, "bulk payload intact");
+        // The whole point of matching the device MTU to the VpnService MTU:
+        // nothing we emit may exceed what the TUN accepts. Both bounds matter
+        // - the lower one proves this bulk run really produced full-size
+        // segments, so the upper bound is not passing vacuously.
+        assert!(
+            h.largest_packet_to_phone() > 1000,
+            "bulk transfer should emit full-size segments, saw {}",
+            h.largest_packet_to_phone()
+        );
+        assert!(
+            h.largest_packet_to_phone() <= TUN_MTU,
+            "emitted {}B, TUN only accepts {}B",
+            h.largest_packet_to_phone(),
+            TUN_MTU
+        );
         h.shutdown();
     }
+
 
     // -- deterministic, single-threaded diagnostics --------------------------
 

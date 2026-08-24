@@ -117,7 +117,12 @@ class ClientViewModel @Inject constructor(
     /** QUIC tunnel state: 0 disconnected, 1 connecting, 2 connected, 3 backoff. */
     fun tunnelState(): Int = rustCore.tunnelState()
 
-    /** Engine data-path counters, e.g. "tun=120 udp=44 tcp=9 in=3011 lost=0 cap=up". */
+    /**
+     * Engine data-path counters, e.g.
+     * "tun=120 udp=44 tcp=9 in=3011 lost=0 cap=up eng=up".
+     * `cap` is the TUN capture loop, `eng` the TCP terminator intake: with
+     * `eng=up` a stuck `tcp=0` means the phone sent no SYN, not a dead engine.
+     */
     fun engineStats(): String = rustCore.engineStats()
 
     /** Bytes/packets pushed toward the host (udp + tcp counters). */

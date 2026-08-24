@@ -150,6 +150,14 @@ static UNDELIVERED: AtomicU64 = AtomicU64::new(0);
 /// (50 ms per try) before giving up on a packet.
 const TUN_TX_WAIT_TRIES: usize = 40;
 
+/// Consecutive failed TUN writes tolerated before the writer gives up. One
+/// rejected packet is normal; a wall of them means the interface is gone.
+const WRITE_FAILURE_LIMIT: u32 = 16;
+
+/// Consecutive failed TUN reads tolerated before the capture ends, for the
+/// same reason.
+const READ_FAILURE_LIMIT: u32 = 16;
+
 /// Intake into the active session's TCP terminator engine. Present only
 /// while a tunnel owns an engine; teardown drops it, which lets the engine
 /// thread wind down.
@@ -563,7 +571,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
     _class: JClass<'local>,
 ) -> JString<'local> {
     let stats = format!(
-        "tun={} udp={} tcp={} in={} lost={} cap={}",
+        "tun={} udp={} tcp={} in={} lost={} cap={} eng={}",
         PACKETS.load(Ordering::Relaxed),
         UDP_FORWARDED.load(Ordering::Relaxed),
         TCP_TERMINATED.load(Ordering::Relaxed),
@@ -572,6 +580,9 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
         // The capture loop dying is invisible otherwise: counters simply stop
         // moving, which reads as "the phone sent nothing".
         if CAPTURE_ALIVE.load(Ordering::SeqCst) { "up" } else { "down" },
+        // Distinguishes "no TCP engine to feed" from "the phone sent no SYN"
+        // when tcp= stays 0.
+        if tcp_pkt_in().is_some() { "up" } else { "down" },
     );
     create_string(env, &stats)
 }
@@ -661,6 +672,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     // away (channel closed) or the capture session ends.
     let writer = tokio::spawn(async move {
         let mut async_fd = writer_fd;
+        let mut consecutive_failures = 0u32;
         loop {
             let pkt = tokio::select! {
                 p = rx.recv() => match p {
@@ -675,14 +687,21 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
                 }
             };
             let mut wrote = false;
+            let mut fd_dead = false;
             while !wrote {
                 let mut guard = match async_fd.writable_mut().await {
                     Ok(g) => g,
-                    Err(_) => break,
+                    Err(_) => {
+                        fd_dead = true;
+                        break;
+                    }
                 };
                 match guard.try_io(|inner| inner.get_mut().write(&pkt)) {
                     Ok(Ok(_)) => wrote = true,
                     Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // A single packet the TUN rejects (oversized, malformed)
+                    // must not end inbound delivery for the whole session:
+                    // drop it and keep serving the rest.
                     Ok(Err(_)) => break,
                     // Same trap as the reader: a full TUN queue arrives as
                     // Err(TryIoError) with readiness cleared. Retry after the
@@ -691,8 +710,16 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
                     Err(_) => continue,
                 }
             }
-            if !wrote {
-                break;
+            if wrote {
+                consecutive_failures = 0;
+            } else {
+                UNDELIVERED.fetch_add(1, Ordering::Relaxed);
+                consecutive_failures += 1;
+                // Only a genuinely dead fd (or relentless failure) ends the
+                // writer; that is what stop uses to wake and exit.
+                if fd_dead || consecutive_failures >= WRITE_FAILURE_LIMIT {
+                    break;
+                }
             }
         }
     });
@@ -701,6 +728,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     let mut async_fd = reader_fd;
     let mut buf = vec![0u8; mtu.max(1500)];
     let mut logged = 0u64;
+    let mut read_failures = 0u32;
     loop {
         if TUN_STOP.load(Ordering::SeqCst) {
             break;
@@ -713,6 +741,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
         match result {
             Ok(Ok(0)) => break, // EOF: interface closed
             Ok(Ok(n)) => {
+                read_failures = 0;
                 PACKETS.fetch_add(1, Ordering::Relaxed);
                 BYTES.fetch_add(n as u64, Ordering::Relaxed);
                 forward_outbound(&buf[..n]);
@@ -728,7 +757,15 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
             }
             // A signal-interrupted read is not a dead interface.
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Ok(Err(_)) => break,
+            // One rejected read must not end the session either; a persistent
+            // wall of them (closed fd) still exits.
+            Ok(Err(_)) => {
+                read_failures += 1;
+                if read_failures >= READ_FAILURE_LIMIT {
+                    break;
+                }
+                continue;
+            }
             // `try_io` intercepts WouldBlock itself: the closure's EAGAIN is
             // reported as Err(TryIoError) after clearing readiness, NOT as
             // Ok(Err(WouldBlock)). Treating it as fatal used to end the whole
