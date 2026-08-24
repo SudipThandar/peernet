@@ -687,3 +687,171 @@ Internet is **not** expected to work yet - this build is about lifecycle stabili
 
 On any failure tap **SHARE DIAGNOSTICS** and send the whole report; every tag above carries a
 session/generation id, so overlapping attempts can be told apart.
+
+---
+
+## 14. Build #106 client-link lifecycle post-mortem (M7.11, `599965a`)
+
+Build #106 established a working tunnel (the user opened YouTube through it) but five
+lifecycle defects made it unusable in practice. All five were found by reading the code
+paths; the client-side rules are now covered by **validated** JVM gates (table below).
+
+### 1. False `HOST_LOST` every ~25 s while the tunnel was working
+
+`startLiveness()` guarded the teardown with
+`p2pBacked = wifiDirect.state.value.joinedAsClient`. That flag is only set by Wi-Fi Direct
+**client callbacks**, which never fire when the user joins `DIRECT-...` by typing the
+passphrase in Android's Wi-Fi picker - the documented, intended flow. The device log shows
+exactly that: the group is on `wlan0` at `192.168.49.213/24`, no `p2p-` interface, so
+`joinedAsClient` was false and the guard meant to protect P2P links never applied to the
+commonest way of joining one.
+
+Two further errors compounded it: `tunnelDelivering()` compares the engine's `in=` counter
+against the previous sample, so an **idle** tunnel (user not loading anything) is
+indistinguishable from a dead one; and a single 3 s TCP-connect timeout to :4434 counted as
+a loss, which a power-saving host radio produces routinely.
+
+Fix: `LinkPolicy.shouldDropLink()`. The QUIC tunnel state is the authority - `CONNECTED` or
+data arriving keeps the link regardless of probes. The evidence that a session is Wi-Fi
+Direct is now the **host's address** (`192.168.49.x`), not a callback flag. The signal that
+genuinely ends a session is `hostNetworkPresent`: when the host stops sharing its group
+disappears and the client's route into that /24 goes with it, which no sleeping radio can
+fake. Direct sessions keep a bounded extra grace period (`DIRECT_MISS_FACTOR`) so a host
+that never returns cannot strand the UI in a permanent "connected" state.
+
+### 2. VPN, `tun0` and the Android VPN key outlived the session
+
+VPN start **and stop** lived in `HomeScreen.kt`:
+`LaunchedEffect(client.connectedHost?.hostId) { if (null) stopVpn() }`, over state read with
+`collectAsStateWithLifecycle()`. Both stop when the Activity stops. With the screen off or
+the app backgrounded, nothing observed the link clearing, so `stopVpn()` was never called:
+the tunnel, the TUN interface and the VPN key survived a host that had stopped sharing.
+(The Rust side was correct all along - `stopTunCapture` closes the fds via
+`close_capture_fds()` - it was simply never asked to.)
+
+Fix: `PeerNetVpnService` owns its own lifetime. It collects `ClientLinkManager.linkedHost`
+from `onCreate()` on its own scope and tears down when the link clears. Teardown is a single
+idempotent `teardown(reason)`. The UI keeps only the consent prompt, which genuinely needs
+an Activity.
+
+### 3. Auto-connect unreliable until app data was cleared
+
+`HostRuntime.sharingActive` was a latch, added in #106 to stop double-SHARE from recreating
+the group. If a share ended **without** `stopSharing()` - process killed, app swiped,
+service stopped by the system, group dropped by the platform - the flag stayed `true`, and
+every later SHARE returned early with `SHARE_ALREADY_ACTIVE`. The only escape was clearing
+app data. #106 introduced this trap.
+
+Fix, two layers, neither of which touches persistent identity: `startSharing()` now
+**reconciles** - if the flag is set but no group is live or forming, it logs
+`SHARE_STALE_STATE_RECOVERED`, resets session-scoped state and proceeds; and
+`HostForegroundService` tells the runtime when hosting ends for any reason
+(`HOST_GROUP_ENDED` from the state collector, plus `onDestroy`), so the flag is cleared at
+the source. Host id and saved credentials are untouched, so a client that joined once still
+auto-rejoins.
+
+### 4. Client internet stopped when the **host's** screen turned off
+
+Nothing in the app stops on screen-off: the foreground service stays foreground,
+`HostRuntime` is a `@Singleton` on an app-scoped `CoroutineScope`, `LinkServer` runs a daemon
+thread, and the QUIC engine lives in Rust. That leaves the radio. A Wi-Fi Direct group owner
+is an access point plus a router; with the screen off the driver enters power save, stops
+servicing the group promptly, and both the tunnel and the plain :4434 probes start timing out.
+
+Fix: a `WifiManager.WifiLock` in `WIFI_MODE_FULL_LOW_LATENCY` (API 29+) /
+`WIFI_MODE_FULL_HIGH_PERF`, held for the duration of a share. This is **not** a
+`PowerManager` wake lock: the CPU and screen still sleep normally, and the screen is never
+kept awake. `WAKE_LOCK` was already in the manifest. A failure to acquire is reported
+(`WIFI_LOCK_FAILED`) rather than left to look healthy.
+
+This one **cannot be proven in CI** - it needs the two phones. `HOST_SCREEN_OFF` /
+`HOST_SCREEN_ON` and a 15 s `LINKSERVER_ALIVE` tick were added so the shared report
+distinguishes "process frozen" (gap in ticks) from "radio asleep" (ticks continue while the
+client loses internet).
+
+### 5. The client probed the user's own router as if it were a host
+
+`gatewayCandidate()` returned `gateways.firstOrNull()`, so a phone on `AirFiber21` probed
+`192.168.31.1:4434` every few seconds forever. Fix: `LinkPolicy.rankGateways()` scores
+candidates and **rejects** the unqualified ones. Ordinary Wi-Fi is probed only with
+corroborating evidence - a remembered host at that exact address, a `DIRECT-` SSID, a `p2p-`
+interface, or an explicit CONNECT tap. With none of those the client stays idle and logs
+`AUTOCONNECT_IDLE` with what it saw. The VPN transport is excluded from candidate discovery,
+so the tunnel can never be mistaken for a route to the host.
+
+### Gate validation (rule from 12: a gate that has never failed is not evidence)
+
+All three bugs reintroduced on throwaway branch `verify/link-policy-gate`, run
+`32736848934`: **Unit tests failed, 10 assertions**, each naming its symptom.
+
+| Assertion | With bug restored |
+| --- | --- |
+| `ordinary router is never probed on its own` | **failed** |
+| `group owner outranks the router when both are present` | **failed** |
+| `explicit connect tap allows probing the current network` | **failed** |
+| `connected tunnel is never dropped over missed probes` | **failed** |
+| `idle tunnel with no inbound packets is not treated as dead` | **failed** |
+| `picker joined direct session survives probe loss without p2p callbacks` | **failed** |
+| `host network disappearing ends the session immediately` | **failed** |
+| `dead direct session is eventually dropped, not stranded forever` | **failed** |
+| `clearing the link also advances the generation` | **failed** |
+| `clearing drops the pinned network and the status text` | **failed** |
+
+The remaining 11 assertions guard behaviour the restored bugs did not change (e.g.
+`isWifiDirectAddress`, `keepReason`, generation advance on a real link). Branch deleted.
+Green run on `main`: `32735933171`.
+
+### Session identity
+
+`ClientLinkManager.setLinked()` now returns a **generation** and increments on every call
+**including clears**. Liveness jobs and VPN bring-up carry theirs and abandon themselves once
+it moves on, so a probe or handshake from a session the user ended cannot tear down - or
+resurrect - the session that replaced it. `PeerNetVpnService` also re-checks the generation
+after the QUIC handshake: installing a default-route TUN for a dead session takes the phone
+offline entirely.
+
+`CLIENT_CLEANUP_COMPLETED` is now gated on `ClientLinkManager.tunnelActive` going false, with
+a 5 s bound and a distinct `CLIENT_CLEANUP_INCOMPLETE`. #106 logged completion immediately,
+while `tun0` was still up - the report claimed a cleanup that had not happened.
+
+### Diagnostics tags added
+
+Host: `SHARE_SESSION_CREATED id=<id>`, `SHARE_STALE_STATE_RECOVERED`, `HOST_GROUP_ENDED`,
+`HOST_SCREEN_OFF`, `HOST_SCREEN_ON`, `LINKSERVER_ALIVE`, `LINKSERVER_STOPPED reason=<r>`,
+`WIFI_LOCK_ACQUIRED`, `WIFI_LOCK_FAILED`, `WIFI_LOCK_RELEASED`.
+
+Client: `P2P_NETWORK_SELECTED`, `LIVENESS_PROBE network=<n> interface=<i>`,
+`LIVENESS_PROBE_SUCCESS`, `LIVENESS_PROBE_TIMEOUT` (carries session, generation, miss count,
+destination, interface, `p2p=`, `directHost=`, `quic=`, `tun=`, `routed=`),
+`AUTOCONNECT_RESET`, `AUTOCONNECT_RETRY`, `AUTOCONNECT_IDLE`, `CLIENT_CLEANUP_INCOMPLETE`,
+`VPN_STOP_REQUESTED`, `TUN_CLOSED`, `VPN_SERVICE_STOPPED`. All client tags carry `s=<session>`
+and link tags carry `gen=<generation>`.
+
+### Deliberately NOT changed
+
+`LinkServer` is untouched - the #106 port-ownership fix and its `LINKSERVER_*` tags are
+preserved verbatim, and its validated gate still passes. Also unchanged: QUIC, UDP framing,
+the packet format, TUN setup, NAT, TCP relay, DNS, routing, encryption, the Windows client and
+all Rust networking. No liveness timeout or retry count was raised as a "fix" - the rules
+changed, not the numbers. No `PowerManager` wake lock and nothing keeps the screen awake. No
+SharedPreferences or app-data clearing: persistent device identity survives every path above.
+
+### Retest script (M7.11, run `32735933171` / `599965a` or later)
+
+* **A. Fresh connect.** Host SHARE; client joins `DIRECT-PeerNet-...` from Wi-Fi settings,
+  opens PeerNet. Expect a link and VPN consent, then `LINK_SUCCESS`.
+* **B. Host screen off.** With a client connected, turn the **host's** screen off for 60 s
+  while browsing on the client. Internet must keep working. The report must show
+  `HOST_SCREEN_OFF` followed by continuing `LINKSERVER_ALIVE` ticks, and **no** `HOST_LOST`.
+* **C. Host STOP.** Host taps STOP SHARING. On the client the VPN key must disappear from the
+  status bar. Expect `HOST_LOST ... host network gone`, `TUN_CLOSED`, `VPN_SERVICE_STOPPED`,
+  `CLIENT_CLEANUP_COMPLETED ... tun=closed`.
+* **D. STOP then SHARE again.** Must auto-connect with **no** clearing of app data. Any
+  `SHARE_ALREADY_ACTIVE` that blocks a share is a regression; `SHARE_STALE_STATE_RECOVERED`
+  is the recovery working.
+* **E. Three cycles.** Repeat SHARE / connect / STOP three times. Session ids must increment
+  and nothing may carry over.
+* **F. Network transition.** Client: `DIRECT-...` -> normal Wi-Fi -> `DIRECT-...`. On the
+  ordinary network expect `AUTOCONNECT_IDLE` and **no** probes to the router's gateway.
+
+On any failure tap **SHARE DIAGNOSTICS** and send the whole report.
