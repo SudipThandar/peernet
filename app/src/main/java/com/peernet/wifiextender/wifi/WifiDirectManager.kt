@@ -97,6 +97,18 @@ class WifiDirectManager @Inject constructor(
     @Volatile
     private var hostingRequested = false
 
+    /**
+     * The user's hosting intent, readable by the host service.
+     *
+     * While this is true a momentary "no group" reading must never be treated as
+     * the end of a session: `refreshGroupInfo()` publishes `hosting=false,
+     * creating=false` whenever `requestGroupInfo` transiently returns null, which
+     * happens right after a successful `createGroup` before the framework has
+     * registered the group.
+     */
+    val hostingIntended: Boolean
+        get() = hostingRequested
+
     /** Bounded re-removal attempts for a group that outlives STOP SHARE. */
     private var staleRemovals = 0
 

@@ -61,10 +61,20 @@ class HostForegroundService : Service() {
 
     private var receiverRegistered = false
 
+    /**
+     * The sharing session this service instance belongs to.
+     *
+     * `stopService()` is asynchronous, so this instance's `onDestroy` can be
+     * delivered *after* the user has started a new share. Without this stamp the
+     * dying instance tore down the new session.
+     */
+    private var session = -1
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        session = hostRuntime.currentSessionId()
         // Constraint: startForeground must happen within 5s of service creation.
         startAsForeground()
         registerScreenReceiver()
@@ -149,16 +159,23 @@ class HostForegroundService : Service() {
                     nm.notify(NOTIFICATION_ID, buildNotification(s.ssid))
                 }
                 if (sawHosting && !s.hosting && !s.creating && !reconciled) {
-                    reconciled = true
-                    // The group ended without anyone asking (platform tore it
-                    // down, Wi-Fi toggled, driver reset). Telling the runtime is
-                    // what keeps the next SHARE working: build #106 left
-                    // `sharingActive = true` here, so every later SHARE
-                    // short-circuited and only clearing app data recovered it.
-                    Diagnostics.note("host", "HOST_GROUP_ENDED (service reconciling share state)")
-                    runCatching { hostRuntime.stopSharing() }
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    // The group *appears* to have ended. This is NOT trusted:
+                    // `refreshGroupInfo()` publishes exactly this when
+                    // `requestGroupInfo` transiently returns null immediately
+                    // after a successful createGroup, while the group is fine.
+                    // Build #108 called `stopSharing()` here and killed live
+                    // shares - "tapping SHARE does nothing". The runtime checks
+                    // the user's hosting intent and only agrees when hosting has
+                    // really ended; until then this service keeps running.
+                    val ended = runCatching {
+                        hostRuntime.noteHostingEnded("group ended", session)
+                    }.getOrDefault(false)
+                    if (ended) {
+                        reconciled = true
+                        Diagnostics.note("host", "HOST_GROUP_ENDED (service stopping)")
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
                 }
             }
         }
@@ -194,11 +211,12 @@ class HostForegroundService : Service() {
             runCatching { unregisterReceiver(screenReceiver) }
             receiverRegistered = false
         }
-        // This service is what keeps hosting alive; if it is gone (killed by the
-        // system, swiped away, stopped), sharing has ended whether or not
-        // anyone said so. Leaving the runtime believing otherwise is what made
-        // the next SHARE do nothing.
-        runCatching { hostRuntime.stopSharing() }
+        // Non-destructive on purpose. This instance may be dying long after the
+        // user started a *new* share (stopService is asynchronous), so it reports
+        // its own session id and the runtime ignores it unless that session is
+        // still current and nothing is hosting. Build #108 called stopSharing()
+        // unconditionally here, which tore down brand-new shares.
+        runCatching { hostRuntime.noteHostingEnded("service destroyed", session) }
         scope.cancel()
         super.onDestroy()
     }

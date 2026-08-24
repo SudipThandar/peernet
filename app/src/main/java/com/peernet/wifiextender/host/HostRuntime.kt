@@ -140,6 +140,46 @@ class HostRuntime @Inject constructor(
         }
     }
 
+    /** Session id a foreground-service instance stamps itself with. */
+    fun currentSessionId(): Int = sessionId
+
+    /**
+     * Told by [HostForegroundService] that hosting appears to have ended.
+     *
+     * Deliberately **not** `stopSharing()`. "Hosting ended" is an unreliable
+     * signal - a transient null from `requestGroupInfo` right after a successful
+     * `createGroup`, or a stale `onDestroy` arriving after the user started a new
+     * share - and build #108 tore down live groups by trusting it.
+     * [HostSessionPolicy.shouldReleaseLatch] decides.
+     *
+     * @return true only if hosting really has ended, in which case the caller may
+     *         also stop itself. False means "ignore this signal, keep running".
+     */
+    fun noteHostingEnded(reason: String, serviceSession: Int): Boolean {
+        val s = wifiDirect.state.value
+        if (!HostSessionPolicy.shouldReleaseLatch(
+                sharingActive = sharingActive,
+                serviceSession = serviceSession,
+                currentSession = sessionId,
+                groupLive = s.hosting,
+                groupForming = s.creating,
+                hostingIntended = wifiDirect.hostingIntended
+            )
+        ) {
+            if (sharingActive) {
+                Diagnostics.note(
+                    "host",
+                    "HOSTING_END_IGNORED ($reason) session=$serviceSession current=$sessionId " +
+                        "group=${s.hosting} creating=${s.creating} intended=${wifiDirect.hostingIntended}"
+                )
+            }
+            return false
+        }
+        Diagnostics.note("host", "HOSTING_ENDED ($reason) id=$sessionId — releasing share state")
+        resetSessionState()
+        return true
+    }
+
     init {
         scope.launch {
             wifiDirect.state.collect { s ->
@@ -239,18 +279,18 @@ class HostRuntime @Inject constructor(
     fun startSharing() {
         val shortId = HostIdentity.shortId(context)
 
+        val s0 = wifiDirect.state.value
+        if (sharingActive && !HostSessionPolicy.shouldStartFresh(sharingActive, s0.hosting, s0.creating)) {
+            // A genuinely live share (group up or forming): a second tap must
+            // not remove and recreate the group, dropping connected clients.
+            Diagnostics.note("host", "SHARE_ALREADY_ACTIVE (ignored, group is live)")
+            return
+        }
         if (sharingActive) {
-            // Distinguish a genuinely live share from a stale latch. If nothing
-            // is actually hosting, this flag is left over from a session that
-            // ended without stopSharing() - the group died on its own, or the
-            // foreground service stopped itself - and honouring it made SHARE
-            // permanently dead until the process restarted. That is precisely
-            // the "I had to clear app data" symptom.
-            val s = wifiDirect.state.value
-            if (s.hosting || s.creating) {
-                Diagnostics.note("host", "SHARE_ALREADY_ACTIVE (ignored, group is live)")
-                return
-            }
+            // Latch set but nothing hosting: left over from a session that ended
+            // without stopSharing() (process killed, app swiped, platform
+            // dropped the group). Honouring it made SHARE permanently dead until
+            // app data was cleared - the "I had to clear app data" symptom.
             Diagnostics.note(
                 "host",
                 "SHARE_STALE_STATE_RECOVERED (sharingActive with no group) - restarting cleanly"
