@@ -46,7 +46,7 @@ data class ClientUiState(
 )
 
 /**
- * Client logic � discovery runs when the user taps CONNECT and automatically
+ * Client logic — discovery runs when the user taps CONNECT and automatically
  * whenever this device joins a Wi-Fi Direct network (reconnect case): once a
  * known host's network is joined, linking happens without further taps.
  */
@@ -222,7 +222,7 @@ class ClientViewModel @Inject constructor(
     /**
      * CONNECT button. Priority order:
      *  1. Learn the host id via mDNS, then JOIN its Wi-Fi Direct network with
-     *     the stable credentials (API 33+) � the phone actually associates
+     *     the stable credentials (API 33+) — the phone actually associates
      *     with DIRECT-PeerNet-xxxx, visible in Wi-Fi settings.
      *  2. Otherwise find a peer advertising a PeerNet name and invite it.
      *  3. Last resort: link over whatever network the phone is on right now
@@ -232,7 +232,7 @@ class ClientViewModel @Inject constructor(
     fun connectNow() {
         if (!busy.compareAndSet(false, true)) return
         _uiState.update {
-            it.copy(searching = true, status = "Searching this network for a PeerNet host�")
+            it.copy(searching = true, status = "Searching this network for a PeerNet host…")
         }
         viewModelScope.launch(Dispatchers.Default) {
             var joined = false
@@ -245,21 +245,21 @@ class ClientViewModel @Inject constructor(
                         passphrase = "pn-$hid"
                     )
                 ) {
-                    _uiState.update { it.copy(status = "Joining the PeerNet network�") }
+                    _uiState.update { it.copy(status = "Joining the PeerNet network…") }
                     joined = awaitJoined(JOIN_WAIT_MS)
                 }
 
                 if (!joined) {
                     val peer = findPeerNetPeer()
                     if (peer != null) {
-                        _uiState.update { it.copy(status = "Joining ${peer.deviceName}�") }
+                        _uiState.update { it.copy(status = "Joining ${peer.deviceName}…") }
                         wifiDirect.connectToPeer(peer.deviceAddress)
                         joined = awaitJoined(JOIN_WAIT_MS)
                     }
                 }
 
                 if (joined) {
-                    _uiState.update { it.copy(status = "PeerNet network joined � establishing link�") }
+                    _uiState.update { it.copy(status = "PeerNet network joined — establishing link…") }
                     val target = findVerifiedHost(rounds = AUTO_ROUNDS)
                     if (target != null) {
                         _uiState.update { it.copy(searching = false) }
@@ -332,7 +332,7 @@ class ClientViewModel @Inject constructor(
             try {
                 wifiDirect.acquireMulticast()
                 _uiState.update {
-                    it.copy(searching = true, status = "PeerNet network detected � looking for host�")
+                    it.copy(searching = true, status = "PeerNet network detected — looking for host…")
                 }
                 val target = findVerifiedHost(rounds = AUTO_ROUNDS)
                 if (target != null) {
@@ -466,7 +466,7 @@ class ClientViewModel @Inject constructor(
      * (name starts with "p2p"); falls back to any plain Wi-Fi transport.
      * Critical because Android routes app traffic over the DEFAULT network,
      * and a "connected without internet" P2P Wi-Fi loses that role to
-     * cellular � where the host's private address is unreachable.
+     * cellular — where the host's private address is unreachable.
      */
     @SuppressLint("MissingPermission")
     private fun currentWifiNetwork(): android.net.Network? {
@@ -498,7 +498,12 @@ class ClientViewModel @Inject constructor(
                 delay(LIVENESS_INTERVAL_MS)
                 misses = if (probe(host)) 0 else misses + 1
                 val p2pBacked = wifiDirect.state.value.joinedAsClient
-                if (misses >= LIVENESS_MISSES && !p2pBacked) {
+                if (misses >= LIVENESS_MISSES && !p2pBacked && !tunnelDelivering()) {
+                    Diagnostics.note(
+                        "liveness",
+                        "dropping link after $misses missed probes " +
+                            "(${lastProbeFailure ?: "no reason recorded"})"
+                    )
                     clearLink("Host disconnected.")
                     break
                 }
@@ -506,7 +511,26 @@ class ClientViewModel @Inject constructor(
         }
     }
 
+    /**
+     * True while replies are still arriving through the tunnel.
+     *
+     * A missed probe alone must never tear the link down: the probe is a plain
+     * TCP connection that can fail for routing reasons while the QUIC tunnel
+     * keeps delivering. Tearing down here restarted the VPN, which reset the
+     * engine counters and re-ran auto-link — a flap loop that looks exactly
+     * like "connects, then no internet".
+     */
+    private var lastInboundSeen = 0L
+
+    private fun tunnelDelivering(): Boolean {
+        val now = inboundCount()
+        val progressed = now > lastInboundSeen
+        lastInboundSeen = now
+        return progressed
+    }
+
     private fun clearLink(message: String) {
+        Diagnostics.note("link", "cleared: $message")
         livenessJob?.cancel()
         livenessJob = null
         linkManager.setLinked(null)
@@ -532,6 +556,37 @@ class ClientViewModel @Inject constructor(
     private suspend fun probe(host: DiscoveredHost): Boolean = probeDetails(host) != null
 
     /**
+     * The network every host-facing socket must ride on.
+     *
+     * Android routes an unbound socket over the DEFAULT network. A Wi-Fi Direct
+     * group is marked "no internet", so on any phone with mobile data the
+     * default is cellular — where the host's 192.168.49.x address does not
+     * exist. An unbound probe therefore times out even though the host is one
+     * hop away, which is exactly how "it stopped connecting automatically"
+     * looks from the outside. `PeerNetVpnService` binds the whole process once
+     * the tunnel is up, but discovery and auto-link run BEFORE that, so every
+     * probe has to pin its own socket.
+     */
+    private fun probeNetwork(): android.net.Network? =
+        linkManager.linkedNetwork.value ?: currentWifiNetwork()
+
+    /** A socket pinned to [probeNetwork], or an unbound one if there is none. */
+    private fun openProbeSocket(): Socket {
+        val net = probeNetwork() ?: return Socket()
+        return runCatching { net.socketFactory.createSocket() }.getOrNull() ?: Socket()
+    }
+
+    /** Interface name behind a network, for diagnostics ("p2p-p2p0-6", "wlan0"). */
+    @SuppressLint("MissingPermission")
+    private fun networkLabel(net: android.net.Network?): String {
+        if (net == null) return "the default network"
+        val cm = appContext
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val name = runCatching { cm.getLinkProperties(net)?.interfaceName }.getOrNull()
+        return name ?: net.toString()
+    }
+
+    /**
      * Verifies a host and returns it enriched with whatever the banner
      * reports. `PN-LINK-2` carries the QUIC certificate fingerprint and
      * tunnel port, which is the authoritative source: mDNS TXT records are
@@ -547,8 +602,9 @@ class ClientViewModel @Inject constructor(
         when (val outcome = probeHost(host)) {
             is ProbeOutcome.Verified -> outcome.host
             is ProbeOutcome.Failed -> {
-                lastProbeFailure = outcome.reason
-                Diagnostics.note("probe", "${host.address}:${host.port} ${outcome.reason}")
+                val via = networkLabel(probeNetwork())
+                lastProbeFailure = "${outcome.reason} (tried over $via)"
+                Diagnostics.note("probe", "${host.address}:${host.port} ${outcome.reason} via $via")
                 null
             }
         }
@@ -561,7 +617,7 @@ class ClientViewModel @Inject constructor(
     private suspend fun probeHost(host: DiscoveredHost): ProbeOutcome =
         withContext(Dispatchers.IO) {
             try {
-                Socket().use { s ->
+                openProbeSocket().use { s ->
                     s.soTimeout = 3_000
                     s.connect(InetSocketAddress(host.address, host.port), 3_000)
                     val banner = s.getInputStream().bufferedReader().readLine()

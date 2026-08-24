@@ -11,6 +11,7 @@ import com.peernet.wifiextender.MainActivity
 import com.peernet.wifiextender.PeerNetApp
 import com.peernet.wifiextender.R
 import com.peernet.wifiextender.core.RustCoreBridge
+import com.peernet.wifiextender.diag.Diagnostics
 import dagger.hilt.android.AndroidEntryPoint
 import timber.log.Timber
 import javax.inject.Inject
@@ -45,6 +46,10 @@ class PeerNetVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Diagnostics.note(
+            "vpn",
+            "onStartCommand action=${intent?.action ?: "start"} startId=$startId capturing=${tunFd != -1}"
+        )
         when (intent?.action) {
             ACTION_STOP -> {
                 stopTunnel()
@@ -152,11 +157,13 @@ class PeerNetVpnService : VpnService() {
 
         pinSocketsToUnderlying()
         linkManager.setTunnelStatus("Tunnel active")
+        Diagnostics.note("vpn", "TUN capture started (fd=$fd mtu=$MTU)")
         Timber.i("TUN capture started (fd=%d mtu=%d)", fd, MTU)
     }
 
     /** Reports why the tunnel is not up and leaves the phone as it was. */
     private fun fail(reason: String) {
+        Diagnostics.note("vpn", "bring-up failed: $reason")
         Timber.w("VPN bring-up failed: %s", reason)
         linkManager.setTunnelStatus(reason)
         runCatching { rustCore.stopTunnel() }
@@ -245,6 +252,7 @@ class PeerNetVpnService : VpnService() {
     }
 
     private fun stopTunnel() {
+        Diagnostics.note("vpn", "stopTunnel (tunnel torn down)")
         bringUp?.interrupt()
         bringUp = null
         rustCore.stopTunnel()
@@ -258,12 +266,14 @@ class PeerNetVpnService : VpnService() {
 
     override fun onRevoke() {
         // User revoked VPN permission from system settings.
+        Diagnostics.note("vpn", "permission revoked by the user or another VPN app")
         Timber.i("VPN permission revoked by user")
         stopTunnel()
         super.onRevoke()
     }
 
     override fun onDestroy() {
+        Diagnostics.note("vpn", "service destroyed")
         rustCore.stopTunnel()
         rustCore.stopTunCapture()
         tunFd = -1
