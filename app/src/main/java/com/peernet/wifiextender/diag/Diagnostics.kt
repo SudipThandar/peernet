@@ -16,51 +16,19 @@ object Diagnostics {
 
     private const val CAP = 400
 
-    private val lock = Any()
-    private val lines = ArrayDeque<String>()
-    private val startedAt = System.currentTimeMillis()
-
-    /** Last recorded stage, to collapse the 4-second poll into one line. */
-    private var lastKey: String? = null
-    private var lastRepeats = 0
+    private val log = DiagLog(CAP)
 
     /**
      * Records one stage outcome. Repeats of the same [stage]+[detail] collapse
-     * into "(xN)" so a polling loop cannot flood the report.
+     * into one line spanning first and last occurrence, so a polling loop cannot
+     * flood the report *and* a gap in that loop stays visible.
      */
-    fun note(stage: String, detail: String) {
-        val key = "$stage|$detail"
-        synchronized(lock) {
-            if (key == lastKey && lines.isNotEmpty()) {
-                lastRepeats++
-                lines.removeLast()
-                lines.addLast("${stamp()} $stage: $detail (x${lastRepeats + 1})")
-                return
-            }
-            lastKey = key
-            lastRepeats = 0
-            lines.addLast("${stamp()} $stage: $detail")
-            while (lines.size > CAP) lines.removeFirst()
-        }
-    }
+    fun note(stage: String, detail: String) = log.note(stage, detail)
 
     /** The full report, oldest first. */
-    fun snapshot(): String = synchronized(lock) {
-        if (lines.isEmpty()) "(no diagnostics recorded yet)" else lines.joinToString("\n")
-    }
+    fun snapshot(): String = log.snapshot()
 
-    fun clear() {
-        synchronized(lock) {
-            lines.clear()
-            lastKey = null
-            lastRepeats = 0
-        }
-    }
-
-    private fun stamp(): String {
-        val ms = System.currentTimeMillis() - startedAt
-        return "+%d.%03ds".format(ms / 1000, ms % 1000)
-    }
+    fun clear() = log.clear()
 
     /**
      * Feeds Timber warnings and errors into the same buffer, so a failure that
