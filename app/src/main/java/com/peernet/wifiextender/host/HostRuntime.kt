@@ -416,6 +416,20 @@ class HostRuntime @Inject constructor(
     }
 
     /**
+     * True while the user's request to share is still standing — set by
+     * [startSharing], cleared by [stopSharing] and by [resetSessionState].
+     *
+     * This is the **intent**, as opposed to `WifiDirectManager.state`, which is an
+     * **observation** of the platform. The two disagree whenever the platform
+     * transiently reports no group during a healthy share, so the screen needs
+     * both: see `HostStatePolicy`, which exists because deriving the UI from the
+     * observation alone rendered IDLE during a blip and invited the re-tap that
+     * churned the group and the :4434 responder.
+     */
+    val sharingIntended: Boolean
+        get() = sharingActive
+
+    /**
      * True once the QUIC engine holds the tunnel port and has a certificate
      * to pin. Clients cannot tunnel without it, so the UI shows this state
      * instead of letting a share look healthy while it is useless.

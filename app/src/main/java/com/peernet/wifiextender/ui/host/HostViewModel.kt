@@ -57,23 +57,35 @@ class HostViewModel @Inject constructor(
             }
         }
     ) { s, _ ->
-        when {
-            s.error != null -> HostUiState(hostState = HostState.ERROR, error = s.error)
-            s.creating -> HostUiState(hostState = HostState.CREATING_GROUP)
-            s.hosting && s.ssid != null -> HostUiState(
-                hostState = HostState.READY,
-                ssid = s.ssid,
-                passphrase = s.passphrase,
-                passphraseAvailable = s.passphraseAvailable,
-                groupOwnerAddress = s.groupOwnerAddress,
-                engineReady = hostRuntime.engineReady,
-                engineFailure = hostRuntime.engineFailure,
-                linkServerListening = hostRuntime.linkServerListening,
-                linkServerFailure = hostRuntime.linkServerFailure,
-                probesAnswered = hostRuntime.probesAnswered
-            )
-            else -> HostUiState(hostState = HostState.IDLE)
-        }
+        // Intent (`sharingIntended`) and observation (`s`) are different things,
+        // and they disagree whenever the platform transiently reports no group
+        // during a healthy share. Deriving this from `s` alone rendered IDLE on
+        // such a blip, which flipped the button back to SHARE and invited the
+        // re-tap that recreated the group and closed :4434 — the actual cause of
+        // the client's "connection refused". HostStatePolicy owns the decision.
+        val groupLive = s.hosting && s.ssid != null
+        val hostState = HostStatePolicy.evaluate(
+            sharingIntended = hostRuntime.sharingIntended,
+            groupLive = groupLive,
+            error = s.error
+        )
+        HostUiState(
+            hostState = hostState,
+            ssid = s.ssid,
+            passphrase = s.passphrase,
+            passphraseAvailable = s.passphraseAvailable,
+            groupOwnerAddress = s.groupOwnerAddress,
+            // Surfaced only when we are actually calling this an error. A live
+            // group outranks a stale error left by an earlier attempt that later
+            // succeeded through the staged credential fallback, and showing both
+            // "Sharing internet" and an error message at once is a contradiction.
+            error = if (hostState == HostState.ERROR) s.error else null,
+            engineReady = hostRuntime.engineReady,
+            engineFailure = hostRuntime.engineFailure,
+            linkServerListening = hostRuntime.linkServerListening,
+            linkServerFailure = hostRuntime.linkServerFailure,
+            probesAnswered = hostRuntime.probesAnswered
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HostUiState())
 
     fun onScreenShown() {
