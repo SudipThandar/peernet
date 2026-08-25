@@ -107,4 +107,34 @@ class GroupCredentialsPolicyTest {
         assertNull(GroupCredentialsPolicy.rejection("12345678"))
         assertNotNull(GroupCredentialsPolicy.rejection("1234567"))
     }
+
+    // ---- an empty field must never mean "reset" ----
+
+    @Test
+    fun `an empty password is rejected rather than treated as a reset`() {
+        // Storage used to accept blank as "clear the stored value", so clearing
+        // the box and pressing Done reported Saved while silently moving the
+        // group onto a different, derived password.
+        val why = GroupCredentialsPolicy.rejection("")
+        assertNotNull("an empty field is a mistake, not an instruction", why)
+        assertTrue("it must state the length requirement", why!!.contains("8"))
+    }
+
+    @Test
+    fun `a password of only spaces is rejected`() {
+        // Eight spaces is long enough for WPA2 and passes a naive length check,
+        // but cannot be read off a screen or typed back with any confidence.
+        assertNotNull(GroupCredentialsPolicy.rejection("        "))
+        assertNotNull(GroupCredentialsPolicy.rejection("\t\t\t\t\t\t\t\t"))
+    }
+
+    @Test
+    fun `a password cannot start or end with a space`() {
+        // Invisible in the other phone's Wi-Fi prompt, so it could only ever be
+        // typed wrongly. Rejected instead of trimmed: storing something other
+        // than what is displayed is how the two stop matching.
+        assertNotNull(GroupCredentialsPolicy.rejection(" password1"))
+        assertNotNull(GroupCredentialsPolicy.rejection("password1 "))
+        assertNull("interior spaces are legitimate", GroupCredentialsPolicy.rejection("pass word1"))
+    }
 }

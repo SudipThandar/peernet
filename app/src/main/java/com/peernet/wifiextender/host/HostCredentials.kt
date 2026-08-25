@@ -43,16 +43,20 @@ object HostCredentials {
     }
 
     /**
-     * Stores a user-chosen passphrase, or clears it back to the derived default
-     * when [value] is blank.
+     * Stores a user-chosen passphrase. Returns the rejection reason, or null on
+     * success.
      *
-     * Returns the rejection reason, or null on success.
+     * Every rule lives in [GroupCredentialsPolicy.rejection] and this method adds
+     * no branch of its own, so the rules stay unit-testable: anything decided
+     * here would need a `Context` and could not be covered.
+     *
+     * In particular a blank value is **rejected, not treated as a reset**. It
+     * used to clear the stored passphrase and return success, so clearing the
+     * field and pressing Done reported "Saved" while silently switching the group
+     * to a completely different (derived) password - the exact class of surprise
+     * this feature exists to remove.
      */
     fun setPassphrase(context: Context, value: String): String? {
-        if (value.isBlank()) {
-            prefs(context).edit().remove(KEY_PASSPHRASE).apply()
-            return null
-        }
         GroupCredentialsPolicy.rejection(value)?.let { return it }
         prefs(context).edit().putString(KEY_PASSPHRASE, value).apply()
         return null

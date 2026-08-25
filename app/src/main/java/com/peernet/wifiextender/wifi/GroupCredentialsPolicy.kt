@@ -74,12 +74,26 @@ object GroupCredentialsPolicy {
      * The framework's own failure for a bad passphrase is an opaque integer
      * delivered asynchronously, long after the screen has moved on, so the
      * passphrase is checked before it is ever handed over.
+     *
+     * The order of these checks is deliberate: an empty field reports the length
+     * requirement, which is the useful thing to say to someone who has just
+     * cleared the box, rather than "cannot be only spaces".
      */
     fun rejection(passphrase: String): String? = when {
         passphrase.length < MIN_LENGTH ->
             "Password must be at least $MIN_LENGTH characters (Wi-Fi requirement)."
         passphrase.length > MAX_LENGTH ->
             "Password must be at most $MAX_LENGTH characters."
+        // Long enough to satisfy WPA2 yet impossible to read off a screen or
+        // type back with any confidence.
+        passphrase.isBlank() ->
+            "Password cannot be only spaces."
+        // A space at either end is legal WPA2 and completely invisible in the
+        // other phone's Wi-Fi prompt, so it can only ever be typed wrongly.
+        // Rejected rather than trimmed: silently storing something other than
+        // what was typed is how a password stops matching what is displayed.
+        passphrase.first().isWhitespace() || passphrase.last().isWhitespace() ->
+            "Password cannot start or end with a space."
         passphrase.any { it.code < 0x20 || it.code > 0x7E } ->
             "Password can only use ordinary keyboard characters."
         else -> null

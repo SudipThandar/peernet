@@ -40,6 +40,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.peernet.wifiextender.host.HostCredentials
 import com.peernet.wifiextender.power.DozeExemption
 import com.peernet.wifiextender.power.DozeExemptionPolicy
+import com.peernet.wifiextender.wifi.GroupCredentialsPolicy
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.peernet.wifiextender.ui.host.HostState
@@ -465,28 +466,43 @@ fun HomeScreen(
                     if (effective.isNullOrEmpty()) {
                         InfoRow("Password", "unavailable — see Wi-Fi settings")
                     } else {
+                        val shown = passwordDraft ?: effective
+                        val changed = shown != effective
+                        // Validated on every keystroke, not only on Done, so the
+                        // reason a short password will not save is on screen
+                        // *while* it is too short instead of after the attempt.
+                        val liveRejection =
+                            if (changed) GroupCredentialsPolicy.rejection(shown) else null
+                        val canSave = changed && liveRejection == null
                         OutlinedTextField(
-                            value = passwordDraft ?: effective,
+                            value = shown,
                             onValueChange = {
                                 passwordDraft = it
+                                passwordError = null
                                 passwordNotice = null
                             },
                             label = { Text("Password") },
                             singleLine = true,
-                            isError = passwordError != null,
+                            isError = liveRejection != null || passwordError != null,
                             supportingText = {
-                                val msg = passwordError ?: passwordNotice
+                                val error = passwordError ?: liveRejection
+                                val msg = error ?: passwordNotice
                                 if (msg != null) {
                                     Text(
                                         msg,
-                                        color = if (passwordError != null) {
+                                        color = if (error != null) {
                                             MaterialTheme.colorScheme.error
                                         } else {
                                             Color(0xFF2E7D32)
                                         }
                                     )
+                                } else if (canSave) {
+                                    Text("Press Done to save this password")
                                 } else {
-                                    Text("Type a new password and press Done to change it")
+                                    Text(
+                                        "At least ${GroupCredentialsPolicy.MIN_LENGTH} characters. " +
+                                            "Type a new password and press Done to change it."
+                                    )
                                 }
                             },
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
@@ -495,21 +511,38 @@ fun HomeScreen(
                             // passwords, and a separate button is not wanted here.
                             keyboardActions = KeyboardActions(
                                 onDone = {
-                                    val typed = (passwordDraft ?: effective).trim()
-                                    if (typed == effective) {
-                                        passwordError = null
-                                        passwordNotice = null
-                                    } else {
-                                        val rejected = HostCredentials.setPassphrase(context, typed)
-                                        passwordError = rejected
-                                        passwordNotice = if (rejected == null) {
-                                            "Saved. Tap STOP SHARING then SHARE to apply it, " +
-                                                "then reconnect the other phone with the new password."
-                                        } else {
-                                            null
+                                    when {
+                                        // Nothing typed: keep the keyboard closed
+                                        // and say nothing. Reporting "saved" for a
+                                        // no-op is how the old version claimed to
+                                        // have changed a password it had not.
+                                        !changed -> {
+                                            passwordError = null
+                                            passwordNotice = null
+                                            keyboard?.hide()
+                                        }
+                                        // Too short / only spaces / unusable: the
+                                        // stored password is left exactly as it
+                                        // was, and the keyboard stays up so the
+                                        // user can finish typing.
+                                        liveRejection != null -> {
+                                            passwordError = liveRejection
+                                            passwordNotice = null
+                                        }
+                                        else -> {
+                                            val rejected =
+                                                HostCredentials.setPassphrase(context, shown)
+                                            passwordError = rejected
+                                            passwordNotice = if (rejected == null) {
+                                                "Saved. Tap STOP SHARING then SHARE to apply it, " +
+                                                    "then reconnect the other phone with the " +
+                                                    "new password."
+                                            } else {
+                                                null
+                                            }
+                                            if (rejected == null) keyboard?.hide()
                                         }
                                     }
-                                    keyboard?.hide()
                                 }
                             ),
                             modifier = Modifier.fillMaxWidth()
