@@ -63,6 +63,154 @@ class PeerNetVpnService : VpnService() {
         watchLink()
     }
 
+    // ---------- Service-owned supervision ----------
+    //
+    // The tunnel must not outlive its underlying network. Watching for that in
+    // the UI layer was the defect: `ClientViewModel`'s liveness loop runs in
+    // `viewModelScope`, which is cancelled with the Activity, so with the screen
+    // off or the app swiped away nothing cleared the link. The VPN key and the
+    // "internet is arriving through the host" notification then stayed up for
+    // ever, and the default-route TUN kept swallowing traffic - the reported
+    // "disconnected Wi-Fi but the VPN icon is still there, and no internet".
+    //
+    // A ConnectivityManager callback is the authoritative, event-driven signal:
+    // it needs no polling, cannot be produced by a sleeping radio, and does not
+    // "default to still connected" the way a failed probe has to.
+
+    @Volatile private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
+    private fun connectivityManager(): android.net.ConnectivityManager? =
+        getSystemService(android.net.ConnectivityManager::class.java)
+
+    private fun watchUnderlyingNetwork() {
+        if (networkCallback != null) return
+        val cm = connectivityManager() ?: return
+        val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onLost(network: android.net.Network) {
+                val lost = network.toString()
+                val mine = underlying?.toString()
+                if (!TunnelSupervisorPolicy.shouldTeardownOnLoss(lost, mine, tunFd != -1)) {
+                    return
+                }
+                Diagnostics.note(
+                    "vpn",
+                    "UNDERLYING_NETWORK_LOST net=$lost — ending the tunnel so the " +
+                        "VPN route cannot outlive its link"
+                )
+                Timber.i("underlying network %s lost; tearing down", lost)
+                // Clear the link too: the UI (and any later auto-connect) must
+                // not keep reporting a session that no longer has a network.
+                // teardown() alone would leave `linkedHost` set.
+                linkManager.setLinked(null)
+                stopTunnel("underlying network lost")
+            }
+        }
+        // clearCapabilities() matters: a Wi-Fi Direct network has no
+        // NET_CAPABILITY_INTERNET, so a default NetworkRequest would never match
+        // it and the loss we care about most would never be delivered.
+        val request = android.net.NetworkRequest.Builder()
+            .clearCapabilities()
+            .build()
+        runCatching { cm.registerNetworkCallback(request, callback) }
+            .onSuccess {
+                networkCallback = callback
+                Diagnostics.note("vpn", "NETWORK_WATCH_STARTED")
+            }
+            .onFailure {
+                Timber.w(it, "registerNetworkCallback failed")
+                Diagnostics.note(
+                    "vpn",
+                    "NETWORK_WATCH_FAILED (${it.javaClass.simpleName}) — a lost link " +
+                        "may leave the tunnel up until you disconnect manually"
+                )
+            }
+    }
+
+    private fun stopWatchingNetwork() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        runCatching { connectivityManager()?.unregisterNetworkCallback(callback) }
+    }
+
+    /**
+     * Recovers the underlying network when the UI did not supply one.
+     *
+     * `EXTRA_NETWORK` comes from `linkedNetwork()`, which can be null. Without a
+     * known underlying network a lost link cannot be attributed, so the watch
+     * above would silently do nothing - the exact "fix that quietly no-ops" this
+     * change exists to remove. Resolving it from the host's own subnet also
+     * repairs socket pinning on that path.
+     */
+    private fun resolveUnderlyingFromHost() {
+        if (underlying != null) return
+        val cm = connectivityManager() ?: return
+        val addr = hostAddr ?: return
+        runCatching {
+            cm.allNetworks.firstOrNull { net ->
+                val caps = cm.getNetworkCapabilities(net)
+                val isVpn =
+                    caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+                val addresses = cm.getLinkProperties(net)
+                    ?.linkAddresses
+                    ?.mapNotNull { it.address?.hostAddress }
+                    .orEmpty()
+                TunnelSupervisorPolicy.canReachHost(addr, isVpn, addresses)
+            }
+        }.onSuccess { found ->
+            if (found != null) {
+                underlying = found
+                Diagnostics.note("vpn", "UNDERLYING_RESOLVED net=$found (from host subnet)")
+            }
+        }.onFailure { Timber.w(it, "underlying network lookup failed") }
+    }
+
+    /**
+     * Keeps the Wi-Fi radio out of power save while the tunnel owns a TUN.
+     *
+     * Wi-Fi Direct power-saves hard with the screen off, which stalls the tunnel.
+     * [HostRuntime][com.peernet.wifiextender.host.HostRuntime] already holds this
+     * lock on the sharing phone; the client never did, so a screen-off stall
+     * could come from either end and there was no way to tell them apart.
+     *
+     * This is a `WifiManager` lock, not a `PowerManager` wake lock: it does not
+     * hold the CPU and never keeps the screen on.
+     */
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+
+    private fun acquireWifiLock() {
+        if (!TunnelSupervisorPolicy.shouldHoldWifiLock(tunFd != -1)) return
+        if (wifiLock?.isHeld == true) return
+        val wm = getSystemService(android.net.wifi.WifiManager::class.java) ?: return
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            @Suppress("DEPRECATION")
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        try {
+            wifiLock = wm.createWifiLock(mode, "peernet-client").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Diagnostics.note("vpn", "WIFI_LOCK_ACQUIRED mode=$mode (radio stays out of power save)")
+        } catch (t: Throwable) {
+            // Never fail a tunnel over this; it degrades screen-off behaviour
+            // only, and the report must say so rather than looking healthy.
+            Timber.w(t, "wifi lock unavailable")
+            Diagnostics.note(
+                "vpn",
+                "WIFI_LOCK_FAILED (${t.javaClass.simpleName}) — internet may pause when the screen sleeps"
+            )
+        }
+    }
+
+    private fun releaseWifiLock() {
+        val lock = wifiLock ?: return
+        runCatching { if (lock.isHeld) lock.release() }
+        wifiLock = null
+        Diagnostics.note("vpn", "WIFI_LOCK_RELEASED")
+    }
+
     /**
      * Ends the tunnel as soon as the client link is gone.
      *
@@ -103,6 +251,7 @@ class PeerNetVpnService : VpnService() {
         intent?.getStringExtra(EXTRA_HOST_ADDR)?.let { hostAddr = it }
         intent?.getStringExtra(EXTRA_HOST_FP)?.let { hostFp = it }
         readUnderlyingNetwork(intent)?.let { underlying = it }
+        resolveUnderlyingFromHost()
 
         // A start with no live link can only install a TUN that swallows
         // traffic. Happens on the START_STICKY restart path after a process
@@ -216,6 +365,10 @@ class PeerNetVpnService : VpnService() {
         }
 
         pinSocketsToUnderlying()
+        // Only now does the service own a TUN, so this is the point where the
+        // radio must stay awake and the underlying network must be watched.
+        acquireWifiLock()
+        watchUnderlyingNetwork()
         linkManager.setTunnelStatus("Tunnel active")
         linkManager.setTunnelActive(true)
         Diagnostics.note("vpn", "TUN capture started (fd=$fd mtu=$MTU)")
@@ -249,6 +402,8 @@ class PeerNetVpnService : VpnService() {
         val hadTun = tunFd != -1
         bringUp?.interrupt()
         bringUp = null
+        stopWatchingNetwork()
+        releaseWifiLock()
         runCatching { rustCore.stopTunnel() }
         runCatching { rustCore.stopTunCapture() }
         tunFd = -1
