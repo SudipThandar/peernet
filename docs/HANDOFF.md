@@ -1128,3 +1128,88 @@ out by design, a user-granted Doze exemption is the only remaining lever if the 
 WifiLock alone does not fix screen-off. It needs a one-time prompt, which touches the
 "one screen, two buttons, no settings" mandate - so it was deliberately **not** added here
 and is an open question for the user.
+## 18. The last screen-off lever: a one-time Doze exemption (run #117, `fa31636`)
+
+Follow-up to section 17. After both phones held a `WifiManager.WifiLock`, one gap
+remained: **a lock on the radio is not a lock on the app**. `WifiLock` keeps the Wi-Fi
+chip serviceable, but the system can still suspend the process with the screen off, and
+once the process stops running the QUIC keepalive (20 s) misses its deadline and the 90 s
+idle timeout kills the connection.
+
+`PowerManager` wake locks are ruled out by design here, so the only remaining lever is a
+**user-granted battery-optimization exemption**. `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`
+was already declared in `AndroidManifest.xml` but was **never referenced in code** - a dead
+permission, flagged at the end of section 17 and now actually wired up.
+
+### The rule
+
+New `app/src/main/java/com/peernet/wifiextender/power/DozeExemptionPolicy.kt`:
+
+`shouldPrompt(sessionActive, alreadyExempt, alreadyAsked)` = `sessionActive && !alreadyExempt && !alreadyAsked`
+
+Trivial-looking, but each clause is load-bearing in an app whose entire UX rule is "one
+screen, two buttons, no settings":
+
+- **`sessionActive`** - a dialog on a cold start would be the first thing a new user sees,
+  with no context for why the app wants it, and there is nothing to protect yet.
+- **`!alreadyExempt`** - never ask for what we already hold.
+- **`!alreadyAsked`** - a user who declined has answered. Re-asking every session turns a
+  two-button app into a nag screen. Persisted in `peernet_power` prefs.
+
+`DozeExemption` holds the Android side separately (`PowerManager.isIgnoringBatteryOptimizations`,
+the prefs flag, and `Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) so the rule stays
+JVM-testable. `requestExemption()` **records the attempt before launching**, so a build with
+no activity for that action cannot produce a prompt loop; it returns false and the session
+continues degraded, logged as `DOZE_EXEMPTION_PROMPT_UNAVAILABLE`.
+
+### Why the trigger is not the button tap
+
+The prompt fires from a `LaunchedEffect` on "a session is genuinely up" - `HostState.READY`,
+or client `quicState == STATE_CONNECTED` - never on the SHARE/CONNECT tap. Two concrete
+reasons, both of which would have been bugs:
+
+1. At tap time the client still has the **VPN consent dialog** pending. A second system
+   dialog would cover it, and a user who dismissed the wrong one would end up with no
+   tunnel and no explanation.
+2. Starting an activity moves the app off-screen, and on **Android 12+ a foreground service
+   cannot be started from the background** - the exact `ForegroundServiceStartNotAllowedException`
+   the code at `HomeScreen.kt:137` already exists to report. Waiting until the service is
+   running sidesteps it, and an app with a running FGS is not subject to the restriction
+   anyway.
+
+### Gate validation (red run deleted)
+
+Sabotage: `sessionActive || !alreadyExempt` - i.e. prompt eagerly and ignore prior refusal.
+**4 of 5** tests failed:
+
+| Assertion | With bug restored |
+| --- | --- |
+| `never prompts before a session is running` | **failed** |
+| `never prompts when already exempt` | **failed** |
+| `never asks a second time` | **failed** |
+| `an exempt user who was asked before is still never prompted` | **failed** |
+
+`prompts once when a session is running and the exemption is missing` correctly kept
+passing - the sabotage still returns true for that case, which is what a well-aimed
+sabotage should leave alone.
+
+Green run on `main`: #117 (`32813697111`), all four jobs. Unit tests: 69.
+
+### Not verified
+
+Whether this actually fixes screen-off needs the user's two phones. Three independent
+mechanisms are now in place - host WifiLock (#108), client WifiLock (#114), Doze exemption
+(#117) - and if the stall persists after all three, the next suspect is the QUIC idle
+timeout versus real suspend duration, **not** more locks.
+
+### Also in this run
+
+The root `README.md` was rewritten: how the tunnel works, why Wi-Fi Direct + QUIC + TUN +
+userspace NAT were chosen over a proxy (each with the reason it beats the alternative), the
+repository layout, tech stack, the CI-only build process, and the two testing rules that
+govern this codebase (no Robolectric -> pure policy objects; a gate that has never failed is
+not evidence).
+
+No release build is published: **ads and a premium tier** (monthly, or one-time lifetime,
+lifting a session limit) are planned first, and release signing is not configured. The
+README says so rather than leaving the absence unexplained.
