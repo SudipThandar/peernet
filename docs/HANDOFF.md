@@ -1213,3 +1213,146 @@ not evidence).
 No release build is published: **ads and a premium tier** (monthly, or one-time lifetime,
 lifting a session limit) are planned first, and release signing is not configured. The
 README says so rather than leaving the absence unexplained.
+## 19. "It asks for the password every time": the wrong API gate (run #119, `003f15b`)
+
+User report: joining works and internet flows, but after the client toggles Wi-Fi off and
+on, the network is not remembered and the password must be typed again - and only in one
+direction (M11 as client failed, J4 as client did not).
+
+### Root cause
+
+`WifiDirectManager.createGroup` gated its custom `WifiP2pConfig` behind
+**`Build.VERSION_CODES.TIRAMISU` (33)**. But `WifiP2pConfig.Builder`,
+`setNetworkName`, `setPassphrase` and `enablePersistentMode` are all **API 29 (Q)**.
+
+So on every phone below API 33, `HostRuntime`'s carefully chosen stable credentials were
+built, passed in, and **silently discarded** - the code fell through to the legacy
+`createGroup(ch, listener)`, which lets the framework generate a fresh SSID and passphrase
+**per share**. The client had saved credentials that no longer matched anything.
+
+The comment at the call site even said "honored on API 33+", so the limitation was known
+and written down; what was wrong was the belief that 33 was the minimum. Nothing failed,
+nothing logged, and the only symptom was a user retyping a password.
+
+The same wrong gate sat on `joinByCredentials` (line 271), so clients that were perfectly
+capable of joining programmatically were forced through Android's Wi-Fi picker by hand.
+
+A second, independent defect: the group was **temporary**. `enablePersistentMode(true)` was
+never called, and a temporary group discards its credentials when it ends, so even a
+correct passphrase would look like a new network next time.
+
+### Why the asymmetry between the two phones
+
+Both phones are below 33, so both regenerated credentials as hosts. What differed is
+whether the *client* OS kept a saved entry for a `DIRECT-` SSID whose credentials had
+changed underneath it. That is OEM/version behaviour we do not control - which is the
+point: the fix is to stop the credentials changing at all, not to argue with the client's
+Wi-Fi settings.
+
+### Fix
+
+- Both gates lowered **33 -> 29**, and `enablePersistentMode(true)` added to the group
+  config and to `joinByCredentials`.
+- `createGroup` now degrades **one capability at a time**: persistent + custom -> custom
+  only -> system credentials. Dropping straight to system credentials on the first failure
+  would have thrown away the stable passphrase - the entire point - merely because a build
+  refused persistence. Each step logs `WIFI_DIRECT_CREATE_RETRY ... dropping=`, and the
+  final fallback says outright that the password will now change every share.
+- `requestedPersistent` is re-armed by every `startHosting`, so one stubborn attempt cannot
+  permanently downgrade later shares on that phone.
+
+### New `wifi/GroupCredentialsPolicy.kt`
+
+The network name and passphrase were **duplicated string literals** in two files:
+`HostRuntime` built `"DIRECT-PeerNet-$shortId"` / `"pn-$hostId"`, and `ClientViewModel`
+rebuilt both to auto-join. Nothing connected them, so editing either would have broken
+auto-join silently. They now live in one policy object with a test asserting host and
+client agree.
+
+**The default passphrase is derived, not random.** A client cannot be *told* a passphrase
+before it joins - the banner server (4434) and NSD are both inside the group - so the only
+passphrase it can present unaided is one it computes from the host id it already
+discovered. The trade-off is explicit and unchanged from the previous `"pn-$hostId"`
+default: the default group is joinable by anyone nearby who knows the scheme, and the
+tunnel is still authenticated by certificate fingerprint over TLS 1.3, so joining the group
+grants no access to traffic. A host wanting a private group sets a custom passphrase, which
+by definition cannot be derived and must be typed once.
+
+The derived alphabet excludes `0/O`, `1/l/I` and `i`. This string is read off one screen and
+typed into another phone; a character the user cannot distinguish is a failed connection
+that looks like an app bug.
+
+### Editable password
+
+`HostCredentials` persists a user-chosen passphrase in `peernet_group`. A stored value that
+fails validation is **ignored rather than trusted** - otherwise one bad write would make
+every future share fail with an opaque framework error, recoverable only by clearing app
+data (which this project forbids as a fix).
+
+The field on screen shows the group's **actual** passphrase, not the stored preference. When
+the framework refused our config those differ, and showing the preference would have the
+user typing a password that cannot work. Saved on IME Done: persisting each keystroke would
+store half-typed passwords, and a separate button was explicitly not wanted.
+
+### Client notification Stop
+
+The client's tunnel notification is `setOngoing(true)` and cannot be swiped, so there was no
+way to end a tunnel without opening the app - poor for something that owns the default
+route. It now has a Stop action mirroring the host's, delivered by a manifest receiver
+(`VpnNotificationActionReceiver`) for the same reason as the host's: independent of process
+state and OEM service-intent handling.
+
+The receiver does **not** simply clear the link. `ClientViewModel` owns the visible client
+state and does not observe `ClientLinkManager.linkedHost`, so clearing the singleton would
+have torn the tunnel down while the screen still read "Connected to …" - a faked UI state,
+which this project forbids. Instead the receiver raises `ClientLinkManager.requestStop()`,
+the ViewModel runs its own tested `disconnect()`, and the receiver additionally clears the
+link, leaves the group and pokes the service so a stop still happens when **no ViewModel is
+alive** - which with the screen off is the normal case, not the exception.
+
+### New `client/AutoConnectPolicy.kt`
+
+A Stop that reconnects itself is worse than no Stop. `clearLink` deliberately re-arms
+auto-connect (`pollMisses = 0`, `AUTOCONNECT_RESET`) so a link lost to an error retries at
+once; applied to a stop the user asked for, that re-arms within one poll.
+
+Leaving the group is not sufficient either: below API 29 the user associates through
+Android's Wi-Fi picker, and `removeGroup()` does not drop a plain Wi-Fi association, so the
+host stays reachable and the client re-links. So an explicit stop is now remembered against
+the network it happened on, and forgotten when the user taps CONNECT or joins a different
+network - never latched forever.
+
+### Gate validation (red run deleted)
+
+Three distinct sabotages, each mapping to its own assertion:
+
+| Sabotage | Test that failed |
+| --- | --- |
+| `MIN_LENGTH = 7` | `exactly eight characters is accepted`, `too short is rejected with a reason the user can act on` |
+| `ALPHABET = "01"` | `the derived passphrase avoids characters a user cannot tell apart` |
+| `shouldAutoLink` returns true always | `a user stop is honoured while still on the same network` |
+
+The ambiguous-alphabet sabotage was chosen as `"01"` rather than a realistic alphabet
+because a 10-character sample from a 36-character set only *probably* contains an ambiguous
+character - a gate that fails 84% of the time is not a gate.
+
+Green run on `main`: #119 (`32827404244`), all four jobs. Unit tests: 83.
+
+### Lesson for this codebase
+
+An API level written from memory is a silent feature switch. The comment said "honored on
+API 33+" and was believed for three builds; the real minimum was 29, and the cost was the
+single most visible annoyance in the app. When gating on `SDK_INT`, the version belongs to
+the *API being called*, and it is worth checking rather than recalling - especially for a
+capability whose absence degrades silently instead of throwing.
+
+### Still open
+
+- **Host screen-off stops sharing.** Reported after run #117. The screen receiver in
+  `HostForegroundService` only writes diagnostics, so it is not the direct cause. The
+  candidate is `observeState()`: a transient "no group" reading while the radio power-saves
+  reaches `noteHostingEnded`, or the OEM genuinely tears the group down on screen off. The
+  diagnostics distinguish these - `HOST_GROUP_ENDED (service stopping)` means our code
+  agreed the group was gone; `WIFI_LOCK_*` and a gap in `tick` entries mean the process was
+  frozen instead. Not guessed at pending that dump.
+- **Intermittent missing tunnel** and a **crash**, both awaiting a diagnostics export.
