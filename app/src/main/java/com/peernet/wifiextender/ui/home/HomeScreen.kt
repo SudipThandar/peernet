@@ -32,6 +32,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.peernet.wifiextender.power.DozeExemption
+import com.peernet.wifiextender.power.DozeExemptionPolicy
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.peernet.wifiextender.ui.host.HostState
@@ -229,6 +231,38 @@ fun HomeScreen(
         // ---- Status ----
         val linkedHost = client.connectedHost
         val isHosting = host.hostState == HostState.READY || host.hostState == HostState.CREATING_GROUP
+
+        // ---- one-time "allow background running" prompt ----
+        //
+        // Doze is the last unaddressed cause of the screen-off stall: both phones
+        // now hold a Wi-Fi lock, but that keeps the radio alive, not the app.
+        // `PowerManager` wake locks are ruled out by design, so a user-granted
+        // exemption is the only lever left.
+        //
+        // The trigger is deliberately "a session is genuinely up" - host READY, or
+        // the client's tunnel actually connected - rather than the button tap:
+        //  - at tap time the client still has the VPN consent dialog pending, and
+        //    a second system dialog would cover it;
+        //  - starting an activity moves the app off-screen, and on Android 12+ a
+        //    foreground service cannot be started from the background. Waiting
+        //    until the service is already running avoids that entirely.
+        val sessionActive = host.hostState == HostState.READY || quicState == STATE_CONNECTED
+        LaunchedEffect(sessionActive) {
+            if (!DozeExemptionPolicy.shouldPrompt(
+                    sessionActive = sessionActive,
+                    alreadyExempt = DozeExemption.isExempt(context),
+                    alreadyAsked = DozeExemption.wasAsked(context)
+                )
+            ) {
+                return@LaunchedEffect
+            }
+            val shown = DozeExemption.requestExemption(context)
+            com.peernet.wifiextender.diag.Diagnostics.note(
+                "power",
+                if (shown) "DOZE_EXEMPTION_PROMPTED" else
+                    "DOZE_EXEMPTION_PROMPT_UNAVAILABLE - no activity for this action on this build"
+            )
+        }
 
         val statusText = when {
             host.hostState == HostState.ERROR -> "Error"
