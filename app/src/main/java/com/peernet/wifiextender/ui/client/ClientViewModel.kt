@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.peernet.wifiextender.client.ClientLinkManager
+import com.peernet.wifiextender.client.AutoConnectPolicy
 import com.peernet.wifiextender.client.LinkPolicy
 import com.peernet.wifiextender.diag.Diagnostics
 import com.peernet.wifiextender.discovery.DiscoveredHost
@@ -90,11 +91,36 @@ class ClientViewModel @Inject constructor(
     @Volatile
     private var lastNetworkFingerprint: String? = null
 
+    /**
+     * The network as of the most recent poll, updated every time rather than only
+     * on change, because [AutoConnectPolicy] needs the *current* value at the
+     * moment the user stops - and [lastNetworkFingerprint] is deliberately reset
+     * to null by `clearLink` to force the next change to be logged.
+     */
+    private var currentNetworkFingerprint: String? = null
+
+    /** Set by an explicit user stop; suppresses auto-connect until intent changes. */
+    private var userStopped = false
+    private var stoppedOnFingerprint: String? = null
+
     private val _uiState = MutableStateFlow(ClientUiState())
     val uiState: StateFlow<ClientUiState> = _uiState.asStateFlow()
 
     init {
         _uiState.update { it.copy(savedHostIds = loadSavedHostIds()) }
+        // The notification's Stop action runs in a receiver, which has no access
+        // to this ViewModel's state. It raises a counter here instead, so the stop
+        // goes through the same tested path as the on-screen DISCONNECT button and
+        // the screen can never be left reading "Connected" with no tunnel.
+        viewModelScope.launch {
+            var seen = linkManager.stopRequests.value
+            linkManager.stopRequests.collect { n ->
+                if (n == seen) return@collect
+                seen = n
+                Diagnostics.note("client", "STOP_FROM_NOTIFICATION s=$session")
+                disconnect()
+            }
+        }
         viewModelScope.launch {
             var wasJoined = false
             wifiDirect.state.collect { s ->
@@ -221,6 +247,7 @@ class ClientViewModel @Inject constructor(
      */
     private fun noteNetworkChange(networks: String, ssid: String) {
         val fingerprint = "$networks|$ssid"
+        currentNetworkFingerprint = fingerprint
         if (fingerprint == lastNetworkFingerprint) return
         lastNetworkFingerprint = fingerprint
         Diagnostics.note("client", "NETWORK_DETECTED s=$session ssid=${ssid.ifBlank { "?" }} [$networks]")
@@ -314,6 +341,12 @@ class ClientViewModel @Inject constructor(
      */
     fun connectNow() {
         if (!busy.compareAndSet(false, true)) return
+        // Tapping CONNECT is unambiguous new intent, so a previous stop must not
+        // keep suppressing auto-connect afterwards.
+        if (AutoConnectPolicy.clearsStop(userTappedConnect = true)) {
+            userStopped = false
+            stoppedOnFingerprint = null
+        }
         _uiState.update {
             it.copy(searching = true, status = "Searching this network for a PeerNet host…")
         }
@@ -323,9 +356,14 @@ class ClientViewModel @Inject constructor(
                 wifiDirect.acquireMulticast()
 
                 val hid = discoverHostId()
+                // Both strings come from the shared policy so the client cannot
+                // drift from what the host actually created. Auto-join only works
+                // for the derived default; a host with a custom password has to be
+                // joined from Wi-Fi settings, which the P2P_JOIN_FAILED note says.
                 if (hid != null && wifiDirect.joinByCredentials(
-                        ssid = "DIRECT-PeerNet-${hid.takeLast(4)}",
-                        passphrase = "pn-$hid"
+                        ssid = com.peernet.wifiextender.wifi.GroupCredentialsPolicy.networkName(hid),
+                        passphrase = com.peernet.wifiextender.wifi.GroupCredentialsPolicy
+                            .derivePassphrase(hid)
                     )
                 ) {
                     _uiState.update { it.copy(status = "Joining the PeerNet network…") }
@@ -410,6 +448,17 @@ class ClientViewModel @Inject constructor(
      */
     private fun autoLink() {
         if (_uiState.value.connectedHost != null) return
+        if (!AutoConnectPolicy.shouldAutoLink(
+                userStopped = userStopped,
+                networkFingerprint = currentNetworkFingerprint,
+                stoppedOnFingerprint = stoppedOnFingerprint
+            )
+        ) {
+            // Without this the stop is undone within one poll, because clearLink
+            // deliberately re-arms auto-connect for error recovery.
+            Diagnostics.note("client", "AUTOCONNECT_SUPPRESSED s=$session (stopped by user)")
+            return
+        }
         if (!busy.compareAndSet(false, true)) return
         viewModelScope.launch(Dispatchers.Default) {
             try {
@@ -811,6 +860,11 @@ class ClientViewModel @Inject constructor(
 
     /** Drops the link and leaves any joined Wi-Fi Direct group. */
     fun disconnect() {
+        // Recorded before clearing, because clearLink re-arms auto-connect and the
+        // poll would otherwise re-link straight away.
+        userStopped = true
+        stoppedOnFingerprint = currentNetworkFingerprint
+        Diagnostics.note("client", "USER_STOPPED s=$session net=${currentNetworkFingerprint ?: "?"}")
         clearLink("Disconnected.")
         wifiDirect.leaveCurrentGroup()
     }

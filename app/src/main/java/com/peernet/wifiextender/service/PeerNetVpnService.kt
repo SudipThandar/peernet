@@ -527,6 +527,15 @@ class PeerNetVpnService : VpnService() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        // The notification is setOngoing(true), so it cannot be swiped away: this
+        // action is the only way to end the tunnel without opening the app, which
+        // matters because the tunnel is a default route and users reach for the
+        // notification first. Mirrors the host's Stop action.
+        val stopIntent = PendingIntent.getBroadcast(
+            this, 1,
+            Intent(this, VpnNotificationActionReceiver::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val notification: Notification =
             NotificationCompat.Builder(this, PeerNetApp.CHANNEL_TUNNEL)
                 .setSmallIcon(R.drawable.ic_notification)
@@ -534,6 +543,7 @@ class PeerNetVpnService : VpnService() {
                 .setContentText("Internet is arriving through the host phone")
                 .setOngoing(true)
                 .setContentIntent(openIntent)
+                .addAction(R.drawable.ic_notification, "Stop", stopIntent)
                 .build()
 
         // A throw here used to kill the service the moment it started, and the

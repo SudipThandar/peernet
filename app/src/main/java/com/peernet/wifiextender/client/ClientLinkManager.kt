@@ -92,4 +92,24 @@ class ClientLinkManager @Inject constructor() {
 
     /** True while [gen] is still the live session. */
     fun isCurrent(gen: Int): Boolean = generation == gen
+
+    /**
+     * Counts explicit user requests to stop the tunnel from outside the UI - the
+     * notification's Stop action.
+     *
+     * A counter rather than a flag or an event: it is observable by a `StateFlow`
+     * collector that may not exist yet, it needs no reset, and a second Stop is
+     * distinguishable from the first.
+     *
+     * The client's UI state is owned by `ClientViewModel`, not by this singleton,
+     * so clearing the link here would tear the tunnel down while the screen still
+     * read "Connected to …". The ViewModel watches this and runs its own tested
+     * disconnect path, keeping one owner for the visible state.
+     */
+    private val _stopRequests = MutableStateFlow(0)
+    val stopRequests: StateFlow<Int> = _stopRequests.asStateFlow()
+
+    fun requestStop() {
+        _stopRequests.value = _stopRequests.value + 1
+    }
 }

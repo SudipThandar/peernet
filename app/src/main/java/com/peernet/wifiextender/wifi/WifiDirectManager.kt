@@ -85,6 +85,15 @@ class WifiDirectManager @Inject constructor(
     private var pendingCreate = false
     private var requestedSsid: String? = null
     private var requestedPassphrase: String? = null
+
+    /**
+     * Whether this share should still try for a persistent group.
+     *
+     * Cleared by the first `createGroup` failure so the retry drops persistence
+     * before it drops the stable passphrase, and re-armed by every [startHosting]
+     * so one stubborn attempt does not permanently downgrade later shares.
+     */
+    private var requestedPersistent = true
     private var multicastLock: WifiManager.MulticastLock? = null
 
     /**
@@ -259,12 +268,26 @@ class WifiDirectManager @Inject constructor(
     fun joinByCredentials(ssid: String, passphrase: String): Boolean {
         val mgr = manager ?: return false
         val ch = channel ?: return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        // Q, not TIRAMISU: WifiP2pConfig.Builder and both setters are API 29.
+        // The wrong gate meant every API 29-32 client fell back to typing the
+        // password into Wi-Fi settings by hand, on a phone that was perfectly
+        // capable of joining on its own.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Diagnostics.note(
+                "wifidirect",
+                "P2P_JOIN_UNSUPPORTED sdk=${Build.VERSION.SDK_INT} — join the network from Wi-Fi settings"
+            )
+            return false
+        }
         return try {
             val config = WifiP2pConfig.Builder()
                 .setNetworkName(ssid)
                 .setPassphrase(passphrase)
+                // Lets the framework store the credentials, so later joins to the
+                // same host need neither this call nor the user.
+                .enablePersistentMode(true)
                 .build()
+            Diagnostics.note("wifidirect", "P2P_JOIN_REQUESTED ssid=$ssid")
             mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     Timber.i("Join requested for %s", ssid)
@@ -272,6 +295,11 @@ class WifiDirectManager @Inject constructor(
 
                 override fun onFailure(reason: Int) {
                     Timber.w("Join %s failed: %d", ssid, reason)
+                    Diagnostics.note(
+                        "wifidirect",
+                        "P2P_JOIN_FAILED ssid=$ssid reason=${reasonText(reason)} — " +
+                            "if the host set its own password, join from Wi-Fi settings instead"
+                    )
                 }
             })
             true
@@ -351,6 +379,9 @@ class WifiDirectManager @Inject constructor(
         _state.update { it.copy(error = null, creating = true) }
         requestedSsid = ssid
         requestedPassphrase = passphrase
+        // Re-armed per share: a previous failure must not silently downgrade
+        // every future share on this phone.
+        requestedPersistent = true
         pendingCreate = true
 
         try {
@@ -429,14 +460,23 @@ class WifiDirectManager @Inject constructor(
         // Local copies: mutable properties cannot be smart-cast to non-null.
         val ssid = requestedSsid
         val passphrase = requestedPassphrase
+        // Q, not TIRAMISU. WifiP2pConfig.Builder, setNetworkName, setPassphrase
+        // and enablePersistentMode are all API 29. Gating them at 33 silently
+        // dropped every API 29-32 phone onto system-generated credentials that
+        // change on every share - which is precisely why a client had to retype
+        // the password each time.
         val customConfig: WifiP2pConfig? = if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             !ssid.isNullOrEmpty() && !passphrase.isNullOrEmpty()
         ) {
             try {
                 WifiP2pConfig.Builder()
                     .setNetworkName(ssid)
                     .setPassphrase(passphrase)
+                    // A temporary group discards its credentials when it ends, so
+                    // the next share looks like a brand-new network to the client.
+                    // Persistent mode is what lets a client rejoin silently.
+                    .apply { if (requestedPersistent) enablePersistentMode(true) }
                     .build()
             } catch (t: Throwable) {
                 Timber.w(t, "custom group config rejected; falling back to system credentials")
@@ -445,6 +485,12 @@ class WifiDirectManager @Inject constructor(
         } else {
             null
         }
+
+        Diagnostics.note(
+            "wifidirect",
+            "WIFI_DIRECT_CREATE_ATTEMPT custom=${customConfig != null} " +
+                "persistent=${customConfig != null && requestedPersistent} sdk=${Build.VERSION.SDK_INT}"
+        )
 
         try {
             if (customConfig != null) {
@@ -494,17 +540,32 @@ class WifiDirectManager @Inject constructor(
                 clearGroupState()
                 return
             }
+            // Degrade one step at a time, most valuable capability last. Dropping
+            // straight to system credentials on the first failure would throw away
+            // the stable passphrase - the whole point of the custom config - just
+            // because a build refused persistent mode.
+            if (requestedPersistent && (requestedSsid != null || requestedPassphrase != null)) {
+                Timber.w("createGroup(persistent) failed: %d — retrying without persistence", reason)
+                Diagnostics.note(
+                    "wifidirect",
+                    "WIFI_DIRECT_CREATE_RETRY reason=${reasonText(reason)} dropping=persistent"
+                )
+                requestedPersistent = false
+                pendingCreate = true
+                createGroup(mgr, ch)
+                return
+            }
             if (requestedSsid != null || requestedPassphrase != null) {
                 Timber.w("createGroup(custom) failed: %d — retrying with system credentials", reason)
+                Diagnostics.note(
+                    "wifidirect",
+                    "WIFI_DIRECT_CREATE_RETRY reason=${reasonText(reason)} dropping=credentials — " +
+                        "the password will change every share on this phone"
+                )
                 requestedSsid = null
                 requestedPassphrase = null
                 pendingCreate = true
-                try {
-                    @Suppress("DEPRECATION")
-                    mgr.createGroup(ch, groupListener(mgr, ch))
-                } catch (e: SecurityException) {
-                    reportP2pDenied("createGroup(fallback)", e)
-                }
+                createGroup(mgr, ch)
                 return
             }
             Timber.w("createGroup failed: %d", reason)

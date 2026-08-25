@@ -90,6 +90,13 @@
             android:name=".service.HostNotificationActionReceiver"
             android:exported="false" />
 
+        <!-- Same, for the client's tunnel notification. Its notification is
+             ongoing and cannot be swiped, so this is the only way to end the
+             tunnel without opening the app. -->
+        <receiver
+            android:name=".service.VpnNotificationActionReceiver"
+            android:exported="false" />
+
     </application>
 
 </manifest>

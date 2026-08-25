@@ -10,12 +10,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -29,9 +32,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.peernet.wifiextender.host.HostCredentials
 import com.peernet.wifiextender.power.DozeExemption
 import com.peernet.wifiextender.power.DozeExemptionPolicy
 import kotlinx.coroutines.delay
@@ -106,6 +112,13 @@ fun HomeScreen(
         }
     }
     val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
+
+    // Null means "showing the live value"; non-null means the user is editing.
+    // Seeding the field directly from state instead would fight every keystroke.
+    var passwordDraft by remember { mutableStateOf<String?>(null) }
+    var passwordError by remember { mutableStateOf<String?>(null) }
+    var passwordNotice by remember { mutableStateOf<String?>(null) }
+    val keyboard = LocalSoftwareKeyboardController.current
 
     fun vpnIntent(): android.content.Intent =
         android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java).apply {
@@ -441,7 +454,68 @@ fun HomeScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     InfoRow("Network", host.ssid ?: "—")
-                    InfoRow("Password", host.passphrase ?: "unavailable — see Wi-Fi settings")
+
+                    // ---- password, editable in place ----
+                    //
+                    // The value shown is the group's ACTUAL passphrase, not the
+                    // stored preference: on a build that refused our custom
+                    // config they differ, and showing the stored one would have
+                    // the user typing a password that cannot work.
+                    val effective = host.passphrase
+                    if (effective.isNullOrEmpty()) {
+                        InfoRow("Password", "unavailable — see Wi-Fi settings")
+                    } else {
+                        OutlinedTextField(
+                            value = passwordDraft ?: effective,
+                            onValueChange = {
+                                passwordDraft = it
+                                passwordNotice = null
+                            },
+                            label = { Text("Password") },
+                            singleLine = true,
+                            isError = passwordError != null,
+                            supportingText = {
+                                val msg = passwordError ?: passwordNotice
+                                if (msg != null) {
+                                    Text(
+                                        msg,
+                                        color = if (passwordError != null) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            Color(0xFF2E7D32)
+                                        }
+                                    )
+                                } else {
+                                    Text("Type a new password and press Done to change it")
+                                }
+                            },
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                            // Saved on Done rather than behind its own button:
+                            // persisting every keystroke would store half-typed
+                            // passwords, and a separate button is not wanted here.
+                            keyboardActions = KeyboardActions(
+                                onDone = {
+                                    val typed = (passwordDraft ?: effective).trim()
+                                    if (typed == effective) {
+                                        passwordError = null
+                                        passwordNotice = null
+                                    } else {
+                                        val rejected = HostCredentials.setPassphrase(context, typed)
+                                        passwordError = rejected
+                                        passwordNotice = if (rejected == null) {
+                                            "Saved. Tap STOP SHARING then SHARE to apply it, " +
+                                                "then reconnect the other phone with the new password."
+                                        } else {
+                                            null
+                                        }
+                                    }
+                                    keyboard?.hide()
+                                }
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
                     InfoRow("Address", host.groupOwnerAddress ?: "acquiring…")
                     InfoRow(
                         "Clients probed",

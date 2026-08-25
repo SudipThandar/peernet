@@ -357,12 +357,19 @@ class HostRuntime @Inject constructor(
         // the group forms and used to race itself for the port.
         ensureResponder()
 
-        // Stable group credentials (honored on API 33+): the network always
-        // appears as DIRECT-PeerNet-xxxx with an unchanging passphrase, so a
-        // client that joined once auto-rejoins on every future share.
+        // Stable group credentials. The passphrase does not change between shares
+        // (that was what forced the user to retype it on the client every time)
+        // and it is the user's own if they set one. See GroupCredentialsPolicy for
+        // why the default is derived rather than random.
+        val passphrase = HostCredentials.passphrase(context)
+        Diagnostics.note(
+            "host",
+            "GROUP_CREDENTIALS custom=${HostCredentials.isCustom(context)} len=${passphrase.length}"
+        )
         wifiDirect.startHosting(
-            ssid = "DIRECT-PeerNet-$shortId",
-            passphrase = "pn-${HostIdentity.id(context)}"
+            ssid = com.peernet.wifiextender.wifi.GroupCredentialsPolicy
+                .networkName(HostIdentity.id(context)),
+            passphrase = passphrase
         )
     }
 
