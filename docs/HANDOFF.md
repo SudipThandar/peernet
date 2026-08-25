@@ -1025,3 +1025,106 @@ Only the user two phones can confirm WhatsApp calling now works. CI proves the f
 and bounding logic; it cannot prove ICE succeeds on a real network. The host `udp_readers`
 leak fix has **no dedicated gate** - it is a small "remove your own registration on exit"
 cleanup, but it is untested and should get a test if that path is ever touched again.
+## 17. Screen-off drops and the stale VPN icon (run #114, `bb1449d`)
+
+Two user reports, one root cause:
+
+- **A**: with the screen off, the client loses internet (the host `WifiLock` added in
+  #108 was not enough).
+- **B**: after disconnecting Wi-Fi on the client, the Android VPN key and the
+  "Internet is arriving through the host phone" notification stay up - and the phone
+  has no internet at all.
+
+### Root cause
+
+All client link supervision lived in `ClientViewModel.startLiveness(host, gen)`
+(`ClientViewModel.kt:636`), i.e. in **`viewModelScope`**. That scope is cancelled when the
+Activity/ViewModel is destroyed - screen off long enough, app swiped away, memory pressure.
+When it died, `livenessJob` died with it and **nothing ever called `clearLink(...)`**.
+
+The consequence is worse than a stale icon. `PeerNetVpnService` installs a
+**default-route TUN**. Once QUIC is dead but the TUN is still installed, every packet on
+the device is routed into a tunnel with no far end - so the phone is not merely showing a
+wrong icon, it has *no internet*, and the only visible symptom is the icon the user
+reported. Bug B was Bug A wearing a different hat.
+
+`PeerNetVpnService.watchLink()` only reacted to `linkedHost == null`. Nothing in the
+service observed **its own underlying network dying** - there was no
+`ConnectivityManager.NetworkCallback` anywhere in the client.
+
+This is the same ownership mistake fixed in #108, left half-done: #108 moved the *stop*
+path out of the UI (`HomeScreen` no longer stops the VPN) but left *liveness* UI-scoped.
+
+### Why the WifiLock asymmetry mattered
+
+`WifiLock` existed **only** in `HostRuntime.kt` (86-136). The client had none. Wi-Fi Direct
+power-saves aggressively with the screen off, so a screen-off stall could originate at
+either end and there was **no way to tell them apart** from a diagnostics dump.
+
+### Fix
+
+New `app/src/main/java/com/peernet/wifiextender/service/TunnelSupervisorPolicy.kt`, pure and
+JVM-testable (no Robolectric in this project), following `service/ForegroundServiceType.kt`:
+
+| Function | Rule |
+| --- | --- |
+| `shouldTeardownOnLoss(lost, underlying, tunInstalled)` | only the tunnel's **own** network ends it; an unattributable loss (`underlying == null`) never does |
+| `shouldHoldWifiLock(tunInstalled)` | client holds the lock exactly while it owns a TUN |
+| `canReachHost(hostAddress, isVpn, addresses)` | same `/24` as the host, port suffix tolerated, **VPN always rejected** |
+
+In `PeerNetVpnService`:
+
+1. `watchUnderlyingNetwork()` registers a `NetworkCallback`. The `NetworkRequest` uses
+   **`clearCapabilities()`** - a Wi-Fi Direct network advertises no
+   `NET_CAPABILITY_INTERNET`, so a default request would never match it and the one loss
+   that matters would never be delivered. `onLost` mirrors `onRevoke` exactly:
+   `linkManager.setLinked(null)` then `stopTunnel(...)`. This runs on the service
+   lifetime, so it is immune to UI death.
+2. A client `WifiManager.WifiLock` (`"peernet-client"`, `WIFI_MODE_FULL_LOW_LATENCY` on
+   API 29+, `setReferenceCounted(false)`) acquired when the TUN is installed and released
+   in `teardown()`. Never fails tunnel bring-up; logs `WIFI_LOCK_ACQUIRED` /
+   `WIFI_LOCK_FAILED` / `WIFI_LOCK_RELEASED`. This is a `WifiManager` lock, **not** a
+   `PowerManager` wake lock, and it does not keep the screen on.
+3. `resolveUnderlyingFromHost()`: `EXTRA_NETWORK` comes from `linkedNetwork()`, which can
+   be **null**. Without a known underlying network the new watch would silently no-op -
+   the exact failure mode this change exists to remove - so the service recovers it from
+   the host's own subnet. This also repairs socket pinning on that path.
+
+### Gate validation (two rounds, both red runs deleted)
+
+Round 1 sabotaged three rules; **3 of 3** caught:
+
+| Assertion | With bug restored |
+| --- | --- |
+| `losing the tunnel's own network ends the tunnel` | **failed** |
+| `the client holds a wifi lock exactly while it owns a TUN` | **failed** |
+| `subnet matching is not a loose prefix match` | **failed** |
+
+The fourth sabotage was **ineffective** - `if (isVpn) return false.also { }` still returns
+`false`, so the VPN guard was never actually broken and its gate was unvalidated. Round 2
+removed the `isVpn` guard outright: exactly **1** test failed,
+`the VPN itself is never the route to the host`. Recording this because a sabotage that
+does not change behaviour proves nothing, and it is easy to miss when the run is already
+red for other reasons.
+
+Green run on `main`: #114 (`32810879266`), all four jobs. Unit tests: 64.
+
+### Lesson for this codebase
+
+Supervision must be owned by the component whose lifetime matches the thing supervised. A
+watchdog in `viewModelScope` guards the UI, not the tunnel. And when a default-route TUN is
+involved, "stale VPN icon" is never cosmetic - it means the device is blackholing all
+traffic, so treat any stale-indicator report as a total-connectivity bug.
+
+### Not verified
+
+Screen-off behaviour under Doze **cannot be tested in CI** - it needs the user's two
+phones. What is provably fixed: the icon/notification now clear on network loss regardless
+of UI state, and the client now holds a WifiLock at all.
+
+`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` is declared in `AndroidManifest.xml` but is
+**never used anywhere in code** (verified by search). With `PowerManager` wake locks ruled
+out by design, a user-granted Doze exemption is the only remaining lever if the client
+WifiLock alone does not fix screen-off. It needs a one-time prompt, which touches the
+"one screen, two buttons, no settings" mandate - so it was deliberately **not** added here
+and is an open question for the user.
