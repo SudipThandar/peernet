@@ -1464,3 +1464,96 @@ The audit found four further issues, left for a follow-up so this fix can be ver
   without logging the cause, and `NoRouteToHost`/`ENETUNREACH` fold into a generic
   `IOException`. Classifying `TCP_REACHABLE/REFUSED/TIMEOUT/NO_ROUTE` would have identified
   this failure from the first diagnostics export instead of requiring a full audit.
+## 21. The host screen said IDLE while the share was alive (run #124, `b38841e`)
+
+**Symptom.** During a healthy share the host screen went back to showing
+`SHARE`, and the network-details card vanished. Nothing had actually stopped:
+the group, the QUIC engine and the :4434 responder were all up.
+
+**Why it was not cosmetic.** IDLE is an invitation. The tester tapped `SHARE`
+again, which ran a full stop/start: the group was recreated and :4434 was
+closed and rebound. That is the sequence that produced `TCP connection refused`
+on the client. The screen manufactured the failure it appeared to report.
+
+**Cause.** `HostViewModel.uiState` derived `HostState` purely from
+`WifiDirectManager.state`. That flow is an *observation* of the platform, and
+the platform reports `hosting = false` for a moment even while a share is
+healthy. Intent lived in `HostRuntime.sharingActive` and was never consulted, so
+any transient outranked the user's standing request to share.
+
+Run #122 removed one producer of the transient (`refreshGroupInfo` clearing the
+session on a null group). This removed the fragility: no other transient, from
+any source, can flip the screen to IDLE while intent stands.
+
+**Fix.** `HostRuntime.sharingIntended` exposes intent. New pure
+`HostStatePolicy.evaluate(sharingIntended, groupLive, error)` owns the decision.
+The ordering is load-bearing in two places:
+
+- A **live group outranks an error**. The staged credential fallback records an
+  error on a failed attempt and then succeeds; reporting `ERROR` over a working
+  share hid the details card and contradicted the headline.
+- An **error outranks intent**, because `startSharing` aborts *before* setting
+  its intent latch when location services are off. Checking intent first showed
+  IDLE and swallowed the one message naming what to fix.
+
+Intent with no group and no error is `CREATING_GROUP`, which `HomeScreen` already
+treats as hosting, so the button reads `STOP SHARING` through a transient.
+
+`error` is surfaced in `HostUiState` only when the state is `ERROR`, so a live
+group cannot display "Sharing internet" and an error message at once.
+
+**Gate.** `HostStatePolicyTest`, 7 tests. Sabotage: restoring the
+observation-only `else -> IDLE` turned `Unit tests` green to red.
+
+**Not fixed by this.** A screen-off failure where the *client actually loses
+internet* is a different defect at a different layer. A derivation error cannot
+take a client's internet away. See section 22.
+
+## 22. The diagnostics buffer was erasing the screen-off evidence (run #126, `6e2f9a0`)
+
+**Context.** The tester reported, on run #122 with the host display off, that
+the host reverted to not-sharing **and** the client lost internet. The second
+half rules out section 21 as the cause.
+
+`HostForegroundService` was built to settle exactly this question. It ticks every
+15s while sharing and documents the rule at `aliveTick()`: a **gap** in those
+entries means the process was frozen by Doze or the OEM's standby, whereas ticks
+that continue while the client is dead point at the radio or the group. Those two
+causes need opposite fixes.
+
+**The defect.** `Diagnostics.note` collapsed consecutive identical lines into
+`(xN)` and rewrote the line with **only the newest stamp**. The tick's text is
+constant while sharing (same session, same counters), so it hit the collapsing
+path on every emission. A ten-minute freeze and ten minutes of healthy ticking
+therefore rendered identically: one line, one timestamp.
+
+The buffer was destroying the evidence it had been added to capture. No number of
+screen-off reproductions could have settled the cause, which is why earlier
+attempts at this symptom (sections 17 and 18) shipped mitigations - `WifiLock`,
+the Doze exemption - without ever confirming which mechanism was at fault.
+
+**Fix.** Buffer logic moved into `DiagLog` with an injectable clock so the rules
+are testable. Collapsed runs now carry `first..last` stamp plus the count:
+
+```
++120.000s..+600.000s host: LINKSERVER_ALIVE (tick) id=3 listening=true ... (x8)
+```
+
+A freeze becomes arithmetic - a 480s span holding 8 ticks of a 15s loop is 24
+missing ticks. Collapsing is retained, so a 4s poll loop still cannot flood a
+400-line buffer and evict the failure being investigated.
+
+`Diagnostics` keeps its public API; every call site is unchanged.
+
+**Gate.** `DiagLogTest`, 8 tests, including two dumps over the same 300s window
+that must differ by count. Sabotage: discarding the span turned `Unit tests`
+green to red.
+
+**Still open.** The screen-off cause itself is *not* diagnosed. Required next:
+reproduce on run #126 or later with the host display off, then `SHARE
+DIAGNOSTICS` from the host and read, in order - `HOST_SCREEN_OFF`, then the
+`LINKSERVER_ALIVE (tick)` spans across the dark period, then whether
+`HOST_GROUP_ENDED (service stopping)` or a `noteHostingEnded` reason appears.
+Tick count far below span/15s means the process was frozen; ticks continuing with
+`group=true engine=true listening=true` while the client is dead means the data
+plane or the radio, not the lifecycle. Do not ship a fix before this is read.
