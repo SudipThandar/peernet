@@ -920,3 +920,108 @@ on a guess in the background.
 GitHub run numbers are authoritative from here on. Earlier notes used internal build numbers
 that drifted: the "#106 post-mortem" in section 14 shipped as run **#108**, and its
 gate-validation failure was run **#109**.
+
+## 16. WhatsApp voice calls failing: one UDP port, many peers (run #112, `805f1ef`)
+
+Reported symptom: on run #110 everything worked - YouTube, Discord voice, WhatsApp
+messaging - **except WhatsApp voice calls**, which never connected. Diagnostics showed a
+completely healthy tunnel: `quicState=2 tunPackets=38479 udp=6875 tcp=31570 in=71980894
+lost=0 cap=up eng=up`. No losses, no errors, nothing to point at.
+
+### Root cause
+
+`peernet-ffi`'s TUN flow table was keyed **only by the phone's UDP source port**:
+
+```rust
+type UdpFlows = HashMap<u16, UdpFlow>;   // u16 = src_port
+struct UdpFlow { local_ip, dst_ip, dst_port }
+```
+
+Every outbound packet did `insert(sport, ...)`, overwriting the entry with its newest
+destination. On the way back, `pump_udp_replies` **discarded** the real peer that the host
+reported in `hdr.dst_ip`/`hdr.dst_port` and rebuilt the reply from `flow.dst_ip`/
+`flow.dst_port` - i.e. from whichever destination that port had touched last.
+
+For one port talking to one destination this is invisible. It is fatal for the opposite
+shape, which is exactly what a WebRTC/ICE agent does: from a **single** local port it fires
+STUN/TURN/peer connectivity checks at **many** candidates in parallel. Each reply was
+rebuilt with the wrong source address, and ICE requires a response to arrive from the
+address the request was sent to (RFC 8445 symmetry check), so the phone's ICE agent
+discarded every single one. No candidate pair ever validated, so the call never established.
+
+Why the control tests all passed and hid it:
+
+| Test | Shape | Result |
+| --- | --- | --- |
+| YouTube, WhatsApp messaging | TCP, terminated locally by smoltcp | unaffected |
+| Discord voice | UDP to a **single** media server | last-destination is always correct |
+| WhatsApp voice | UDP, **one port to many ICE candidates** | every reply misattributed |
+
+This was never WhatsApp-specific. Any ICE/WebRTC caller (Meet, FaceTime, Signal) was broken.
+
+### Fix
+
+Flows are keyed by the full tuple `(src_port, dst_ip, dst_port)`, and a reply is attributed
+to the peer the host actually reports. The host side already did the right thing: its NAT
+socket is unconnected and `pump_udp_replies` uses `recv_from`, so the true peer was in the
+datagram all along - the client was throwing it away.
+
+The **per-port fallback is retained deliberately**, for the two cases where no exact tuple
+can match:
+
+- **virtual DNS.** The phone queries `10.215.17.1:53`; the host rewrites the destination to
+  a real resolver, so the answer arrives from an address the phone never addressed. The
+  reply must still appear to come from `10.215.17.1:53` or the phone's stack drops it.
+- **the stream fallback** (`udp_exchange_via_stream`), which relays only
+  `(src_port, payload)` and carries no peer address at all.
+
+Tuple keying makes the table grow with ICE fan-out, so it is now bounded: an idle sweep
+(reusing `UDP_NAT_IDLE_TIMEOUT_SECS`, so both ends forget a flow together) plus a cap that
+trims to 3/4 rather than exactly to the limit - trimming to the limit would re-sort the
+whole table on every packet once full, turning a bounded table into a per-packet cost.
+
+Second, independent defect fixed in `peernet-host`: the per-port reply-pump registration in
+`udp_readers` was never removed. Once the NAT swept an idle mapping, the same local port
+came back (`get_or_create` preserves the client source port), `insert()` returned `Some`,
+`is_new` was false, and **no reply pump was spawned** - that flow went silently one-way.
+
+### Diagnostics added
+
+`engineStats()` gained payload-free aggregates, because "UDP works" and "UDP works only for
+single-destination flows" were indistinguishable from the old counters:
+
+`flows=open/ports fnew=.. fexp=.. fanout=.. rok=.. rmap=.. rmiss=..`
+
+`fanout>0` proves ICE-style multiplexing is present; `rok` vs `rmap` separates exact matches
+from fallback remaps; `rmiss>0` means replies arrived that no flow could claim. Metadata and
+counters only - no payloads, no per-packet addresses logged.
+
+### Gate validation
+
+Bugs reintroduced on throwaway branch `verify/udp-flow-gate`, run #113 (`32759201074`):
+**Build APK (cargo test) failed**.
+
+| Assertion | With bug restored |
+| --- | --- |
+| `multi_destination_replies_keep_their_own_source` - "reply source IP must be the peer that answered, not the last dest" | **failed** |
+| `idle_flows_are_swept_under_pressure` - "table must be bounded after sweep, was 2149" | **failed** |
+
+The DNS/stream fallback tests kept **passing** under sabotage, which is the point: they
+confirm the fix preserves the virtual-DNS contract instead of trading one break for another.
+
+Branch and red run deleted. Green run on `main`: #112 (`32758614656`).
+
+### Lesson for this codebase
+
+A UDP "flow" is not identified by a port. Keying reverse-path state by source port alone
+silently corrupts any protocol that multiplexes destinations over one socket, and the
+corruption is invisible to every aggregate counter - the tunnel reports zero loss because
+nothing was lost, only misaddressed. When rewriting addresses on a return path, carry the
+real peer end-to-end and treat rewriting as the exception that must justify itself.
+
+### Not verified
+
+Only the user two phones can confirm WhatsApp calling now works. CI proves the flow-table
+and bounding logic; it cannot prove ICE succeeds on a real network. The host `udp_readers`
+leak fix has **no dedicated gate** - it is a small "remove your own registration on exit"
+cleanup, but it is untested and should get a test if that path is ever touched again.
