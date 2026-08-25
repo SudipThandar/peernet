@@ -515,11 +515,11 @@ class WifiDirectManager @Inject constructor(
     ): WifiP2pManager.ActionListener = object : WifiP2pManager.ActionListener {
         override fun onSuccess() {
             Timber.i("Wi-Fi Direct group created")
-            pendingCreate = false
             if (!hostingRequested) {
                 // STOP arrived while the group was forming. Remove it at once:
                 // otherwise it stays up with nobody tracking it, which is
                 // exactly how a DIRECT-… network outlived STOP SHARE.
+                pendingCreate = false
                 Diagnostics.note(
                     "wifidirect",
                     "WIFI_DIRECT_GROUP_CREATED after stop — removing immediately"
@@ -529,6 +529,13 @@ class WifiDirectManager @Inject constructor(
                 return
             }
             Diagnostics.note("wifidirect", "WIFI_DIRECT_GROUP_CREATED")
+            // Do NOT clear pendingCreate here. createGroup reports success before
+            // requestGroupInfo will return the new group, so the refresh below
+            // (and any broadcast that races it) gets a transient null. Clearing
+            // the flag now let that null wipe the just-created group — the
+            // WIFI_DIRECT_SESSION_CLEARED-immediately-after-GROUP_CREATED bug that
+            // flipped the host UI to IDLE and churned the :4434 responder.
+            // GroupLifecyclePolicy keeps the session until a real group is seen.
             _state.update { it.copy(creating = false, hosting = true, error = null) }
             refreshGroupInfo()
         }
@@ -585,11 +592,26 @@ class WifiDirectManager @Inject constructor(
         val mgr = manager ?: return
         val ch = channel ?: return
         mgr.requestGroupInfo(ch) { group ->
+            val action = GroupLifecyclePolicy.onGroupReport(
+                groupPresent = group != null,
+                createInFlight = pendingCreate
+            )
+            pendingCreate = action.createStillInFlight
             if (group == null) {
-                // No group at all: this is the only authoritative "session is
-                // over" signal, and it must also clear the *client* fields —
-                // leaving joinedAsClient=true kept a dead host linked forever.
-                if (!pendingCreate) clearGroupState()
+                // No group. While a create is still in flight this is the
+                // expected transient null between the success callback and the
+                // group registering, so the live session is kept. Otherwise this
+                // is the authoritative "session is over" signal, and it must also
+                // clear the *client* fields — leaving joinedAsClient=true kept a
+                // dead host linked forever.
+                if (action.clearSession) {
+                    clearGroupState()
+                } else {
+                    Diagnostics.note(
+                        "wifidirect",
+                        "WIFI_DIRECT_GROUP_PENDING (transient null during create — keeping session)"
+                    )
+                }
                 return@requestGroupInfo
             }
 
