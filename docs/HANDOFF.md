@@ -1356,3 +1356,111 @@ capability whose absence degrades silently instead of throwing.
   agreed the group was gone; `WIFI_LOCK_*` and a gap in `tick` entries mean the process was
   frozen instead. Not guessed at pending that dump.
 - **Intermittent missing tunnel** and a **crash**, both awaiting a diagnostics export.
+
+## 20. "TCP connection refused": the group was cleared right after it was created (run #122, `b540304`)
+
+Client SM-M115F (Android 31) reported `TCP CONNECTION REFUSED` against `192.168.49.1:4434`
+while the host SM-J400F (Android 29) reported `probes=0`. Both statements were true, and
+together they ruled out most of the obvious suspects: `ECONNREFUSED` is an RST or an ICMP
+port-unreachable, so a listener was genuinely absent at that instant - not a wrong-network
+problem (that is a timeout) and not a bind-address problem (`LinkServer` binds `0.0.0.0`).
+`probes=0` confirmed no client TCP connection had ever been accepted.
+
+### Root cause
+
+`WifiP2pManager.createGroup` reports success through its `ActionListener` **before**
+`requestGroupInfo` will return the new group. For a short window after the success callback
+the framework still answers `requestGroupInfo` with `null`.
+
+`groupListener.onSuccess()` cleared its `pendingCreate` guard at the top of the callback and
+then called `refreshGroupInfo()`. That first report was the transient null, `pendingCreate`
+was already false, and the null branch treats a missing group as the authoritative "session
+is over" signal - so the just-created, perfectly healthy group was wiped:
+
+```
+WIFI_DIRECT_GROUP_CREATED
+WIFI_DIRECT_SESSION_CLEARED (was hosting=true)
+...HOST_READY only later, once a broadcast re-read the group
+```
+
+The contradictory `group=false` then `group=true` in the host diagnostics was this bug, not
+a benign transitional state.
+
+### Why a false teardown caused a refused connection
+
+`HostViewModel.uiState` derives `HostState` purely from `WifiDirectManager.state`, so
+`hosting=false` moved the host to `IDLE`: the button flipped from STOP SHARING back to
+SHARE and the details card vanished, though hosting was fine. That invited a second tap,
+which ran `stopSharing()` then `startSharing()` - closing port 4434 and removing and
+recreating the group. `LinkServer` bumps its generation three times per such cycle, which is
+exactly the `2 -> 5 -> 8 -> 11` in the logs: four sharing sessions where the user intended
+one. The client's 4s-to-15s poll kept landing in those stop windows, and each landing was a
+refused connection.
+
+So the failure was never in the socket code. The chain was: wrong ordering in the create
+callback -> false IDLE -> user-driven churn -> 4434 flapping -> refused.
+
+### The fix
+
+`pendingCreate` is no longer cleared when `createGroup` succeeds; it is cleared only when a
+real group has actually been observed. A create is "done" when the group exists, not when
+the framework says it accepted the request. The decision moved into a pure
+`GroupLifecyclePolicy.onGroupReport(groupPresent, createInFlight)` so the ordering invariant
+is unit-testable - the module has no Robolectric, so anything touching `WifiP2pManager`
+directly cannot be tested at all.
+
+A null report while a create is in flight now writes
+`WIFI_DIRECT_GROUP_PENDING (transient null during create - keeping session)` instead of
+silently clearing, so the window is visible in diagnostics rather than inferred.
+
+The `!hostingRequested` path still clears `pendingCreate` immediately: a STOP that arrives
+while the group is forming must not leave the flag set, or a later null could never end the
+session.
+
+### Gate validation (red run deleted)
+
+Reverting the policy to the old "clear on any null" behaviour failed exactly two of the five
+new tests:
+
+| Sabotage | Tests that failed |
+| --- | --- |
+| `clearSession = true` regardless of `createInFlight` | `transient null right after create keeps the live session` (:36), `full create sequence never clears the session until the real teardown` (:88) |
+
+The other three tests cover the group-present and genuine-teardown paths, which the sabotage
+does not touch, so they correctly kept passing - the blast radius matched the change.
+
+Because the workflow only triggers on `main` pushes and PRs, the sabotage branch was run via
+`workflow_dispatch --ref`; the red run and the branch were both deleted afterwards.
+
+Green run on `main`: #122 (`32854744234`), all four jobs. Unit tests: 91.
+
+### Lesson for this codebase
+
+An asynchronous success callback is not proof that the thing it created is observable yet.
+`createGroup` succeeding and the group existing are two different events, and the code
+treated them as one. Where a guard exists specifically to cover that gap, the guard must be
+released by the *confirming observation*, never by the callback that opens the gap - clearing
+it early converts the guard into a no-op while leaving it in the source, which reads as
+protection during review.
+
+It is also worth noting how far the symptom was from the cause: a networking-looking error
+(`connection refused`, a port, an IP) was produced by a state-ordering bug in Wi-Fi Direct
+lifecycle handling, and amplified by a UI that derives its button state from that state.
+Chasing the socket would have found nothing wrong with it.
+
+### Deliberately not changed in this run
+
+The audit found four further issues, left for a follow-up so this fix can be verified alone:
+
+- **`bindProcessToNetwork` is process-wide and sticky** (`PeerNetVpnService`): a phone that
+  was a client and then becomes a host can leave the process bound to the old network, which
+  would misroute the host's own accept path. Presents as a timeout rather than a refusal, so
+  it is not the cause of this report.
+- **Client is poll-only** - no `registerNetworkCallback` anywhere in `ClientViewModel`; a
+  callback will be added as an accelerator with the proven poll kept as the fallback.
+- **`groupOwnerAddress` is only populated when we are the GO** (`go=?` in `HOST_READY`), and
+  the client infers `.1` from the subnet instead of preferring the discovered address.
+- **`probeHost` swallows the exception** - `ConnectException` becomes a friendly string
+  without logging the cause, and `NoRouteToHost`/`ENETUNREACH` fold into a generic
+  `IOException`. Classifying `TCP_REACHABLE/REFUSED/TIMEOUT/NO_ROUTE` would have identified
+  this failure from the first diagnostics export instead of requiring a full audit.
