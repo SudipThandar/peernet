@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.peernet.wifiextender.client.ClientLinkManager
+import com.peernet.wifiextender.diag.Diagnostics
 import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.AndroidEntryPoint
 import timber.log.Timber
@@ -31,6 +32,24 @@ class VpnNotificationActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != PeerNetVpnService.ACTION_STOP) return
         Timber.i("Tunnel notification Stop received")
+
+        // A notification left over from a previous session must not stop the
+        // current one. The service stamps the link generation it built the
+        // action for; if that generation has moved on, the session this Stop
+        // referred to is already gone and there is nothing to do.
+        //
+        // A missing stamp (-1) means the action predates this check, so it is
+        // honoured: failing to stop is worse than stopping something already
+        // dead, because the tunnel is a default route.
+        val stampedGen = intent.getIntExtra(PeerNetVpnService.EXTRA_LINK_GEN, -1)
+        if (stampedGen >= 0 && !linkManager.isCurrent(stampedGen)) {
+            Timber.i("ignoring stale Stop for generation %d", stampedGen)
+            Diagnostics.note(
+                "vpn",
+                "STOP_ACTION_IGNORED_STALE gen=$stampedGen now=${linkManager.generation}"
+            )
+            return
+        }
 
         // Ask the UI to disconnect properly if it exists.
         runCatching { linkManager.requestStop() }

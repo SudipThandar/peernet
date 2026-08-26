@@ -334,13 +334,20 @@ class PeerNetVpnService : VpnService() {
      * above would silently do nothing - the exact "fix that quietly no-ops" this
      * change exists to remove. Resolving it from the host's own subnet also
      * repairs socket pinning on that path.
+     *
+     * Ambiguity is reported rather than hidden. This matches on the host's /24,
+     * so two networks on the same subnet both qualify and the old
+     * `firstOrNull` picked one silently - pinning the tunnel to the wrong
+     * network is indistinguishable from a dead host from the user's side. When
+     * there is more than one candidate the Wi-Fi Direct range wins, because that
+     * is where a PeerNet host always lives, and the choice is logged.
      */
     private fun resolveUnderlyingFromHost() {
         if (underlying != null) return
         val cm = connectivityManager() ?: return
         val addr = hostAddr ?: return
         runCatching {
-            cm.allNetworks.firstOrNull { net ->
+            val candidates = cm.allNetworks.filter { net ->
                 val caps = cm.getNetworkCapabilities(net)
                 val isVpn =
                     caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
@@ -350,6 +357,20 @@ class PeerNetVpnService : VpnService() {
                     .orEmpty()
                 TunnelSupervisorPolicy.canReachHost(addr, isVpn, addresses)
             }
+            if (candidates.size > 1) {
+                Diagnostics.note(
+                    "vpn",
+                    "UNDERLYING_AMBIGUOUS ${candidates.size} networks match ${addr}'s subnet " +
+                        "- preferring the Wi-Fi Direct range"
+                )
+            }
+            candidates.firstOrNull { net ->
+                cm.getLinkProperties(net)
+                    ?.linkAddresses
+                    ?.mapNotNull { it.address?.hostAddress }
+                    .orEmpty()
+                    .any { com.peernet.wifiextender.client.LinkPolicy.isWifiDirectAddress(it) }
+            } ?: candidates.firstOrNull()
         }.onSuccess { found ->
             if (found != null) {
                 underlying = found
@@ -479,11 +500,18 @@ class PeerNetVpnService : VpnService() {
         }
         generation = linkManager.generation
         tornDown.set(false)
+        // Refresh the notification so its Stop action carries this session's
+        // generation rather than the -1 stamped during onCreate.
+        startAsForeground()
 
         if (tunFd != -1) {
-            // Already capturing; just refresh socket pinning in case the
-            // network changed while we stayed up.
+            // Already capturing. Refresh socket pinning AND the process bind: a
+            // re-delivery is one of the ways we learn the network changed while
+            // we stayed up, and pinSocketsToUnderlying alone only updates the
+            // system's accounting - it chooses no route, so without the process
+            // bind every socket stays attached to the previous network.
             pinSocketsToUnderlying()
+            bindProcessToLink()
             return START_STICKY
         }
         if (bringUp?.isAlive == true) return START_STICKY
@@ -748,9 +776,17 @@ class PeerNetVpnService : VpnService() {
         // action is the only way to end the tunnel without opening the app, which
         // matters because the tunnel is a default route and users reach for the
         // notification first. Mirrors the host's Stop action.
+        //
+        // EXTRA_LINK_GEN stamps the session this action belongs to. Without it a
+        // Stop tap on a notification left over from a previous session cleared
+        // the *current* link, killing a healthy tunnel. FLAG_UPDATE_CURRENT plus
+        // the fixed request code means there is only ever one of these, so
+        // re-issuing the notification refreshes the stamp.
         val stopIntent = PendingIntent.getBroadcast(
             this, 1,
-            Intent(this, VpnNotificationActionReceiver::class.java).setAction(ACTION_STOP),
+            Intent(this, VpnNotificationActionReceiver::class.java)
+                .setAction(ACTION_STOP)
+                .putExtra(EXTRA_LINK_GEN, generation),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val notification: Notification =
@@ -786,6 +822,13 @@ class PeerNetVpnService : VpnService() {
         const val EXTRA_HOST_ADDR = "host_addr"
         const val EXTRA_HOST_FP = "host_fp"
         const val EXTRA_NETWORK = "host_network"
+
+        /**
+         * The link generation the notification's Stop action belongs to.
+         *
+         * A Stop tap from a previous session must not clear the current link.
+         */
+        const val EXTRA_LINK_GEN = "link_gen"
         const val SESSION = "PeerNet"
         const val MTU = 1280
         const val VPN_ADDRESS = "10.215.17.2"
