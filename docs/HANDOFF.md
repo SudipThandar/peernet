@@ -1990,14 +1990,21 @@ an unknown one. It should be done with device visibility, not blind.
 - **The client has no screen-off awareness at all.** `ACTION_SCREEN_OFF`/`ON`
   receivers exist only in `HostForegroundService`, and only write diagnostics.
 
-**Release readiness (P3), all still open.** `signingConfig = null`, so there is no
-upload key. CI runs only `assembleDebug`, `testDebugUnitTest` and `lintDebug`,
-which means **`assembleRelease` has never run once** while release builds have
-both `isMinifyEnabled` and `isShrinkResources` on - R8 is completely untested.
-`proguard-rules.pro` does at least keep `com.peernet.wifiextender.core.**`, which
-covers the JNI surface. `versionCode` is still 1. The manifest declares
-`WAKE_LOCK` and `uses-feature android.software.device_admin` and uses neither, and
-the two `specialUse` foreground services need Play Console justification text.
+**Release readiness (P3), run #145, `8d32be3`.** `signingConfig = null` is still
+set - the output is unsigned and cannot be installed on a device - but R8 now
+runs on every CI pass via `assembleRelease`. First run passed: R8 minified the
+APK from 22 MB (debug, unminified) to 6 MB (release, `isMinifyEnabled` +
+`isShrinkResources`), a 72% reduction, without stripping the JNI surface
+(`com.peernet.wifiextender.core.**` kept by `proguard-rules.pro`) or the Compose
+tree. The `assembleRelease` step was added to `Build APK` alongside the existing
+`assembleDebug`, so every future CI run exercises both. A `PowerPolicyManifestTest`
+(5 gates) reads the manifest and sources as text and fails the build if
+`WAKE_LOCK` is declared, `device_admin` appears, any source acquires a wake lock
+or keeps the screen on, or the `WifiLock` two-call-site minimum is missing.
+
+`versionCode` is still 1. The two `specialUse` foreground services still need
+Play Console justification text. A release upload key and Play Billing remain
+the two items between here and the Play Store.
 
 ### Manual device test matrix
 

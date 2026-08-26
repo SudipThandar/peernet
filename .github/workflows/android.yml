@@ -110,6 +110,22 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
+      # assembleRelease has never run before. release builds have
+      # isMinifyEnabled = true and isShrinkResources = true, so this is the
+      # first time R8 exercises the JNI surface (kept via proguard-rules.pro)
+      # and the Compose tree. A failure here is expected and is its own
+      # debugging loop - this step exists to surface it before any release
+      # signing is configured.
+      - name: Assemble release APK (R8 first run)
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Upload release APK (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: peernet-release-apk-unsigned
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest
