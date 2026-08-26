@@ -930,32 +930,44 @@ class ClientViewModel @Inject constructor(
             is ProbeOutcome.Failed -> {
                 val via = networkLabel(probeNetwork())
                 lastProbeFailure = "${outcome.reason} (tried over $via)"
-                Diagnostics.note("probe", "${host.address}:${host.port} ${outcome.reason} via $via")
+                Diagnostics.note("probe", "${host.address}:${host.port} ${outcome.detail} via $via")
                 null
             }
         }
 
     private sealed interface ProbeOutcome {
         data class Verified(val host: DiscoveredHost) : ProbeOutcome
-        data class Failed(val reason: String) : ProbeOutcome
+        /**
+         * @param reason shown to the tester
+         * @param detail recorded verbatim, so an unrecognised failure still
+         *   carries the OS's own errno text into the shared report
+         */
+        data class Failed(val reason: String, val detail: String) : ProbeOutcome
     }
 
     private suspend fun probeHost(host: DiscoveredHost): ProbeOutcome =
         withContext(Dispatchers.IO) {
+            // Which side of connect() we failed on decides whether the next thing
+            // to suspect is this phone's network or the host's responder, so it is
+            // tracked rather than inferred from the exception type.
+            var phase = com.peernet.wifiextender.client.ProbePhase.CONNECTING
             try {
                 openProbeSocket().use { s ->
                     s.soTimeout = 3_000
                     s.connect(InetSocketAddress(host.address, host.port), 3_000)
+                    phase = com.peernet.wifiextender.client.ProbePhase.READING_BANNER
                     val banner = s.getInputStream().bufferedReader().readLine()
                     Timber.d("Probe banner from %s: %s", host.address, banner)
                     if (banner.isNullOrBlank()) {
                         return@withContext ProbeOutcome.Failed(
-                            "connected but the host sent no banner"
+                            "connected but the host sent no banner",
+                            "NO_BANNER phase=$phase (TCP established, stream closed empty)"
                         )
                     }
                     if (!banner.startsWith(com.peernet.wifiextender.wifi.LinkServer.BANNER_PREFIX)) {
                         return@withContext ProbeOutcome.Failed(
-                            "answered with something else: ${banner.take(40)}"
+                            "answered with something else: ${banner.take(40)}",
+                            "WRONG_BANNER phase=$phase got=${banner.take(60)}"
                         )
                     }
                     val parts = banner.trim().split(" ")
@@ -982,14 +994,13 @@ class ClientViewModel @Inject constructor(
                         )
                     )
                 }
-            } catch (e: java.net.ConnectException) {
-                // Reachable address, nothing accepting: the host app is not
-                // sharing (or was killed).
-                ProbeOutcome.Failed("refused the connection — is SHARE on, on the host phone?")
-            } catch (e: java.net.SocketTimeoutException) {
-                ProbeOutcome.Failed("did not answer within 3s — wrong network, or the host app is asleep")
             } catch (e: java.io.IOException) {
-                ProbeOutcome.Failed("unreachable (${e.javaClass.simpleName}: ${e.message.orEmpty().take(60)})")
+                // One catch, one classifier. Three separate catches previously
+                // reported ECONNREFUSED and ENETUNREACH identically as "the host
+                // is not sharing", and a banner read timeout as "wrong network"
+                // when TCP had in fact connected.
+                val d = com.peernet.wifiextender.client.LinkProbePolicy.classify(phase, e)
+                ProbeOutcome.Failed(d.message, d.detail)
             }
         }
 
