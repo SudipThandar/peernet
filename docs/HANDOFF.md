@@ -1613,3 +1613,83 @@ REFUSED` turned `Unit tests` green to red.
 **Consequence for the open investigation.** Every earlier conclusion that rested
 on the word "refused" is now unproven, not wrong. The next client dump will say
 which it was. Do not re-reason about the group lifecycle until it does.
+---
+
+## 24. The client screen outlived the link it described (run #130, `d94a74b`)
+
+**Symptom, as reported.** The host taps STOP. The client's Wi-Fi drops. The app
+goes on saying "Connected to PeerNet-4f93".
+
+**Cause.** `ClientLinkManager.linkedHost` is the authority for "am I linked", and
+`setLinked(null)` has four callers - `ClientViewModel.clearLink`,
+`PeerNetVpnService` twice, and `VpnNotificationActionReceiver`. The three outside
+the view model never touched the view model's own `connectedHost`, which is what
+`HomeScreen` renders (`HomeScreen.kt:246`, `:285`). The view model never observed
+the manager. So there was no path by which an external teardown could reach the
+screen.
+
+The watcher that was supposed to cover this compared `joinedAsClient` falling
+edges (`ClientViewModel.kt:141-145`). That flag is documented twelve lines below
+it (`:149-156`) as never becoming true when the user joins by typing the
+passphrase in Android's Wi-Fi settings - which is this app's only documented
+client flow. It starts false, stays false, and its falling edge never happens.
+`clearLink("Host disconnected.")` was unreachable code in practice.
+
+That left the liveness loop's `clearLink` (`:755`) as the only working clearing
+path, and it has a silent exit at `:691-694`: `break` on
+`!linkManager.isCurrent(gen)` with no clear. Generation bumps are routine with
+four writers, so the loop could vanish leaving the screen populated.
+
+**Fix.** `LinkPolicy.shouldClearStaleUi(hadManagerLink, hasManagerLink,
+uiShowsLink)` plus a watcher on `linkManager.linkedHost`. Deliberately an edge,
+not a level: `linkedHost` is null before a link exists too, so a level check
+would clear the screen mid-connection and fight the view model while it sets the
+link up. `clearLink` is split into `clearLink` (nulls the manager, then delegates)
+and `clearLocalLinkState`, so the watcher can clear the screen without spending a
+second generation on top of the one the external writer already spent.
+
+**Gate.** `LinkPolicyStaleUiTest`, 6 tests, including an exhaustive check that
+exactly one of the eight input combinations may clear the screen. Sabotage:
+replacing the edge with the level check `!hasManagerLink && uiShowsLink` turned
+`Unit tests` green to red.
+
+**Not fixed by this.** The stale VPN notification of section 17 is a different
+object. This only fixes the app's own screen.
+
+---
+
+## 25. SHARE destroyed the client session with no warning (run #132, `c11e9a1`)
+
+**Symptom, as reported.** "Client cannot share while connected as client - tapping
+SHARE silently disconnects from the host and reconnects to JioAirFiber and starts
+sharing."
+
+**What is the radio and what was the app.** A device gets one P2P group from
+`WifiP2pManager`, and neither the SM-J400F nor the SM-M115F supports P2P
+concurrency. Creating a group as host therefore destroys the group joined as a
+client. This is not something the app can code around, and it means the
+daisy-chained extender - phone B receiving from A while serving C - is not
+implementable on this hardware. Do not plan features that assume it.
+
+The app bug was narrower and real: `HostRuntime.startSharing` (`:300-331`) had no
+guard of any kind. Nothing checked for an active client link, so Android tore the
+client group down underneath the user with no warning, no teardown, and no
+explanation for the internet stopping. The user read that as the app secretly
+switching networks.
+
+**Fix.** `RoleConflictPolicy.evaluateShareRequest(clientLinkActive, tunnelActive)`
+returns `PROCEED` or `CONFIRM_REPLACING_CLIENT_LINK`. `HomeScreen` asks before
+switching roles and, on confirmation, ends the client session deliberately -
+`stopVpn()`, `disconnect()`, settle, then share - mirroring what the CONNECT
+button already did in the opposite direction (`HomeScreen.kt:374-378`). Both the
+link and `tunnelActive` are checked because they disagree while the VPN service is
+tearing down; `tunnelActive` is now exposed on `ClientViewModel`.
+
+**Gate.** `RoleConflictPolicyTest`, 5 tests, including an exhaustive check that
+only a fully idle phone shares without asking. Sabotage: returning `PROCEED`
+unconditionally - the pre-fix behaviour - turned `Unit tests` green to red.
+
+**Still open, and unchanged by either fix.** The host stopping by itself after
+5-10 minutes, and whether the client's working internet is the tunnel or its own
+mobile data. Both need a `SHARE DIAGNOSTICS` dump from a run #132 build; neither
+is diagnosable from CI. Read the host dump in the order given in section 22.
