@@ -1893,7 +1893,7 @@ No sabotage branch was run for this phase - the generation plumbing is the same
 pattern already gated elsewhere, and Actions capacity was better spent on Phase D.
 That is a gap in the record, not a claim of correctness.
 
-### RC-5 and two silent data-path killers (Phase D, `bef48e5`, VERIFICATION PENDING)
+### RC-5 and two silent data-path killers (Phase D, run #142, `a79da1e`)
 
 **`describe()` could panic on a malformed frame.** The IPv6 arm tested only
 `!packet.is_empty()` before reading `packet[6]`, so any 1-to-6 byte frame whose
@@ -1911,6 +1911,12 @@ anywhere in the process. The slot is now stamped with a capture generation claim
 once per session; every task-exit close is scoped to its own generation, while
 `stopTunCapture` keeps closing whatever is registered because it is the
 authoritative stop.
+
+The generation is claimed in `startTunCapture`, **not** inside the spawned task.
+Claiming it in the task left a window between spawn and first poll: a session
+started later could register first and then be overwritten by the older task
+claiming a higher generation. `TUN_FD` already serialises sessions, so claiming
+under that guard makes generation order match session order by construction.
 
 **RC-5: nothing enforced the no-panic rule at the FFI boundary.** The module
 header has always claimed "no panics cross the FFI boundary" and nothing
@@ -1938,12 +1944,18 @@ predicate. `a_stale_capture_task_cannot_close_a_newer_sessions_fds` proves it on
 the real tracker using a descriptor the test owns, serialised on the existing
 `ENGINE_LOCK` because these statics are process-global.
 
-**Status: run #141 has not verified this commit.** GitHub Actions was in a
-declared major outage (upstream database failover, inbound traffic throttled) for
-the entire attempt. The first attempt's four jobs were cancelled at exactly 15
-minutes with `steps=0`, never having been assigned a runner; the re-run sat queued
-with zero jobs. No job ever executed, so **this phase has no green run and no
-sabotage validation.** Both are owed before Phase D is treated as done.
+**Sabotage.** Both fixes were reverted on one branch - `describe()`'s length check
+dropped and `capture_gen_owns` forced to `true` - which turned `Build APK` red with
+all three tests failing and nothing else (`10 passed; 3 failed`). The
+`describe` failure reproduced the original defect exactly:
+`index out of bounds: the len is 1 but the index is 6`.
+
+**A note on the run history.** This commit was first pushed as `bef48e5` during a
+declared GitHub Actions major outage (upstream database failover, inbound traffic
+throttled). Run #141's four jobs were cancelled at exactly 15 minutes with
+`steps=0`, never having been assigned a runner, and the re-run sat queued with zero
+jobs; #141 is a dead run for an intermediate commit, not a failure of this code.
+Verification is run #142 against `a79da1e`.
 
 ### What the audit found and this work did NOT fix
 
