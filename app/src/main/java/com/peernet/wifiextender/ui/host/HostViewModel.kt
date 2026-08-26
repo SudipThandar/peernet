@@ -35,7 +35,14 @@ data class HostUiState(
     val linkServerListening: Boolean = false,
     val linkServerFailure: String? = null,
     /** Probes answered: >0 proves a client reached this host. */
-    val probesAnswered: Int = 0
+    val probesAnswered: Int = 0,
+    /** The auto-stop limit selected for the next (or current) share. */
+    val shareDuration: com.peernet.wifiextender.host.ShareDuration =
+        com.peernet.wifiextender.host.ShareTimerPolicy.DEFAULT,
+    /** Time until auto-stop, or null when unlimited or not sharing. */
+    val shareRemainingMs: Long? = null,
+    /** Whether the unlimited option is owned. */
+    val premium: Boolean = false
 )
 
 @HiltViewModel
@@ -84,7 +91,10 @@ class HostViewModel @Inject constructor(
             engineFailure = hostRuntime.engineFailure,
             linkServerListening = hostRuntime.linkServerListening,
             linkServerFailure = hostRuntime.linkServerFailure,
-            probesAnswered = hostRuntime.probesAnswered
+            probesAnswered = hostRuntime.probesAnswered,
+            shareDuration = hostRuntime.shareDurationInEffect,
+            shareRemainingMs = hostRuntime.shareTimeRemainingMs(),
+            premium = hostRuntime.premium
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HostUiState())
 
@@ -98,6 +108,10 @@ class HostViewModel @Inject constructor(
 
     fun stopSharing() {
         hostRuntime.stopSharing()
+    }
+
+    fun setShareDuration(duration: com.peernet.wifiextender.host.ShareDuration) {
+        hostRuntime.setShareDuration(duration)
     }
 
     private companion object {

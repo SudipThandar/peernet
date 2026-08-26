@@ -41,6 +41,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.peernet.wifiextender.host.HostCredentials
 import com.peernet.wifiextender.host.RoleConflictPolicy
 import com.peernet.wifiextender.host.ShareAction
+import com.peernet.wifiextender.host.ShareDuration
+import com.peernet.wifiextender.host.ShareTimerPolicy
 import com.peernet.wifiextender.power.DozeExemption
 import com.peernet.wifiextender.power.DozeExemptionPolicy
 import com.peernet.wifiextender.wifi.GroupCredentialsPolicy
@@ -78,6 +80,8 @@ fun HomeScreen(
     // gets one P2P group, so hosting would destroy the client session; the user is
     // asked instead of having the internet vanish underneath them.
     var shareRoleConflict by remember { mutableStateOf(false) }
+    // Explains a duration tap that could not be honoured.
+    var premiumNotice by remember { mutableStateOf<String?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -344,6 +348,67 @@ fun HomeScreen(
         }
 
         Spacer(Modifier.height(32.dp))
+
+        // ---- SHARE DURATION ----
+        // Offered before sharing only: a running share keeps the limit it started
+        // with, because silently shortening one would look like the host dying.
+        if (!isHosting) {
+            Text(
+                text = "Share for",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ShareDuration.values().forEach { option ->
+                    val selected = option == host.shareDuration
+                    TextButton(
+                        onClick = {
+                            if (ShareTimerPolicy.isSelectable(option, host.premium)) {
+                                premiumNotice = null
+                                hostViewModel.setShareDuration(option)
+                            } else {
+                                // Honest about why the tap did nothing, instead of a
+                                // disabled control with no explanation.
+                                premiumNotice =
+                                    "Unlimited sharing will be a paid option. " +
+                                    "It is not available yet."
+                            }
+                        }
+                    ) {
+                        Text(
+                            text = option.label,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (selected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        )
+                    }
+                }
+            }
+            premiumNotice?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+        } else {
+            // Named explicitly so a timer stop is never mistaken for a fault.
+            Text(
+                text = ShareTimerPolicy.formatRemaining(host.shareRemainingMs)
+                    ?.let { "Stops in $it" }
+                    ?: "No time limit",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
+        }
 
         // ---- SHARE ----
         // Shared by the direct tap and by the role-conflict confirmation, so both

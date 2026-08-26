@@ -58,6 +58,10 @@ class HostRuntime @Inject constructor(
      */
     @Volatile
     private var sharingActive = false
+    /** When the current share began, for the auto-stop clock. 0 when not sharing. */
+    private var shareStartedAtMs = 0L
+    /** The limit being enforced for this share, resolved at start. */
+    private var shareDuration = ShareTimerPolicy.DEFAULT
 
     /** Latches HOST_READY so it is reported on the edge, not on every emission. */
     @Volatile
@@ -230,6 +234,18 @@ class HostRuntime @Inject constructor(
                 if (advertisedFingerprint != null && advertisedFingerprint != (engineFingerprint ?: "")) {
                     publishAdvert()
                 }
+                // Auto-stop. Checked here rather than with a scheduled job so the
+                // deadline cannot outlive the process that owns it and stop a
+                // share that a later session started.
+                if (shareStartedAtMs != 0L &&
+                    ShareTimerPolicy.hasExpired(
+                        startedAtMs = shareStartedAtMs,
+                        nowMs = System.currentTimeMillis(),
+                        duration = shareDuration
+                    )
+                ) {
+                    stopSharing(reason = HostStopReason.TIMER_EXPIRED)
+                }
             }
         }
     }
@@ -312,9 +328,18 @@ class HostRuntime @Inject constructor(
 
         sharingActive = true
         reportedReady = false
+        // Resolved once, at the start, so changing the setting mid-share cannot
+        // retroactively shorten a share that is already running.
+        shareDuration = ShareTimerSetting.load(context)
+        shareStartedAtMs = System.currentTimeMillis()
         val sid = sessions.incrementAndGet()
         sessionId = sid
         Diagnostics.note("host", "SHARE_SESSION_CREATED id=$sid")
+        Diagnostics.note(
+            "host",
+            "SHARE_TIMER_ARMED id=$sid limit=${shareDuration.label} " +
+                "premium=${Entitlements.isPremium(context)}"
+        )
 
         // Brand the Wi-Fi Direct identity so clients see "PeerNet-xxxx",
         // not the owner's personal device name. Reflection-based; no-op where
@@ -373,12 +398,20 @@ class HostRuntime @Inject constructor(
         )
     }
 
-    fun stopSharing() {
+    /**
+     * @param reason recorded verbatim as `HOST_STOP_REASON`. The timer passes its
+     *        own value so a share that stopped because the user asked for a
+     *        30-minute limit can never be mistaken, in a diagnostics dump, for the
+     *        unexplained host death that is still under investigation.
+     */
+    fun stopSharing(reason: String = HostStopReason.USER) {
+        Diagnostics.note("host", "HOST_STOP_REASON=$reason id=$sessionId")
         Diagnostics.note("host", "SHARE_STOP_REQUESTED id=$sessionId")
         // Intent cleared first so nothing the teardown triggers (state
         // emissions, group-removal callbacks) can restart the responder or the
         // advertisement behind us.
         sharingActive = false
+        shareStartedAtMs = 0L
         reportedReady = false
         stopResponder()
         withdrawAdvert()
@@ -406,6 +439,7 @@ class HostRuntime @Inject constructor(
      */
     private fun resetSessionState() {
         sharingActive = false
+        shareStartedAtMs = 0L
         reportedReady = false
         stopResponder()
         withdrawAdvert()
@@ -413,6 +447,43 @@ class HostRuntime @Inject constructor(
         runCatching { rustCore.stopHost() }
         engineFingerprint = null
         engineError = null
+    }
+
+    /** The limit being enforced for the current (or next) share. */
+    val shareDurationInEffect: ShareDuration
+        get() = if (sharingActive) shareDuration else ShareTimerSetting.load(context)
+
+    /** True when the unlimited option is owned. Hard-coded false until billing ships. */
+    val premium: Boolean get() = Entitlements.isPremium(context)
+
+    /**
+     * Stores the user's choice for the next share.
+     *
+     * A running share keeps the limit it started with: silently shortening a share
+     * already in progress would look exactly like the host dying on its own.
+     */
+    fun setShareDuration(duration: ShareDuration) {
+        val resolved = ShareTimerPolicy.resolve(duration, Entitlements.isPremium(context))
+        ShareTimerSetting.save(context, resolved)
+        if (!sharingActive) shareDuration = resolved
+        Diagnostics.note(
+            "host",
+            "SHARE_TIMER_SET requested=${duration.label} stored=${resolved.label} " +
+                "activeShareUnchanged=$sharingActive"
+        )
+    }
+
+    /**
+     * Milliseconds until auto-stop, or null when this share has no limit or none
+     * is running. Read by the screen's existing 2-second poll.
+     */
+    fun shareTimeRemainingMs(): Long? {
+        if (shareStartedAtMs == 0L) return null
+        return ShareTimerPolicy.remainingMs(
+            startedAtMs = shareStartedAtMs,
+            nowMs = System.currentTimeMillis(),
+            duration = shareDuration
+        )
     }
 
     /**
