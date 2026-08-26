@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -38,6 +39,8 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.peernet.wifiextender.host.HostCredentials
+import com.peernet.wifiextender.host.RoleConflictPolicy
+import com.peernet.wifiextender.host.ShareAction
 import com.peernet.wifiextender.power.DozeExemption
 import com.peernet.wifiextender.power.DozeExemptionPolicy
 import com.peernet.wifiextender.wifi.GroupCredentialsPolicy
@@ -71,6 +74,10 @@ fun HomeScreen(
     // Distinguishes "user tapped SHARE" from the startup prompt so granting
     // permissions at first launch never silently starts hosting.
     var pendingStartSharing by remember { mutableStateOf(false) }
+    // Set when SHARE is tapped while this phone is receiving as a client. A phone
+    // gets one P2P group, so hosting would destroy the client session; the user is
+    // asked instead of having the internet vanish underneath them.
+    var shareRoleConflict by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -113,6 +120,7 @@ fun HomeScreen(
         }
     }
     val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
+    val tunnelActive by clientViewModel.tunnelActive.collectAsStateWithLifecycle()
 
     // Null means "showing the live value"; non-null means the user is editing.
     // Seeding the field directly from state instead would fight every keystroke.
@@ -338,15 +346,31 @@ fun HomeScreen(
         Spacer(Modifier.height(32.dp))
 
         // ---- SHARE ----
+        // Shared by the direct tap and by the role-conflict confirmation, so both
+        // routes honour the permission gate identically.
+        fun requestShare() {
+            if (missingPerms.isNotEmpty()) {
+                pendingStartSharing = true
+                permissionLauncher.launch(missingPerms.toTypedArray())
+            } else {
+                hostViewModel.startSharing()
+            }
+        }
+
         Button(
             onClick = {
                 if (isHosting) {
                     hostViewModel.stopSharing()
-                } else if (missingPerms.isNotEmpty()) {
-                    pendingStartSharing = true
-                    permissionLauncher.launch(missingPerms.toTypedArray())
                 } else {
-                    hostViewModel.startSharing()
+                    when (
+                        RoleConflictPolicy.evaluateShareRequest(
+                            clientLinkActive = linkedHost != null,
+                            tunnelActive = tunnelActive
+                        )
+                    ) {
+                        ShareAction.CONFIRM_REPLACING_CLIENT_LINK -> shareRoleConflict = true
+                        ShareAction.PROCEED -> requestShare()
+                    }
                 }
             },
             modifier = Modifier
@@ -359,6 +383,38 @@ fun HomeScreen(
             }
         ) {
             Text(if (isHosting) "STOP SHARING" else "SHARE", style = MaterialTheme.typography.titleMedium)
+        }
+
+        if (shareRoleConflict) {
+            AlertDialog(
+                onDismissRequest = { shareRoleConflict = false },
+                title = { Text("Stop receiving first?") },
+                text = {
+                    Text(
+                        "This phone is getting its internet from " +
+                            "${linkedHost?.name ?: "another phone"}. It can host or " +
+                            "receive, but not both at once, so sharing will end that " +
+                            "connection and you will lose internet on this phone."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        shareRoleConflict = false
+                        // Ends the client session deliberately before hosting. The
+                        // group must be left in an orderly way - previously Android
+                        // destroyed it underneath us with no teardown at all.
+                        scope.launch {
+                            stopVpn()
+                            clientViewModel.disconnect()
+                            delay(2_500)
+                            requestShare()
+                        }
+                    }) { Text("STOP AND SHARE") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { shareRoleConflict = false }) { Text("CANCEL") }
+                }
+            )
         }
 
         // ---- CONNECT / DISCONNECT ----

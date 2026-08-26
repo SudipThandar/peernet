@@ -353,6 +353,13 @@ class ClientViewModel @Inject constructor(
     /** Plain-language tunnel progress/error for the single screen. */
     val tunnelStatus: StateFlow<String> = linkManager.tunnelStatus
 
+    /**
+     * Whether the VPN tunnel is up. Exposed so the screen can tell that this phone
+     * is receiving internet even at moments when the link itself has been cleared
+     * but the service has not finished tearing down.
+     */
+    val tunnelActive: StateFlow<Boolean> = linkManager.tunnelActive
+
     /** Lets the UI report what only it can observe (e.g. denied VPN consent). */
     fun reportTunnelStatus(message: String) = linkManager.setTunnelStatus(message)
 
