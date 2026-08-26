@@ -1693,3 +1693,86 @@ unconditionally - the pre-fix behaviour - turned `Unit tests` green to red.
 5-10 minutes, and whether the client's working internet is the tunnel or its own
 mobile data. Both need a `SHARE DIAGNOSTICS` dump from a run #132 build; neither
 is diagnosable from CI. Read the host dump in the order given in section 22.
+---
+
+## 26. The J4 has no SIM - the tunnel has carried real traffic (inference, run #132)
+
+**The fact that settles it.** The SM-J400F has no SIM card, and that model has no
+eSIM. It therefore has no cellular data path at all.
+
+**What that eliminates.** Section 17's second world - "the notification is stale
+and the phone is really on its own mobile data" - cannot apply to the J4. In the
+last report the J4 was the client, associated with the host's P2P group, and:
+
+- a phone holds one Wi-Fi STA association, and the J4's was the P2P group;
+- a P2P group carries no internet of its own (a laptop can associate with
+  `DIRECT-PeerNet-xxxx` and gets nothing - the host only NATs traffic *inside* the
+  QUIC tunnel, in userspace);
+- there is no cellular path.
+
+Internet nonetheless worked at normal speed. There is no remaining route by which
+it could have arrived except the tunnel. **This is the first end-to-end success on
+record.** Until now there was no successful baseline at all, which is why the
+stabilization audit refused to start on WhatsApp-level debugging.
+
+**What was mis-read.** The Wi-Fi "connected without internet" warning is correct
+and permanent - Android's captive-portal probe is not tunnel traffic and will
+never validate on a P2P group. Ignore it forever; it is not a symptom. The missing
+VPN key icon is cosmetic: `awaitTunnelThenCapture` cannot report "Tunnel active"
+without a real TUN fd (`PeerNetVpnService.kt:307-350`, `:372-373`), so a working
+tunnel with no visible icon means the icon was collapsed or missed, not absent.
+
+**Still worth confirming, cheaply.** `tunPackets > 0` renders the grey line's third
+segment (`HomeScreen.kt:304`), and the client dump prints `tunPackets=`. That turns
+this inference into proof. Do it, but do not treat the tunnel as unproven while
+waiting.
+
+**Consequence for role assignment.** The J4 cannot be the host for any test that
+needs internet to share - it has none of its own except over Wi-Fi. A host sharing
+Wi-Fi means STA and group-owner run concurrently on one chipset, which is a
+plausible and untested cause of the 5-10 minute death: STA and GO must usually
+share a channel, and a router changing channel can take the group down. **The
+decisive experiment is to host from the M11 on mobile data with Wi-Fi fully off.**
+If the share then survives well past ten minutes, the fault is STA/GO
+concurrency, not Doze and not the app.
+
+---
+
+## 27. Share duration timer (run #134, `f2e44b8`)
+
+30 / 45 / 60 minutes, plus an unlimited option behind an entitlement. Free tier is
+time-limited rather than crippled: a 30-minute share is a complete share.
+
+**Files.** `host/ShareTimerPolicy.kt` holds `ShareDuration`, `ShareTimerPolicy`,
+`ShareTimerSetting`, `HostStopReason` and `Entitlements`.
+
+**`Entitlements.isPremium` is a hard-coded `false`.** Play Billing is not wired.
+This is the single place that changes when it is, so the unlimited option cannot
+become free through a forgotten check somewhere else.
+
+**Enforcement.** On `HostRuntime`'s existing 2-second supervision tick, not a
+scheduled job - a `WorkManager`/`AlarmManager` deadline can outlive the process
+that set it and stop a share that a *later* session started. The limit is resolved
+once in `startSharing`, so changing the setting mid-share cannot retroactively
+shorten a running share.
+
+**Two properties exist specifically because section 25's host death is still
+open**, and a timer that could be mistaken for it would poison every future dump:
+
+1. `stopSharing(reason)` records `HOST_STOP_REASON=<reason>`; the timer passes
+   `timer-expired`, the user path `user`. `SHARE_TIMER_ARMED` records the limit at
+   the start of the share. So a dump always answers "the user's limit, or the bug?"
+2. A backwards clock jump - NTP correction, the user changing the time, a reboot
+   mid-share - yields the *full* budget, never an instant expiry.
+
+A stored `UNLIMITED` is resolved against the current entitlement on every load, so
+unlimited sharing cannot be inherited from a lapsed subscription or from an older
+build where the option was not gated.
+
+**Gate.** `ShareTimerPolicyTest`, 12 tests. Sabotage: removing the backwards-clock
+guard and making `resolve` return the request unchanged turned `Unit tests` green
+to red.
+
+**Deliberately not built yet, and why.** The paid unlimited tier. Selling "never
+turns off" while the host still dies unexplained after 5-10 minutes earns refunds
+and one-star reviews. Ship the timer, find the death, then sell the subscription.
