@@ -1776,3 +1776,241 @@ to red.
 **Deliberately not built yet, and why.** The paid unlimited tier. Selling "never
 turns off" while the host still dies unexplained after 5-10 minutes earns refunds
 and one-star reviews. Ship the timer, find the death, then sell the subscription.
+
+## 28. Stabilization audit and the four fix phases (runs #136-#141)
+
+A full read of the lifecycle, power and FFI paths, looking for causes of the three
+standing P0 complaints: internet stopping at random, screen-off killing the
+tunnel, and an unexplained crash. Four root causes were found by reading code
+rather than by guessing from symptoms. Three are fixed; one is deliberately only
+half-fixed and that is called out below.
+
+The audit's governing observation, which shaped every fix: **there is no rebind
+path anywhere in the engine.** `core/` contains no `Endpoint::rebind`, no
+`setsockopt`, no `SO_BINDTODEVICE`, and the app never calls `.protect()` or
+`Network.bindSocket`. Preserving a live QUIC connection across an underlying
+network change is therefore not implementable here. A controlled, fast
+re-establish is the only correct response, and that is what Phase B builds.
+
+### RC-2, the screen-off cause (Phase A, run #136, `c99c5aa`)
+
+Both ends acquired `WIFI_MODE_FULL_LOW_LATENCY` on API 29+. The platform honours
+low-latency mode **only while the screen is on and the app is in the
+foreground**, so the one lock that was supposed to protect the tunnel went inert
+at exactly the moment it was needed. `WIFI_MODE_FULL_HIGH_PERF` is deprecated but
+functional and independent of screen state.
+
+`power/WifiLockPolicy.kt` now owns the decision. `lockMode()` deliberately takes
+no SDK-version parameter: the previous code's version check was the bug, so there
+is no version input to get wrong again. The acquire sites log
+`WIFI_LOCK_ACQUIRED mode=FULL_HIGH_PERF survives-screen-off`, which makes the
+mode visible in a dump instead of implied.
+
+A comment in `power/DozeExemptionPolicy.kt` claimed the WifiLock "keeps the Wi-Fi
+radio serviceable". It does not - it prevents Wi-Fi being torn down for power
+saving, which is a narrower promise. The comment was corrected, because a false
+claim in a comment is how the wrong lock mode survived review in the first place.
+
+**Doze state was also unknowable.** `DozeExemption.isExempt()` fed exactly one
+thing, `shouldPrompt` at `HomeScreen.kt`, and was never logged, so no dump ever
+said whether the app was exempt. Both ends now emit `DOZE_EXEMPTION_GRANTED` or
+`DOZE_EXEMPTION_NOT_GRANTED (system may suspend this app when idle)` at acquire
+time. Note the prompt itself is still evaluated inside a Composable, so it has no
+Activity to launch from - the reporting is fixed, the prompting is not.
+
+**Gate.** `WifiLockPolicyTest`, 9 tests. Sabotage: returning
+`MODE_FULL_LOW_LATENCY` from `lockMode()` turned `Unit tests` red.
+
+### RC-1, the actual teardown chain (Phase B, run #138, `368924e`)
+
+This is the mechanism behind "the internet just stops", and it was a
+self-inflicted teardown, not a radio failure.
+
+`PeerNetVpnService` registered a network callback with `.clearCapabilities()` and
+implemented **`onLost` only**. Tunnel identity was the ephemeral network id
+string. When the screen went off, the P2P group re-associated and Android issued
+a *new* `Network` object for the same physical link (observed: 723 replaced by
+726). The service saw `onLost(723)`, concluded the link was gone, and ran the
+whole chain: `UNDERLYING_NETWORK_LOST` -> `LINK_CLEARED_EXTERNALLY` ->
+`VPN_STOP_REQUESTED` -> `TUN_CLOSED` -> `CLIENT_CLEANUP_COMPLETED`. The link was
+fine. The app killed it.
+
+`service/UnderlyingNetworkPolicy.kt` replaces "loss means death" with "loss opens
+a window". `onLost` no longer tears anything down: it records
+`awaitingReplacementSince`, logs
+`UNDERLYING_NETWORK_LOST net=... - awaiting replacement (12000ms)`, shows
+"Reconnecting to the host..." and immediately tries to resolve a replacement. The
+callback now also implements `onAvailable` and `onLinkPropertiesChanged`, which is
+how the replacement is noticed at all.
+
+`shouldAdopt` refuses a candidate that is a VPN, that cannot reach the host, or
+that arrives with no TUN installed. On adoption the service logs
+`UNDERLYING_NETWORK_ADOPTED net= was= via= (replacement|first)`, pins sockets,
+**rebinds the process** - the previous code only pinned, which is
+accounting-only - and re-establishes QUIC only when it is genuinely replacing a
+network (`QUIC_REESTABLISH_STARTED` / `QUIC_REESTABLISHED` /
+`QUIC_REESTABLISH_FAILED` / `QUIC_REESTABLISH_SKIPPED`).
+
+**The TUN fd is never touched during any of this.** The VPN stays up, so apps
+keep their sockets and see a stall rather than a disconnect.
+
+The 12-second grace window is not arbitrary and is asserted in a test to be under
+half the 90-second QUIC idle timeout, so the watchdog
+(`UNDERLYING_REPLACEMENT_TIMEOUT after Xms`) always fires while the QUIC
+connection is still theoretically alive. Raising the idle timeout is forbidden and
+this fix does not need it.
+
+`TunnelSupervisorPolicy.shouldTeardownOnLoss` was renamed `lossConcernsTunnel`.
+Same signature, same logic: the old name asserted a conclusion that is no longer
+true, since a true result now opens a recovery window rather than ordering a
+teardown.
+
+**Gate.** `UnderlyingNetworkPolicyTest`, 15 tests, including an exhaustive sweep
+of all 32 input combinations to `shouldAdopt` asserting exactly 3 adopt. Sabotage:
+`shouldAdopt` returning `false` turned `Unit tests` red.
+
+### Client-side ownership bugs (Phase C, run #140, `f35e7fb`)
+
+Three independent ways the client could act on stale information.
+
+1. **A stale notification could stop a live session.** The Stop action called
+   `setLinked(null)` with no generation check, so a notification left over from a
+   previous session killed the current one. The `PendingIntent` now carries
+   `EXTRA_LINK_GEN`, and `VpnNotificationActionReceiver` logs
+   `STOP_ACTION_IGNORED_STALE gen= now=` and returns when the stamp is not
+   current. A missing stamp is still honoured, so a notification from an older
+   build cannot become un-stoppable.
+2. **The already-capturing path never rebound the process.** It called only
+   `pinSocketsToUnderlying()`. It now also calls `bindProcessToLink()`.
+3. **Host resolution picked arbitrarily.** `resolveUnderlyingFromHost` used the
+   deprecated `cm.allNetworks` and took `firstOrNull` of a /24 match, so any
+   second interface on the same subnet was a coin flip. It now collects all
+   candidates, logs `UNDERLYING_AMBIGUOUS N networks match ...` when there is
+   more than one, and prefers the Wi-Fi Direct range via
+   `LinkPolicy.isWifiDirectAddress`.
+
+No sabotage branch was run for this phase - the generation plumbing is the same
+pattern already gated elsewhere, and Actions capacity was better spent on Phase D.
+That is a gap in the record, not a claim of correctness.
+
+### RC-5 and two silent data-path killers (Phase D, `bef48e5`, VERIFICATION PENDING)
+
+**`describe()` could panic on a malformed frame.** The IPv6 arm tested only
+`!packet.is_empty()` before reading `packet[6]`, so any 1-to-6 byte frame whose
+first nibble is 6 indexed out of bounds. Nothing guarantees a TUN read is a
+well-formed packet. The panic killed the capture task while `CAPTURE_ALIVE` still
+reported `up`, which is the worst possible combination: the tunnel carries nothing
+and the diagnostics line insists the data path is healthy. It now requires a full
+40-byte header and labels truncated frames `v6 short (NB)`.
+
+**`CAPTURE_FDS` was one unstamped slot.** A capture task that exited after a new
+session had registered closed the *new* session's descriptors. That close is
+silent, it produces EBADF on a tunnel that still looks alive, and because fd
+numbers are reused immediately it could also land on an unrelated descriptor
+anywhere in the process. The slot is now stamped with a capture generation claimed
+once per session; every task-exit close is scoped to its own generation, while
+`stopTunCapture` keeps closing whatever is registered because it is the
+authoritative stop.
+
+**RC-5: nothing enforced the no-panic rule at the FFI boundary.** The module
+header has always claimed "no panics cross the FFI boundary" and nothing
+implemented it. `core/Cargo.toml`'s release profile does not set
+`panic = "abort"`, so unwinding is live, and all thirteen `extern "system"` entry
+points called straight into engine code. A panic reaching that boundary is
+undefined behaviour and on Android aborts the process: the app vanishes with no
+message, and there is no diagnostics dump either because the process holding the
+diagnostics is gone. This is the leading explanation for the unexplained crash,
+though it is not proven - no crash text has ever been captured.
+
+All thirteen now run inside `guard_ffi`, which catches the unwind, records
+`internal error in <entry point>: <detail>` via `set_last_error`, and returns a
+safe fallback. It is not a silent catch: the reason reaches `lastError()` and
+therefore the one app screen, so a caught panic looks like a reported fault rather
+than a mysterious no-op. `AssertUnwindSafe` is required because `JNIEnv` is not
+`UnwindSafe`; it is justified because the engine's shared state is atomics plus
+mutexes already read with `unwrap_or_else(|p| p.into_inner())`, so a poisoned lock
+is handled rather than propagated.
+
+**Gates.** `describe_never_panics_on_malformed_frames` sweeps every first nibble
+at every length across both header boundaries and asserts the exact label for
+truncated IPv6. `only_the_owning_generation_may_close` covers the ownership
+predicate. `a_stale_capture_task_cannot_close_a_newer_sessions_fds` proves it on
+the real tracker using a descriptor the test owns, serialised on the existing
+`ENGINE_LOCK` because these statics are process-global.
+
+**Status: run #141 has not verified this commit.** GitHub Actions was in a
+declared major outage (upstream database failover, inbound traffic throttled) for
+the entire attempt. The first attempt's four jobs were cancelled at exactly 15
+minutes with `steps=0`, never having been assigned a runner; the re-run sat queued
+with zero jobs. No job ever executed, so **this phase has no green run and no
+sabotage validation.** Both are owed before Phase D is treated as done.
+
+### What the audit found and this work did NOT fix
+
+Listed because a known unfixed defect is worth more than a forgotten one.
+
+**RC-3, recovery lives in the wrong scope. Half-fixed, deliberately.** Teardown
+runs in the foreground service, which survives Activity destruction. Recovery -
+the auto-connect poll, liveness checks, discovery, probing - lives in
+`ClientViewModel.viewModelScope`, which dies with the Activity. The asymmetry
+means that with the Activity gone the tunnel can die but can never come back.
+
+Phase B fixes the case that actually matters most, network replacement, because
+that recovery now lives in the service. Moving the rest was **deliberately
+deferred**: it is a large refactor of the stable networking path, it can only be
+verified to compile here, and the obvious naive version is continuous background
+polling, which is explicitly forbidden. Doing it badly would trade a known P0 for
+an unknown one. It should be done with device visibility, not blind.
+
+**Other findings left alone, with severity:**
+
+- **(P1) Host UDP NAT** keys on client source port only, is global, has no idle
+  sweep, and evicts one entry at a time once it hits 512.
+- **(P2) smoltcp is built without IPv6, ICMP or reassembly**
+  (`core/peernet-tcp/Cargo.toml`), and sets neither `set_timeout` nor
+  `set_keep_alive`, so terminated flows never idle out and leak roughly 128 KiB
+  each.
+- **(P2) The share timer is not persisted**, so killing the host process loses the
+  deadline.
+- **(P1/P0, still open) The host stops by itself after 5-10 minutes.** Unchanged by
+  this work. The leading hypothesis remains STA/GO channel concurrency, and the
+  decisive test remains hosting from the M11 on mobile data with Wi-Fi fully off.
+- **The client has no screen-off awareness at all.** `ACTION_SCREEN_OFF`/`ON`
+  receivers exist only in `HostForegroundService`, and only write diagnostics.
+
+**Release readiness (P3), all still open.** `signingConfig = null`, so there is no
+upload key. CI runs only `assembleDebug`, `testDebugUnitTest` and `lintDebug`,
+which means **`assembleRelease` has never run once** while release builds have
+both `isMinifyEnabled` and `isShrinkResources` on - R8 is completely untested.
+`proguard-rules.pro` does at least keep `com.peernet.wifiextender.core.**`, which
+covers the JNI surface. `versionCode` is still 1. The manifest declares
+`WAKE_LOCK` and `uses-feature android.software.device_admin` and uses neither, and
+the two `specialUse` foreground services need Play Console justification text.
+
+### Manual device test matrix
+
+There is no adb and emulators cannot do Wi-Fi Direct, so these cannot be
+automated and CI proves none of them. Roles as in the last report: **J4 (API 29,
+no SIM) as client, M11 (API 31, has SIM) as host.** Every check reads from
+`SHARE DIAGNOSTICS` on the device itself.
+
+Note throughout: the client's Wi-Fi "connected without internet" system warning is
+correct and permanent. Ignore it.
+
+| # | Test | Steps | Pass condition | Fails if |
+|---|---|---|---|---|
+| 1 | Lock mode is right | Start a share, start a client, dump both | Both dumps show `WIFI_LOCK_ACQUIRED mode=FULL_HIGH_PERF survives-screen-off` | Any dump says `FULL_LOW_LATENCY SCREEN-ON-ONLY` |
+| 2 | Doze state is stated | Same dumps | Each shows `DOZE_EXEMPTION_GRANTED` or `DOZE_EXEMPTION_NOT_GRANTED` | Neither line appears |
+| 3 | Tunnel carries traffic | With the tunnel up, load a page on the J4 | `tun=` and `in=` both rising in `engineStats`; the J4 has no SIM so this can only be the tunnel | `in=0` while `tun=` rises: host reachable but not relaying |
+| 4 | **Screen-off soak, 15 min** | Tunnel up, screen off on both, wait 15 min, wake and dump the client | `UNDERLYING_NETWORK_LOST ... awaiting replacement` followed by `UNDERLYING_NETWORK_ADOPTED ... (replacement)`, and internet still works | The old chain appears: `LINK_CLEARED_EXTERNALLY` -> `VPN_STOP_REQUESTED` -> `TUN_CLOSED` |
+| 5 | Replacement is fast enough | Same dump | Any `QUIC_REESTABLISHED` present; no `UNDERLYING_REPLACEMENT_TIMEOUT` | `UNDERLYING_REPLACEMENT_TIMEOUT after Xms` appears |
+| 6 | Stale Stop is ignored | Connect, disconnect, connect again, then tap Stop on the *old* notification if still present | `STOP_ACTION_IGNORED_STALE gen= now=` and the live tunnel survives | The live tunnel stops |
+| 7 | Host death isolation | Host from the M11 **on mobile data with Wi-Fi fully off**, hold 20 min | Share still alive; dump shows `LINKSERVER_ALIVE (tick)` spans consistent with roughly one tick per 15 s | Confirms STA/GO channel concurrency as the cause |
+| 8 | Host death classification | If the host does stop, dump immediately | `HOST_STOP_REASON=` names it | No reason line and the dump starts near `+0`: the process was killed |
+| 9 | Timer is the user's, not a bug | Set 30 min, start, let it expire | `SHARE_TIMER_ARMED` at start and `HOST_STOP_REASON=timer-expired` at stop | Stop with no reason line |
+| 10 | Timer survives the UI | Start a 30 min share, rotate the phone, background and reopen the app | Countdown continues from the real deadline; no reset, no second timer | Remaining time jumps or resets |
+| 11 | Role conflict warns | With a client session live, tap SHARE | Confirmation dialog before anything is torn down | The client session dies silently |
+| 12 | Voice call | WhatsApp voice call over the tunnel | Call connects and holds; `fanout>0` and `rmiss=0` | `rmiss` climbing: replies arrive that no flow can claim |
+
+Tests 4, 5 and 7 are the ones that matter. Test 4 is the direct check on RC-1 and
+RC-2 together, and test 7 is the only way to settle the host death.
