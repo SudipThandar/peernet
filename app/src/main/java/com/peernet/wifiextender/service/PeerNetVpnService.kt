@@ -12,6 +12,8 @@ import com.peernet.wifiextender.PeerNetApp
 import com.peernet.wifiextender.R
 import com.peernet.wifiextender.core.RustCoreBridge
 import com.peernet.wifiextender.diag.Diagnostics
+import com.peernet.wifiextender.power.DozeExemption
+import com.peernet.wifiextender.power.WifiLockPolicy
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -174,6 +176,11 @@ class PeerNetVpnService : VpnService() {
      *
      * This is a `WifiManager` lock, not a `PowerManager` wake lock: it does not
      * hold the CPU and never keeps the screen on.
+     *
+     * The mode comes from [WifiLockPolicy]: this used to ask for
+     * `WIFI_MODE_FULL_LOW_LATENCY`, which is only active while the screen is on
+     * and the app is foreground, so it did nothing in the one situation it was
+     * added for. See that class for the full reasoning.
      */
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
@@ -181,18 +188,17 @@ class PeerNetVpnService : VpnService() {
         if (!TunnelSupervisorPolicy.shouldHoldWifiLock(tunFd != -1)) return
         if (wifiLock?.isHeld == true) return
         val wm = getSystemService(android.net.wifi.WifiManager::class.java) ?: return
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } else {
-            @Suppress("DEPRECATION")
-            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        }
+        val mode = WifiLockPolicy.lockMode()
         try {
             wifiLock = wm.createWifiLock(mode, "peernet-client").apply {
                 setReferenceCounted(false)
                 acquire()
             }
-            Diagnostics.note("vpn", "WIFI_LOCK_ACQUIRED mode=$mode (radio stays out of power save)")
+            Diagnostics.note(
+                "vpn",
+                "WIFI_LOCK_ACQUIRED mode=${WifiLockPolicy.describe(mode)}"
+            )
+            noteDozeState()
         } catch (t: Throwable) {
             // Never fail a tunnel over this; it degrades screen-off behaviour
             // only, and the report must say so rather than looking healthy.
@@ -209,6 +215,25 @@ class PeerNetVpnService : VpnService() {
         runCatching { if (lock.isHeld) lock.release() }
         wifiLock = null
         Diagnostics.note("vpn", "WIFI_LOCK_RELEASED")
+    }
+
+    /**
+     * Records whether the Doze exemption is actually GRANTED.
+     *
+     * Audit finding: the only Doze line a report ever contained was
+     * `DOZE_EXEMPTION_PROMPTED`, written when the dialog was *shown*. A reader
+     * could not tell whether the user granted it, declined it, or never saw it -
+     * which made every screen-off report ambiguous about the one variable being
+     * investigated. `DozeExemption.isExempt` already existed and was only ever
+     * used as an input to the prompt decision, never reported.
+     */
+    private fun noteDozeState() {
+        val granted = DozeExemption.isExempt(this)
+        Diagnostics.note(
+            "vpn",
+            if (granted) "DOZE_EXEMPTION_GRANTED"
+            else "DOZE_EXEMPTION_NOT_GRANTED (system may suspend this app when idle)"
+        )
     }
 
     /**

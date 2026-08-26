@@ -4,6 +4,8 @@ import android.content.Context
 import com.peernet.wifiextender.diag.Diagnostics
 import com.peernet.wifiextender.discovery.HostIdentity
 import com.peernet.wifiextender.discovery.NsdHostAdvertiser
+import com.peernet.wifiextender.power.DozeExemption
+import com.peernet.wifiextender.power.WifiLockPolicy
 import com.peernet.wifiextender.util.Permissions
 import com.peernet.wifiextender.wifi.LinkServer
 import com.peernet.wifiextender.wifi.WifiDirectManager
@@ -87,8 +89,10 @@ class HostRuntime @Inject constructor(
      * Rust engine and the P2P group all keep running - so the radio is the
      * remaining mechanism.
      *
-     * `WIFI_MODE_FULL_LOW_LATENCY` (API 29+) also disables power save; the older
-     * `WIFI_MODE_FULL_HIGH_PERF` is the equivalent below that.
+     * `WIFI_MODE_FULL_LOW_LATENCY` (API 29+) is deliberately NOT used: it is only
+     * in effect while the screen is on and this app is in the foreground, which
+     * is the exact opposite of what is needed here. [WifiLockPolicy] holds the
+     * reasoning and the mode choice.
      */
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
@@ -96,18 +100,22 @@ class HostRuntime @Inject constructor(
         if (wifiLock?.isHeld == true) return
         val wm = context.getSystemService(Context.WIFI_SERVICE)
             as? android.net.wifi.WifiManager ?: return
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } else {
-            @Suppress("DEPRECATION")
-            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        }
+        val mode = WifiLockPolicy.lockMode()
         try {
             wifiLock = wm.createWifiLock(mode, "peernet-host").apply {
                 setReferenceCounted(false)
                 acquire()
             }
-            Diagnostics.note("host", "WIFI_LOCK_ACQUIRED mode=$mode (radio stays out of power save)")
+            Diagnostics.note(
+                "host",
+                "WIFI_LOCK_ACQUIRED mode=${WifiLockPolicy.describe(mode)}"
+            )
+            val granted = DozeExemption.isExempt(context)
+            Diagnostics.note(
+                "host",
+                if (granted) "DOZE_EXEMPTION_GRANTED"
+                else "DOZE_EXEMPTION_NOT_GRANTED (system may suspend this app when idle)"
+            )
         } catch (t: Throwable) {
             // Never fail a share over this; it degrades screen-off behaviour
             // only, and the report must say so rather than looking healthy.
