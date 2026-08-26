@@ -121,6 +121,33 @@ class ClientViewModel @Inject constructor(
                 disconnect()
             }
         }
+        // Follow the authoritative link. `ClientLinkManager` is cleared by the VPN
+        // service and by the notification's Stop action as well as from here, and
+        // none of those paths knew about this screen's `connectedHost` - so the app
+        // went on claiming "Connected to PeerNet-xxxx" over a dead session after
+        // the host tapped STOP. The `joinedAsClient` watcher below cannot cover
+        // this: that flag never becomes true when the user joins through Android's
+        // Wi-Fi settings, so its falling edge never fires.
+        viewModelScope.launch {
+            var hadLink = false
+            linkManager.linkedHost.collect { link ->
+                val hasLink = link != null
+                if (LinkPolicy.shouldClearStaleUi(
+                        hadManagerLink = hadLink,
+                        hasManagerLink = hasLink,
+                        uiShowsLink = _uiState.value.connectedHost != null
+                    )
+                ) {
+                    Diagnostics.note(
+                        "client",
+                        "LINK_CLEARED_EXTERNALLY s=$session - manager dropped the link " +
+                            "while the screen still showed one"
+                    )
+                    clearLocalLinkState("Disconnected from the host.")
+                }
+                hadLink = hasLink
+            }
+        }
         viewModelScope.launch {
             var wasJoined = false
             wifiDirect.state.collect { s ->
@@ -822,13 +849,26 @@ class ClientViewModel @Inject constructor(
      * cleanup that had not happened. Safe to call repeatedly.
      */
     private fun clearLink(message: String) {
+        // Invalidates the generation, so every in-flight probe, retry and VPN
+        // bring-up belonging to this session abandons itself.
+        linkManager.setLinked(null)
+        clearLocalLinkState(message)
+    }
+
+    /**
+     * Clears this screen's own view of the link **without** touching the link
+     * manager.
+     *
+     * Needed because the manager can be cleared by someone else - the VPN service
+     * on teardown, or the notification's Stop action - and calling `setLinked`
+     * again from here would burn a second generation, invalidating the session
+     * that a concurrent reconnect may already have established.
+     */
+    private fun clearLocalLinkState(message: String) {
         val had = _uiState.value.connectedHost != null
         Diagnostics.note("link", "cleared: $message")
         livenessJob?.cancel()
         livenessJob = null
-        // Invalidates the generation, so every in-flight probe, retry and VPN
-        // bring-up belonging to this session abandons itself.
-        linkManager.setLinked(null)
         _uiState.update { it.copy(connectedHost = null, status = message) }
         // Re-arm auto-connect: the next poll should probe immediately rather
         // than inherit the backoff from whatever ended the previous session.

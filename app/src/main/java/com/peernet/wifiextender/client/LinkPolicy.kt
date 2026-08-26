@@ -147,6 +147,34 @@ object LinkPolicy {
     }
 
     /**
+     * Whether the client screen is showing a link that the link manager has
+     * already dropped.
+     *
+     * `ClientLinkManager.linkedHost` is the authority, but three writers outside
+     * the view model call `setLinked(null)` - `PeerNetVpnService` twice and the
+     * notification's Stop action - and none of them touched the view model's own
+     * `connectedHost`. So the screen kept reading "Connected to PeerNet-xxxx"
+     * over a link that no longer existed, which is exactly what happened when the
+     * host tapped STOP: the Wi-Fi vanished and the app still claimed a session.
+     *
+     * The watcher that was *supposed* to catch this (`joinedAsClient` going
+     * false) cannot fire for this app's documented client flow at all: joining by
+     * typing the passphrase in Android's Wi-Fi settings never produces P2P client
+     * callbacks, so `joinedAsClient` stays false forever and its falling edge
+     * never happens. Watching the manager instead works for every join method.
+     *
+     * This is deliberately an **edge**, not a level. `linkedHost` is null before a
+     * link is established too, and a level check would clear the screen during
+     * connection - or fight the view model while it is setting the link up. Only
+     * a transition from linked to unlinked means a session actually ended.
+     */
+    fun shouldClearStaleUi(
+        hadManagerLink: Boolean,
+        hasManagerLink: Boolean,
+        uiShowsLink: Boolean
+    ): Boolean = hadManagerLink && !hasManagerLink && uiShowsLink
+
+    /**
      * Extra probe grace for Wi-Fi Direct sessions, on top of [missThreshold].
      * Bounded on purpose: the definitive end-of-session signal is the host's
      * network disappearing, not this counter.
