@@ -1,4 +1,4 @@
-﻿//! JNI bridge between the Android app and the Rust engine.
+//! JNI bridge between the Android app and the Rust engine.
 //!
 //! Loaded from Kotlin via `System.loadLibrary("peernet_core")`.
 //! Symbol names must match `com.peernet.wifiextender.core.NativeCore` exactly.
@@ -6,7 +6,7 @@
 //! Constraints honored here:
 //! - no panics cross the FFI boundary
 //! - TUN fd is received as i32, wrapped in `OwnedFd`, and driven exclusively
-//!   through tokio async I/O (`AsyncFd`) â€” never blocking reads
+//!   through tokio async I/O (`AsyncFd`) - never blocking reads
 //! - ownership transfers to Rust on start; Kotlin never closes the same fd,
 //!   which rules out double-close UB (stop path closes it exactly once)
 
@@ -380,6 +380,42 @@ fn set_last_error(msg: &str) {
     *last_error_slot().lock().unwrap_or_else(|p| p.into_inner()) = msg.to_string();
 }
 
+/// Runs `body`, turning a panic into `fallback` instead of letting it unwind
+/// out of a JNI entry point.
+///
+/// The module header has always claimed "no panics cross the FFI boundary", but
+/// nothing enforced it: all thirteen `extern "system"` functions called straight
+/// into engine code, and the release profile does not set `panic = "abort"`, so
+/// unwinding is in effect. A panic reaching the `extern` boundary is undefined
+/// behaviour; on Android it aborts the process. The user sees the app vanish
+/// with no message, and because the process is gone there is no diagnostics
+/// dump either - the single worst failure mode this app can have.
+///
+/// `AssertUnwindSafe` is required because `JNIEnv` is not `UnwindSafe`. It is
+/// justified here: the engine's shared state is atomics plus mutexes that are
+/// already read with `unwrap_or_else(|p| p.into_inner())`, so a lock poisoned
+/// by a panic is handled rather than propagated.
+///
+/// Deliberately not a silent catch: the reason is recorded in `lastError()`, so
+/// a caught panic still shows up on the one app screen instead of looking like
+/// a mysterious no-op.
+fn guard_ffi<T, F: FnOnce() -> T>(what: &str, fallback: T, body: F) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(payload) => {
+            let detail = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            set_last_error(&format!("internal error in {what}: {detail}"));
+            fallback
+        }
+    }
+}
+
 // ---------- Core info ----------
 
 /// NativeCore.version() -> String
@@ -390,8 +426,10 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_version<
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
-    let text = concat!("peernet-core ", env!("CARGO_PKG_VERSION"));
-    create_string(env, text)
+    let text = guard_ffi("version", String::new(), || {
+        concat!("peernet-core ", env!("CARGO_PKG_VERSION")).to_string()
+    });
+    create_string(env, &text)
 }
 
 /// NativeCore.newSessionId() -> String (32-char hex)
@@ -402,7 +440,10 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_newSessionI
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
-    create_string(env, &SessionId::generate().to_hex())
+    let id = guard_ffi("newSessionId", String::new(), || {
+        SessionId::generate().to_hex()
+    });
+    create_string(env, &id)
 }
 
 // ---------- TUN capture (Milestone 6) ----------
@@ -419,11 +460,15 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunCap
     fd: jint,
     mtu: jint,
 ) -> jboolean {
+    guard_ffi("startTunCapture", 0, || start_tun_capture_impl(fd, mtu))
+}
+
+fn start_tun_capture_impl(fd: jint, mtu: jint) -> jboolean {
     if fd < 0 {
         return 0;
     }
     if TUN_FD.swap(fd as i32, Ordering::SeqCst) != -1 {
-        // Already capturing; hand the fd back untouched by leaving it open â€”
+        // Already capturing; hand the fd back untouched by leaving it open -
         // caller treats false as "abort" and will not close it either.
         return 0;
     }
@@ -458,16 +503,19 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_stopTunCapt
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
-    TUN_STOP.store(true, Ordering::SeqCst);
-    let fd = TUN_FD.swap(-1, Ordering::SeqCst);
-    if fd >= 0 {
-        // Closing the tracked fds wakes pending reads/writes with EBADF.
-        // The capture task also runs close_capture_fds() on exit; both
-        // paths are safe because the tracker swaps to -1 first.
-        close_capture_fds();
-        return 1;
-    }
-    0
+    guard_ffi("stopTunCapture", 0, || {
+        TUN_STOP.store(true, Ordering::SeqCst);
+        let fd = TUN_FD.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
+            // Closing the tracked fds wakes pending reads/writes with EBADF.
+            // The capture task also closes them on exit, but scoped to its own
+            // generation; this path is the authoritative stop and closes
+            // whatever session is registered right now.
+            close_current_capture_fds();
+            return 1;
+        }
+        0
+    })
 }
 
 /// NativeCore.tunPacketCount() -> Long
@@ -478,7 +526,9 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunPacketCo
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jlong {
-    PACKETS.load(Ordering::Relaxed) as jlong
+    guard_ffi("tunPacketCount", 0, || {
+        PACKETS.load(Ordering::Relaxed) as jlong
+    })
 }
 
 // ---------- PNTP engine lifecycle (Milestone 7) ----------
@@ -525,13 +575,20 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
 ) -> JString<'local> {
     let name = get_string(&mut env, &device_name);
     let dns = get_string(&mut env, &dns_upstream);
+    let fingerprint = guard_ffi("startHost", String::new(), || {
+        start_host_impl(port, &name, &dns)
+    });
+    create_string(env, &fingerprint)
+}
+
+fn start_host_impl(port: jint, name: &str, dns: &str) -> String {
     let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_some() {
         set_last_error("host engine already running on this port");
-        return create_string(env, "");
+        return String::new();
     }
     let addr = SocketAddr::from(([0, 0, 0, 0], port.clamp(1, 65535) as u16));
-    match bind_host_server(addr, &name, &dns) {
+    match bind_host_server(addr, name, dns) {
         Ok(server) => {
             let fingerprint = server.fingerprint_hex().to_string();
             let server = std::sync::Arc::new(server);
@@ -541,12 +598,12 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startHost<
             });
             *guard = Some(server);
             crate::jni_log(&format!("[host] engine up on {addr}, pin {fingerprint}"));
-            create_string(env, &fingerprint)
+            fingerprint
         }
         Err(e) => {
             set_last_error(&format!("host bind failed: {e}"));
             crate::jni_log(&format!("[host] bind failed: {e}"));
-            create_string(env, "")
+            String::new()
         }
     }
 }
@@ -559,14 +616,16 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_stopHost<
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
-    let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
-    match guard.take() {
-        Some(server) => {
-            server.shutdown();
-            1
+    guard_ffi("stopHost", 0, || {
+        let mut guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
+        match guard.take() {
+            Some(server) => {
+                server.shutdown();
+                1
+            }
+            None => 0,
         }
-        None => 0,
-    }
+    })
 }
 
 /// NativeCore.hostSessionCount() -> Int
@@ -577,8 +636,10 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_hostSession
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jint {
-    let guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
-    guard.as_ref().map(|s| s.session_count()).unwrap_or(0) as jint
+    guard_ffi("hostSessionCount", 0, || {
+        let guard = host_slot().lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().map(|s| s.session_count()).unwrap_or(0) as jint
+    })
 }
 
 /// NativeCore.startTunnel(serverAddr: String, fingerprintHex: String, deviceName: String) -> Boolean
@@ -600,8 +661,10 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel
     let addr = get_string(&mut env, &server_addr);
     let fp = get_string(&mut env, &fingerprint_hex);
     let name = get_string(&mut env, &device_name);
+    guard_ffi("startTunnel", 0, || start_tunnel_impl(addr, fp, name))
+}
 
-    let Ok(parsed) = SocketAddr::from_str(&addr) else {
+fn start_tunnel_impl(addr: String, fp: String, name: String) -> jboolean {    let Ok(parsed) = SocketAddr::from_str(&addr) else {
         set_last_error(&format!("bad host address '{addr}'"));
         return 0;
     };
@@ -681,26 +744,28 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_stopTunnel<
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
-    CLIENT_STARTING.store(false, Ordering::SeqCst);
-    TUNNEL_STATE.store(0, Ordering::SeqCst);
-    // Invalidate any handshake still in flight.
-    ENGINE_GEN.fetch_add(1, Ordering::SeqCst);
-    clear_udp_flows();
-    tcp_teardown();
-    // Clone the handle out before touching the slot again; shutdown() is
-    // synchronous so it is safe outside the lock.
-    let client = {
-        let guard = client_slot().lock().unwrap_or_else(|p| p.into_inner());
-        guard.as_ref().map(std::sync::Arc::clone)
-    };
-    match client {
-        Some(client) => {
-            client.shutdown();
-            *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
-            1
+    guard_ffi("stopTunnel", 0, || {
+        CLIENT_STARTING.store(false, Ordering::SeqCst);
+        TUNNEL_STATE.store(0, Ordering::SeqCst);
+        // Invalidate any handshake still in flight.
+        ENGINE_GEN.fetch_add(1, Ordering::SeqCst);
+        clear_udp_flows();
+        tcp_teardown();
+        // Clone the handle out before touching the slot again; shutdown() is
+        // synchronous so it is safe outside the lock.
+        let client = {
+            let guard = client_slot().lock().unwrap_or_else(|p| p.into_inner());
+            guard.as_ref().map(std::sync::Arc::clone)
+        };
+        match client {
+            Some(client) => {
+                client.shutdown();
+                *client_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+                1
+            }
+            None => 0,
         }
-        None => 0,
-    }
+    })
 }
 
 /// NativeCore.tunnelState() -> Int (see TUNNEL_STATE mapping)
@@ -711,7 +776,7 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_tunnelState
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jint {
-    TUNNEL_STATE.load(Ordering::SeqCst)
+    guard_ffi("tunnelState", 0, || TUNNEL_STATE.load(Ordering::SeqCst))
 }
 
 /// NativeCore.lastError() -> String ("" when nothing failed since the last
@@ -724,10 +789,12 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_lastError<
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
-    let msg = last_error_slot()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
+    let msg = guard_ffi("lastError", String::new(), || {
+        last_error_slot()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    });
     create_string(env, &msg)
 }
 
@@ -755,8 +822,13 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
+    let stats = guard_ffi("engineStats", String::new(), engine_stats_line);
+    create_string(env, &stats)
+}
+
+fn engine_stats_line() -> String {
     let (flows_open, ports_open) = udp_flow_gauges();
-    let stats = format!(
+    format!(
         "tun={} udp={} tcp={} in={} lost={} cap={} eng={} \
          flows={}/{} fnew={} fexp={} fanout={} rok={} rmap={} rmiss={}",
         PACKETS.load(Ordering::Relaxed),
@@ -781,24 +853,73 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_engineStats
         UDP_REPLY_EXACT.load(Ordering::Relaxed),
         UDP_REPLY_REMAPPED.load(Ordering::Relaxed),
         UDP_REPLY_UNMATCHED.load(Ordering::Relaxed),
-    );
-    create_string(env, &stats)
+    )
 }
 
 /// All fds backing an active capture session (original + read/write
-/// duplicates). Closed exactly once by close_capture_fds(); registered
-/// before the async halves are built so every exit path cleans up.
-static CAPTURE_FDS: Mutex<[i32; 3]> = Mutex::new([-1, -1, -1]);
+/// duplicates), stamped with the capture generation that owns them.
+///
+/// The stamp is load-bearing. `stopTunCapture` closes the tracked fds to wake
+/// pending reads, and the capture task also closes them on its way out - but
+/// those two events are not ordered with respect to a *new* session starting.
+/// Without a generation, a capture task that exited late called
+/// `close_capture_fds()` and closed the fds a newer session had just
+/// registered. Closing a live TUN fd this way is silent: capture stays marked
+/// alive, reads fail with EBADF, and the tunnel carries nothing. Worse, the
+/// number is immediately reusable, so the close can land on an unrelated
+/// descriptor opened by any thread in the process.
+static CAPTURE_FDS: Mutex<(u64, [i32; 3])> = Mutex::new((0, [-1, -1, -1]));
 
-fn register_capture_fds(original: i32, read_fd: i32, write_fd: i32) {
-    *CAPTURE_FDS.lock().unwrap_or_else(|p| p.into_inner()) = [original, read_fd, write_fd];
+static CAPTURE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Claims the next capture generation. Called once per capture session.
+fn next_capture_gen() -> u64 {
+    CAPTURE_GEN.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-fn close_capture_fds() {
-    let fds = std::mem::replace(
-        &mut *CAPTURE_FDS.lock().unwrap_or_else(|p| p.into_inner()),
-        [-1, -1, -1],
-    );
+fn register_capture_fds(gen: u64, original: i32, read_fd: i32, write_fd: i32) {
+    *CAPTURE_FDS.lock().unwrap_or_else(|p| p.into_inner()) =
+        (gen, [original, read_fd, write_fd]);
+}
+
+/// Whether the session identified by [gen] still owns the fds in the tracking
+/// slot currently stamped [slot_gen].
+///
+/// Split out so the ownership rule is testable without touching process-wide
+/// descriptor state: the whole fix is that a late-exiting capture task must
+/// answer `false` here rather than closing a live tunnel's fds.
+fn capture_gen_owns(slot_gen: u64, gen: u64) -> bool {
+    slot_gen == gen
+}
+
+/// Closes the fds belonging to [gen], or does nothing if a newer session owns
+/// the slot. This is the path every capture-task exit uses.
+fn close_capture_fds(gen: u64) {
+    let fds = {
+        let mut slot = CAPTURE_FDS.lock().unwrap_or_else(|p| p.into_inner());
+        if !capture_gen_owns(slot.0, gen) {
+            // A newer capture session owns these descriptors. Closing them
+            // here would break the live tunnel, not clean up after this one.
+            return;
+        }
+        std::mem::replace(&mut slot.1, [-1, -1, -1])
+    };
+    for fd in fds.iter().filter(|f| **f >= 0) {
+        unsafe {
+            libc::close(*fd);
+        }
+    }
+}
+
+/// Closes whatever capture session is currently registered.
+///
+/// Used by the explicit `stopTunCapture` path, which is authoritative: it is
+/// stopping the session that exists right now, whichever generation that is.
+fn close_current_capture_fds() {
+    let fds = {
+        let mut slot = CAPTURE_FDS.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::replace(&mut slot.1, [-1, -1, -1])
+    };
     for fd in fds.iter().filter(|f| **f >= 0) {
         unsafe {
             libc::close(*fd);
@@ -811,6 +932,11 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     use std::os::fd::AsFd;
     use std::os::unix::io::AsRawFd;
 
+    // This session's identity. Every close below is scoped to it, so a task
+    // that exits after a new session has started cannot close the new
+    // session's descriptors.
+    let cap_gen = next_capture_gen();
+
     // Split the TUN into independent read/write halves so the outbound
     // reader and reply writer never contend on one handle. Duplicated fds
     // share one open description; tokio registers level-triggered
@@ -820,22 +946,23 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     let owned = ManuallyDrop::new(std::fs::File::from(file));
     // Track the original immediately so even early failure paths close it
     // exactly once.
-    register_capture_fds(owned.as_raw_fd(), -1, -1);
+    register_capture_fds(cap_gen, owned.as_raw_fd(), -1, -1);
     let read_half = match owned.try_clone() {
         Ok(f) => f,
         Err(_) => {
-            close_capture_fds();
+            close_capture_fds(cap_gen);
             return;
         }
     };
     let write_half = match owned.try_clone() {
         Ok(f) => f,
         Err(_) => {
-            close_capture_fds();
+            close_capture_fds(cap_gen);
             return;
         }
     };
     register_capture_fds(
+        cap_gen,
         owned.as_raw_fd(),
         read_half.as_raw_fd(),
         write_half.as_raw_fd(),
@@ -846,14 +973,14 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     let reader_fd = match AsyncFd::new(read_half) {
         Ok(a) => a,
         Err(_) => {
-            close_capture_fds();
+            close_capture_fds(cap_gen);
             return;
         }
     };
     let writer_fd = match AsyncFd::new(write_half) {
         Ok(a) => a,
         Err(_) => {
-            close_capture_fds();
+            close_capture_fds(cap_gen);
             return;
         }
     };
@@ -975,7 +1102,7 @@ async fn run_capture(file: OwnedFd, mtu: usize) {
     }
 
     CAPTURE_ALIVE.store(false, Ordering::SeqCst);
-    close_capture_fds();
+    close_capture_fds(cap_gen);
     let _ = writer.await;
 }
 
@@ -1381,14 +1508,25 @@ fn set_nonblocking(fd: RawFd) -> Result<(), i32> {
 }
 
 /// Minimal IPv4/IPv6 summary for the capture log.
+///
+/// Every index here is length-checked. This function runs on the capture hot
+/// path, where a panic would unwind out of the capture task, kill it, and leave
+/// `CAPTURE_ALIVE` reporting "up" - a tunnel that looks healthy and carries
+/// nothing. The IPv6 arm used to test only `!packet.is_empty()` and then index
+/// `packet[6]`, so any 1-6 byte frame whose first nibble was 6 panicked.
 fn describe(packet: &[u8]) -> String {
     if packet.len() >= 20 && packet[0] >> 4 == 4 {
         let proto = packet[9];
         let src = format!("{}.{}.{}.{}", packet[12], packet[13], packet[14], packet[15]);
         let dst = format!("{}.{}.{}.{}", packet[16], packet[17], packet[18], packet[19]);
         format!("v4 proto={proto} {src}->{dst}")
-    } else if !packet.is_empty() && packet[0] >> 4 == 6 {
+    } else if packet.len() >= 40 && packet[0] >> 4 == 6 {
+        // A full IPv6 header is 40 bytes; the next-header byte is at offset 6.
         format!("v6 proto={} ({}B)", packet[6], packet.len())
+    } else if !packet.is_empty() && packet[0] >> 4 == 6 {
+        // Recognisably IPv6 but truncated. Naming it is worth more than a
+        // header field that is not there.
+        format!("v6 short ({}B)", packet.len())
     } else {
         format!("non-ip ({}B)", packet.len())
     }
@@ -1820,5 +1958,111 @@ mod tests {
             "table must be bounded after sweep, was {open}"
         );
         reset_flows();
+    }
+
+    /// `describe()` runs on the capture task for every outbound packet. It used
+    /// to test only `!packet.is_empty()` before reading `packet[6]`, so any
+    /// frame of 1..=6 bytes whose first nibble is 6 indexed out of bounds and
+    /// panicked. That panic killed the capture task while `CAPTURE_ALIVE` still
+    /// reported "up", i.e. the tunnel silently stopped carrying traffic and the
+    /// diagnostics line insisted the data path was fine.
+    ///
+    /// Nothing guarantees a TUN read is a well-formed packet, so the contract
+    /// is: never panic, for any byte sequence of any length.
+    #[test]
+    fn describe_never_panics_on_malformed_frames() {
+        // Every length across the v4 (20) and v6 (40) header boundaries, for
+        // every possible first nibble - this covers the exact 1..=6 byte
+        // IPv6-nibble frames that used to panic.
+        for version_nibble in 0u8..16 {
+            for len in 0usize..=48 {
+                let mut packet = vec![0u8; len];
+                if len > 0 {
+                    packet[0] = version_nibble << 4;
+                }
+                let text = describe(&packet);
+                assert!(
+                    !text.is_empty(),
+                    "describe must name every frame (nibble={version_nibble} len={len})"
+                );
+            }
+        }
+
+        // Truncated IPv6 is named as such rather than misreported or crashed.
+        for len in 1usize..40 {
+            let mut packet = vec![0u8; len];
+            packet[0] = 0x60;
+            assert_eq!(
+                describe(&packet),
+                format!("v6 short ({len}B)"),
+                "truncated IPv6 must be labelled short, not decoded"
+            );
+        }
+
+        // A full IPv6 header still reports its next-header byte.
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[6] = 17;
+        assert_eq!(describe(&v6), "v6 proto=17 (40B)");
+
+        // Empty input is not IP at all.
+        assert_eq!(describe(&[]), "non-ip (0B)");
+    }
+
+    /// The ownership rule behind the capture-fd tracker, tested without
+    /// touching process-global descriptors.
+    #[test]
+    fn only_the_owning_generation_may_close() {
+        assert!(capture_gen_owns(7, 7), "owner must be allowed to close");
+        assert!(
+            !capture_gen_owns(8, 7),
+            "a task from generation 7 must not close generation 8's fds"
+        );
+        assert!(
+            !capture_gen_owns(7, 8),
+            "generation mismatch in either direction denies the close"
+        );
+        assert!(
+            next_capture_gen() < next_capture_gen(),
+            "generations must be unique and increasing"
+        );
+    }
+
+    /// End-to-end on the real tracker: a capture task that exits after a new
+    /// session has registered must not close the new session's descriptors.
+    ///
+    /// Before the fix `CAPTURE_FDS` was one unstamped slot, so this stale close
+    /// landed on a live TUN fd. Reads then failed with EBADF while capture was
+    /// still marked alive, and because fd numbers are reused immediately the
+    /// close could hit an unrelated descriptor anywhere in the process.
+    #[test]
+    fn a_stale_capture_task_cannot_close_a_newer_sessions_fds() {
+        let _serial = ENGINE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Real fds this test owns, so "still open" is observable.
+        let stale_gen = next_capture_gen();
+        let live_gen = next_capture_gen();
+        let live_fd = unsafe { libc::dup(0) };
+        assert!(live_fd >= 0, "test needs a spare descriptor");
+
+        // The newer session takes the slot.
+        register_capture_fds(live_gen, live_fd, -1, -1);
+
+        // The older capture task now exits and tries to clean up.
+        close_capture_fds(stale_gen);
+        assert!(
+            unsafe { libc::fcntl(live_fd, libc::F_GETFD) } != -1,
+            "stale generation closed a live session's fd"
+        );
+
+        // The owning generation still closes normally.
+        close_capture_fds(live_gen);
+        assert!(
+            unsafe { libc::fcntl(live_fd, libc::F_GETFD) } == -1,
+            "owning generation must release its own fd"
+        );
+
+        // Leave the tracker clean for other tests.
+        register_capture_fds(0, -1, -1, -1);
     }
 }
