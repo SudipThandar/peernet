@@ -78,33 +78,225 @@ class PeerNetVpnService : VpnService() {
     // A ConnectivityManager callback is the authoritative, event-driven signal:
     // it needs no polling, cannot be produced by a sleeping radio, and does not
     // "default to still connected" the way a failed probe has to.
+    //
+    // The second defect was in how that signal was interpreted. This section
+    // used to implement `onLost` and nothing else, and treated a loss of the
+    // tunnel's own network as the end of the session. Android destroys the old
+    // `Network` object and publishes a replacement when a Wi-Fi Direct group
+    // re-associates - which is exactly what happens when the screen turns off -
+    // so a routine transition was being read as a fatal one. There is now a
+    // three-state machine: attached, awaiting a replacement, or ended. See
+    // `UnderlyingNetworkPolicy`.
 
     @Volatile private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
+    /**
+     * When the tunnel's own network went away, or 0 while it has one.
+     *
+     * Non-zero means "a replacement is allowed to appear". This is the state the
+     * old code could not express: it had `onLost` and no notion of a network
+     * being replaced, so a routine Wi-Fi Direct re-association read as the end
+     * of the session.
+     */
+    @Volatile private var awaitingReplacementSince: Long = 0L
+
     private fun connectivityManager(): android.net.ConnectivityManager? =
         getSystemService(android.net.ConnectivityManager::class.java)
+
+    /** Whether [net] holds an address on the host's subnet (and is not the VPN). */
+    private fun networkReachesHost(
+        cm: android.net.ConnectivityManager,
+        net: android.net.Network
+    ): Boolean {
+        val addr = hostAddr ?: return false
+        val caps = cm.getNetworkCapabilities(net)
+        val isVpn = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+        val addresses = cm.getLinkProperties(net)
+            ?.linkAddresses
+            ?.mapNotNull { it.address?.hostAddress }
+            .orEmpty()
+        return TunnelSupervisorPolicy.canReachHost(addr, isVpn, addresses)
+    }
+
+    /**
+     * Considers [net] as the tunnel's underlying network.
+     *
+     * Called from both `onAvailable` and `onLinkPropertiesChanged`: a Wi-Fi
+     * Direct network is routinely published before it has an address, so
+     * `onAvailable` alone cannot decide whether it reaches the host, and relying
+     * on it would miss the replacement every time.
+     */
+    private fun considerNetwork(net: android.net.Network, trigger: String) {
+        val cm = connectivityManager() ?: return
+        val isVpn = cm.getNetworkCapabilities(net)
+            ?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+        if (!UnderlyingNetworkPolicy.shouldAdopt(
+                candidateIsVpn = isVpn,
+                candidateReachesHost = networkReachesHost(cm, net),
+                haveUnderlying = underlying != null,
+                awaitingReplacement = awaitingReplacementSince != 0L,
+                tunInstalled = tunFd != -1
+            )
+        ) {
+            return
+        }
+        adoptNetwork(net, trigger)
+    }
+
+    /**
+     * Attaches the tunnel to [net], rebuilding the QUIC endpoint if this is a
+     * replacement for a network the tunnel was already using.
+     *
+     * The TUN file descriptor is deliberately untouched. Rust owns it after
+     * `startTunCapture`, and re-establishing capture here would create a second
+     * owner for the same descriptor. Leaving it in place also keeps the VPN key
+     * steady and avoids resetting every app socket using the tunnel.
+     */
+    private fun adoptNetwork(net: android.net.Network, trigger: String) {
+        val previous = underlying?.toString()
+        val replacing = UnderlyingNetworkPolicy.isReplacement(previous, net.toString())
+        underlying = net
+        awaitingReplacementSince = 0L
+        Diagnostics.note(
+            "vpn",
+            "UNDERLYING_NETWORK_ADOPTED net=$net was=${previous ?: "-"} via=$trigger " +
+                if (replacing) "(replacement)" else "(first)"
+        )
+        pinSocketsToUnderlying()
+        // The process bind is the one that actually matters here:
+        // setUnderlyingNetworks only labels the VPN for the system's accounting
+        // and chooses no route. Without rebinding the process, every socket -
+        // including the QUIC endpoint rebuilt below - stays attached to the dead
+        // Network and the tunnel never carries a packet again.
+        bindProcessToLink()
+        if (replacing) reestablishQuic()
+    }
+
+    /**
+     * Rebuilds the QUIC endpoint on the current underlying network.
+     *
+     * Necessary rather than optional: the core has no way to re-pin an existing
+     * socket (no `Endpoint::rebind`, no `SO_BINDTODEVICE`), so a socket created
+     * on the previous `Network` stays bound to a dead handle for ever. Only the
+     * endpoint is rebuilt; TUN capture keeps running throughout.
+     */
+    private fun reestablishQuic() {
+        val addr = hostAddr
+        val fp = hostFp
+        if (addr.isNullOrBlank() || fp.isNullOrBlank()) {
+            Diagnostics.note("vpn", "QUIC_REESTABLISH_SKIPPED (host details unknown)")
+            return
+        }
+        scope.launch {
+            Diagnostics.note("vpn", "QUIC_REESTABLISH_STARTED host=$addr")
+            runCatching { rustCore.stopTunnel() }
+            val ok = runCatching { rustCore.startTunnel(addr, fp, Build.MODEL) }
+                .getOrDefault(false)
+            if (ok) {
+                Diagnostics.note("vpn", "QUIC_REESTABLISHED (TUN kept, endpoint rebuilt)")
+                linkManager.setTunnelStatus("Tunnel active")
+            } else {
+                // The group is back but the host is not answering on it. That is
+                // a real failure and must be reported, not retried silently.
+                val why = runCatching { rustCore.lastError() }.getOrDefault("")
+                Diagnostics.note("vpn", "QUIC_REESTABLISH_FAILED $why")
+                linkManager.setLinked(null)
+                stopTunnel("host unreachable after network change")
+            }
+        }
+    }
+
+    /**
+     * Ends the session if no replacement network arrives within the window.
+     *
+     * Without this the tunnel would wait for ever on a network that is never
+     * coming back, which is the "connected but no internet" state this whole
+     * mechanism exists to avoid.
+     */
+    private fun armReplacementWatchdog(startedAt: Long) {
+        scope.launch {
+            kotlinx.coroutines.delay(UnderlyingNetworkPolicy.REPLACEMENT_GRACE_MS)
+            // A different loss may have restarted the window; only the newest
+            // one may end the session.
+            if (awaitingReplacementSince != startedAt) return@launch
+            val elapsed = System.currentTimeMillis() - startedAt
+            if (!UnderlyingNetworkPolicy.shouldTeardownAfterGrace(
+                    awaitingReplacement = true,
+                    elapsedMs = elapsed
+                )
+            ) {
+                return@launch
+            }
+            Diagnostics.note(
+                "vpn",
+                "UNDERLYING_REPLACEMENT_TIMEOUT after ${elapsed}ms - ending the tunnel " +
+                    "so the VPN route cannot outlive its link"
+            )
+            linkManager.setLinked(null)
+            stopTunnel("no replacement network")
+        }
+    }
 
     private fun watchUnderlyingNetwork() {
         if (networkCallback != null) return
         val cm = connectivityManager() ?: return
         val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                considerNetwork(network, "onAvailable")
+            }
+
+            override fun onLinkPropertiesChanged(
+                network: android.net.Network,
+                linkProperties: android.net.LinkProperties
+            ) {
+                // The event that actually matters for a P2P group: the
+                // replacement network usually appears before it has an address,
+                // so this is where it becomes recognisable as the route to the
+                // host.
+                considerNetwork(network, "onLinkPropertiesChanged")
+            }
+
             override fun onLost(network: android.net.Network) {
                 val lost = network.toString()
                 val mine = underlying?.toString()
-                if (!TunnelSupervisorPolicy.shouldTeardownOnLoss(lost, mine, tunFd != -1)) {
+                if (!UnderlyingNetworkPolicy.shouldAwaitReplacement(
+                        TunnelSupervisorPolicy.lossConcernsTunnel(lost, mine, tunFd != -1)
+                    )
+                ) {
                     return
                 }
+                // Do NOT clear the link or tear down here. Android destroys the
+                // old Network object and publishes a replacement when a Wi-Fi
+                // Direct group re-associates (the 723 -> 726 pair in the field
+                // reports); acting now would kill a session whose group is still
+                // present. The sockets bound to `network` are already dead, so
+                // the tunnel is unusable until a replacement is adopted - but
+                // that is a stall to recover from, not a session to end.
+                val startedAt = System.currentTimeMillis()
+                awaitingReplacementSince = startedAt
+                underlying = null
                 Diagnostics.note(
                     "vpn",
-                    "UNDERLYING_NETWORK_LOST net=$lost — ending the tunnel so the " +
-                        "VPN route cannot outlive its link"
+                    "UNDERLYING_NETWORK_LOST net=$lost - awaiting replacement " +
+                        "(${UnderlyingNetworkPolicy.REPLACEMENT_GRACE_MS}ms)"
                 )
-                Timber.i("underlying network %s lost; tearing down", lost)
-                // Clear the link too: the UI (and any later auto-connect) must
-                // not keep reporting a session that no longer has a network.
-                // teardown() alone would leave `linkedHost` set.
-                linkManager.setLinked(null)
-                stopTunnel("underlying network lost")
+                Timber.i("underlying network %s lost; awaiting replacement", lost)
+                // The tunnel is genuinely not carrying traffic during the
+                // window, so the UI must say so. Claiming "Tunnel active" here
+                // is the kind of faked state that made earlier reports useless.
+                linkManager.setTunnelStatus("Reconnecting to the host...")
+                // A replacement may already exist: this loss can be delivered
+                // after the new network has come up.
+                resolveUnderlyingFromHost()
+                // Read once into a local: `underlying` is volatile and another
+                // thread may clear it, so a smart cast is unavailable and `!!`
+                // would be a race.
+                val already = underlying
+                if (already != null) {
+                    adoptNetwork(already, "onLost/immediate")
+                } else {
+                    armReplacementWatchdog(startedAt)
+                }
             }
         }
         // clearCapabilities() matters: a Wi-Fi Direct network has no

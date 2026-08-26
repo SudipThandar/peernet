@@ -18,14 +18,18 @@ import org.junit.Test
  */
 class TunnelSupervisorPolicyTest {
 
-    // ---- losing the underlying network must end the tunnel ----
+    // ---- attributing a network loss to this tunnel ----
+    //
+    // A true result no longer means "tear down": it opens a replacement window
+    // (see UnderlyingNetworkPolicyTest). It still means "this event is about my
+    // tunnel", which is what these gates check.
 
     @Test
-    fun `losing the tunnel's own network ends the tunnel`() {
+    fun `losing the tunnel's own network concerns this tunnel`() {
         assertTrue(
-            "the tunnel must not outlive the network it runs over - leaving it up " +
-                "keeps the VPN key and blackholes traffic through a dead route",
-            TunnelSupervisorPolicy.shouldTeardownOnLoss(
+            "the tunnel must react to its own network going away - ignoring it " +
+                "keeps the VPN key up and blackholes traffic through a dead route",
+            TunnelSupervisorPolicy.lossConcernsTunnel(
                 lostNetwork = "101",
                 underlyingNetwork = "101",
                 tunInstalled = true
@@ -39,7 +43,7 @@ class TunnelSupervisorPolicyTest {
         // would make a healthy tunnel flap for reasons unrelated to it.
         assertFalse(
             "only the tunnel's own underlying network may end it",
-            TunnelSupervisorPolicy.shouldTeardownOnLoss(
+            TunnelSupervisorPolicy.lossConcernsTunnel(
                 lostNetwork = "202",
                 underlyingNetwork = "101",
                 tunInstalled = true
@@ -48,12 +52,12 @@ class TunnelSupervisorPolicyTest {
     }
 
     @Test
-    fun `an unknown underlying network is never grounds for teardown`() {
+    fun `an unknown underlying network makes a loss unattributable`() {
         // A loss that cannot be attributed must not be guessed at, or a healthy
-        // session dies whenever any unrelated network disappears.
+        // session reacts whenever any unrelated network disappears.
         assertFalse(
-            "an unattributable loss must not end the tunnel",
-            TunnelSupervisorPolicy.shouldTeardownOnLoss(
+            "an unattributable loss must not touch the tunnel",
+            TunnelSupervisorPolicy.lossConcernsTunnel(
                 lostNetwork = "101",
                 underlyingNetwork = null,
                 tunInstalled = true
@@ -62,9 +66,9 @@ class TunnelSupervisorPolicyTest {
     }
 
     @Test
-    fun `with no TUN installed there is nothing to tear down`() {
+    fun `with no TUN installed there is nothing to supervise`() {
         assertFalse(
-            TunnelSupervisorPolicy.shouldTeardownOnLoss(
+            TunnelSupervisorPolicy.lossConcernsTunnel(
                 lostNetwork = "101",
                 underlyingNetwork = "101",
                 tunInstalled = false

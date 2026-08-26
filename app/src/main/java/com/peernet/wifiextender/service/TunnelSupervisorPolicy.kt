@@ -21,7 +21,7 @@ package com.peernet.wifiextender.service
 object TunnelSupervisorPolicy {
 
     /**
-     * Whether losing [lostNetwork] must end the tunnel.
+     * Whether losing [lostNetwork] is an event about *this* tunnel.
      *
      * Only the tunnel's *own* underlying network counts. Any other network
      * disappearing is routine (cellular handover, another Wi-Fi going away) and
@@ -29,11 +29,18 @@ object TunnelSupervisorPolicy {
      * have nothing to do with it.
      *
      * A loss is never actionable when the tunnel does not own a TUN
-     * ([tunInstalled] false) - there is nothing to tear down - nor when the
+     * ([tunInstalled] false) - there is nothing to supervise - nor when the
      * underlying network is unknown, because then the loss cannot be attributed
-     * and guessing would tear down a healthy session.
+     * and guessing would disturb a healthy session.
+     *
+     * This used to be called `shouldTeardownOnLoss`, and the service tore the
+     * session down the moment it returned true. That was the screen-off bug: a
+     * Wi-Fi Direct re-association destroys the old `Network` and publishes a
+     * replacement, so the first half of a routine transition was being read as
+     * the end of the session. A true result now opens a replacement window
+     * instead - see [UnderlyingNetworkPolicy].
      */
-    fun shouldTeardownOnLoss(
+    fun lossConcernsTunnel(
         lostNetwork: String?,
         underlyingNetwork: String?,
         tunInstalled: Boolean
