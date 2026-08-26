@@ -491,7 +491,13 @@ fn start_tun_capture_impl(fd: jint, mtu: jint) -> jboolean {
     let owned = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
     let mtu = mtu.clamp(1200, 1500) as usize;
 
-    runtime().spawn(async move { run_capture(owned, mtu).await });
+    // Claim the generation here, not inside the task. `TUN_FD` above serialises
+    // sessions, so claiming under that guard makes generation order match
+    // session order. Claiming it inside the spawned task would leave a window
+    // between spawn and first poll in which a later session could register
+    // first and then be overwritten by this, older, task.
+    let cap_gen = next_capture_gen();
+    runtime().spawn(async move { run_capture(owned, mtu, cap_gen).await });
     1
 }
 
@@ -664,7 +670,8 @@ pub extern "system" fn Java_com_peernet_wifiextender_core_NativeCore_startTunnel
     guard_ffi("startTunnel", 0, || start_tunnel_impl(addr, fp, name))
 }
 
-fn start_tunnel_impl(addr: String, fp: String, name: String) -> jboolean {    let Ok(parsed) = SocketAddr::from_str(&addr) else {
+fn start_tunnel_impl(addr: String, fp: String, name: String) -> jboolean {
+    let Ok(parsed) = SocketAddr::from_str(&addr) else {
         set_last_error(&format!("bad host address '{addr}'"));
         return 0;
     };
@@ -927,15 +934,15 @@ fn close_current_capture_fds() {
     }
 }
 
-async fn run_capture(file: OwnedFd, mtu: usize) {
+async fn run_capture(file: OwnedFd, mtu: usize, cap_gen: u64) {
     use std::mem::ManuallyDrop;
     use std::os::fd::AsFd;
     use std::os::unix::io::AsRawFd;
 
-    // This session's identity. Every close below is scoped to it, so a task
-    // that exits after a new session has started cannot close the new
-    // session's descriptors.
-    let cap_gen = next_capture_gen();
+    // `cap_gen` is this session's identity, claimed by the caller under the
+    // TUN_FD guard. Every close below is scoped to it, so a task that exits
+    // after a new session has started cannot close the new session's
+    // descriptors.
 
     // Split the TUN into independent read/write halves so the outbound
     // reader and reply writer never contend on one handle. Duplicated fds
@@ -1642,7 +1649,8 @@ mod tests {
         UDP_FORWARDED.store(0, Ordering::Relaxed);
         TUN_STOP.store(false, Ordering::SeqCst);
 
-        tokio::spawn(async move { run_capture(tun_side, 1500).await });
+        let cap_gen = next_capture_gen();
+        tokio::spawn(async move { run_capture(tun_side, 1500, cap_gen).await });
 
         // No tunnel client is installed, so forwarding is a no-op; PACKETS is
         // what proves the loop kept reading.
