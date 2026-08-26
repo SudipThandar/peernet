@@ -1557,3 +1557,59 @@ DIAGNOSTICS` from the host and read, in order - `HOST_SCREEN_OFF`, then the
 Tick count far below span/15s means the process was frozen; ticks continuing with
 `group=true engine=true listening=true` while the client is dead means the data
 plane or the radio, not the lifecycle. Do not ship a fix before this is read.
+## 23. "Connection refused" was never proven to be a refusal (run #128, `de2b044`)
+
+**Context.** Sections 20 and 21 both treated the client's `TCP connection
+refused` as fact and worked backwards from it to the host's group and :4434
+lifecycle. That premise was never verified.
+
+**The defect.** `ClientViewModel.probeHost` used three catch blocks:
+
+```kotlin
+} catch (e: java.net.ConnectException) {
+    ProbeOutcome.Failed("refused the connection - is SHARE on, on the host phone?")
+} catch (e: java.net.SocketTimeoutException) {
+    ProbeOutcome.Failed("did not answer within 3s - wrong network, or the host app is asleep")
+```
+
+On Android, `IoBridge` maps `EHOSTUNREACH` to `NoRouteToHostException` and
+`EACCES` to `SocketException`, but **everything else, including both
+`ECONNREFUSED` and `ENETUNREACH`, becomes `ConnectException`**. So a client with
+no route to `192.168.49.1` was told, in confident prose, that the host had
+stopped sharing. `e.message` - carrying the errno, the only thing that separates
+them - was discarded on that line.
+
+`ENETUNREACH` is not hypothetical here: it is what a process-wide
+`bindProcessToNetwork` left pointing at the wrong network produces, which is an
+open defect (`fix-process-bind-leak`).
+
+The timeout branch was wrong in the other direction. A read timeout was reported
+as "wrong network", but by then TCP had connected - so the network is fine and the
+*host's* responder accepted and never wrote. The two messages sent the tester to
+opposite phones.
+
+**Fix.** New pure `LinkProbePolicy.classify(phase, throwable)` returning
+`ProbeDiagnosis(kind, message, detail, tcpEstablished)`:
+
+- classification is driven by **errno text**, then by the **phase** the probe was
+  in (`CONNECTING` vs `READING_BANNER`), not by exception type alone
+- `tcpEstablished` states plainly whether TCP came up, which is the bit that
+  decides which phone to look at next
+- the OS's errno string always reaches the diagnostics `detail`, so the report
+  survives an unrecognised failure
+- a **bare `ConnectException` is not called a refusal**. That assumption is the
+  defect; with no errno there is no evidence, so it reports `OTHER` with the raw
+  text
+
+`ProbeOutcome.Failed` now carries `reason` (shown) and `detail` (recorded), so the
+buffer gets `ENETUNREACH`, not a friendly sentence. Control flow is untouched:
+every failure still yields `Failed` and a null host.
+
+**Gate.** `LinkProbePolicyTest`, 12 tests, including two `ConnectException`s that
+must not produce the same message and one `SocketTimeoutException` that must
+classify differently by phase. Sabotage: restoring `e is ConnectException ->
+REFUSED` turned `Unit tests` green to red.
+
+**Consequence for the open investigation.** Every earlier conclusion that rested
+on the word "refused" is now unproven, not wrong. The next client dump will say
+which it was. Do not re-reason about the group lifecycle until it does.
