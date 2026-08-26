@@ -21,8 +21,14 @@
     <!-- Foreground hosting -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- WAKE_LOCK is deliberately NOT declared. PowerManager wake locks are ruled
+         out by design: keeping the CPU or screen awake to hold a tunnel up is the
+         wrong fix and a battery complaint waiting to happen. The tunnel is held by
+         WifiManager.WifiLock (WIFI_MODE_FULL_HIGH_PERF), which needs no permission,
+         plus a user-granted Doze exemption. PowerManager is referenced in
+         DozeExemptionPolicy only to read isIgnoringBatteryOptimizations, which does
+         not require WAKE_LOCK. -->
 
     <!-- Battery optimization opt-out (requested with explanation, never forced) -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -31,7 +37,6 @@
 
     <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
-    <uses-feature android:name="android.software.device_admin" android:required="false" />
 
     <application
         android:name=".PeerNetApp"

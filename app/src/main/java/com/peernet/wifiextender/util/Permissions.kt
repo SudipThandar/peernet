@@ -10,7 +10,7 @@ import androidx.core.content.ContextCompat
  * Central permission helper (Section 10.3 / 19.3).
  *
  * Returns only the permissions that still need a runtime grant for the
- * current Android version. Static manifest permissions (INTERNET, WAKE_LOCK,
+ * current Android version. Static manifest permissions (INTERNET,
  * FOREGROUND_SERVICE, etc.) are granted at install time and are not listed.
  *
  * Required vs optional matters: after a second denial Android stops showing
