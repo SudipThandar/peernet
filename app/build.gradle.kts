@@ -39,8 +39,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // CI builds an unsigned release APK until release signing is configured (Milestone 12).
-            signingConfig = null
+            // Signed with the debug keystore so the APK is installable for
+            // testing. Swap to your upload key before publishing to the Play
+            // Store (Milestone 12).
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

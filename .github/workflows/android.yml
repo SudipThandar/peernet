@@ -119,10 +119,10 @@ jobs:
       - name: Assemble release APK (R8 first run)
         run: ./gradlew assembleRelease --stacktrace
 
-      - name: Upload release APK (unsigned)
+      - name: Upload release APK (R8-minified)
         uses: actions/upload-artifact@v4
         with:
-          name: peernet-release-apk-unsigned
+          name: peernet-release-apk
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
