@@ -45,7 +45,6 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.SignalWifiOff
@@ -485,6 +484,18 @@ fun HomeScreen(
             Spacer(Modifier.height(8.dp))
         } else {
             // Named explicitly so a timer stop is never mistaken for a fault.
+            // A local 1-second tick keeps the countdown smooth: the supervision
+            // tick that updates host.shareRemainingMs runs every 2 s, which
+            // makes the display jump by 2 each time it recomposes.
+            var tick by remember { mutableStateOf(0L) }
+            LaunchedEffect(Unit) {
+                while (true) {
+                    kotlinx.coroutines.delay(1_000L)
+                    tick++
+                }
+            }
+            @Suppress("UNUSED_EXPRESSION")
+            tick // force recomposition every second
             Text(
                 text = ShareTimerPolicy.formatRemaining(host.shareRemainingMs)
                     ?.let { "Stops in $it" }
@@ -614,61 +625,7 @@ fun HomeScreen(
             )
         }
 
-        // ---- Client result line (no lists) ----
-        if (client.status.isNotBlank()) {
-            Text(
-                client.status,
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray,
-                modifier = Modifier.padding(top = 8.dp)
-            )
-        }
-
-        // ---- Why linking has not happened (never stay silent) ----
-        if (client.linkDiagnostic.isNotBlank() && linkedHost == null && !isHosting) {
-            Text(
-                client.linkDiagnostic,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error
-            )
-        }
-
-        // ---- Diagnostics out of the app (the tester has no adb) ----
-        TextButton(onClick = {
-            val report = buildString {
-                appendLine("PeerNet diagnostics")
-                appendLine("device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.SDK_INT}")
-                appendLine("engine: ${home.engineVersion ?: "unknown"}")
-                appendLine("stats: ${engineStats.ifBlank { "(none)" }}")
-                appendLine("quicState=$quicState tunPackets=$tunPackets")
-                appendLine("hostState=${host.hostState} engineReady=${host.engineReady} engineFailure=${host.engineFailure ?: "-"}")
-                appendLine("linkedHost=${linkedHost?.address ?: "-"}:${linkedHost?.tunnelPort ?: 0}")
-                appendLine("tunnelStatus=${tunnelStatus.ifBlank { "-" }}")
-                appendLine("lastCrash=${lastCrash ?: "-"}")
-                appendLine("linkDiagnostic=${client.linkDiagnostic.ifBlank { "-" }}")
-                appendLine()
-                append(com.peernet.wifiextender.diag.Diagnostics.snapshot())
-            }
-            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(android.content.Intent.EXTRA_SUBJECT, "PeerNet diagnostics")
-                putExtra(android.content.Intent.EXTRA_TEXT, report)
-            }
-            runCatching {
-                context.startActivity(
-                    android.content.Intent.createChooser(send, "Share PeerNet diagnostics")
-                )
-            }
-        }) {
-            Icon(
-                imageVector = Icons.Filled.BugReport,
-                contentDescription = null,
-                modifier = Modifier.padding(end = 6.dp)
-            )
-            Text("SHARE DIAGNOSTICS", style = MaterialTheme.typography.labelSmall)
-        }
-
-        // ---- Errors ----
+        // ---- Sharing details (password needed for manual join) ----
         host.error?.let {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                 Text(it, modifier = Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onErrorContainer)
