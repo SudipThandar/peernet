@@ -75,6 +75,13 @@ class HostForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         session = hostRuntime.currentSessionId()
+        if (com.peernet.wifiextender.power.DozeExemptionPolicy.isSamsungDevice()) {
+            com.peernet.wifiextender.diag.Diagnostics.note(
+                "host",
+                "SAMSUNG_DEVICE_SERVICE_STARTED - Samsung battery " +
+                    "optimization may kill this service when the screen turns off"
+            )
+        }
         // Constraint: startForeground must happen within 5s of service creation.
         startAsForeground()
         registerScreenReceiver()
@@ -118,11 +125,11 @@ class HostForegroundService : Service() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 runCatching { hostRuntime.stopSharing() }
                 stopSelf()
-                return START_NOT_STICKY
+                return START_STICKY
             }
             else -> startAsForeground()
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun startAsForeground() {

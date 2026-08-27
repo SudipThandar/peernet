@@ -80,4 +80,11 @@ class DozeExemptionPolicyTest {
             )
         )
     }
+
+    @Test
+    fun `isSamsungDevice is a pure function that does not crash`() {
+        // Cannot assert the exact value because the test JVM's manufacturer
+        // varies, but it must not throw.
+        DozeExemptionPolicy.isSamsungDevice()
+    }
 }

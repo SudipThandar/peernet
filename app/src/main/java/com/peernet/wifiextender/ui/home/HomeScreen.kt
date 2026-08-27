@@ -273,6 +273,64 @@ fun HomeScreen(
         //    foreground service cannot be started from the background. Waiting
         //    until the service is already running avoids that entirely.
         val sessionActive = host.hostState == HostState.READY || quicState == STATE_CONNECTED
+
+        // Samsung's proprietary battery optimization ("Put unused apps to
+        // sleep") kills the foreground service when the screen turns off,
+        // regardless of Android's standard Doze exemption. Samsung has no
+        // programmatic API; the user must manually add PeerNet to "Never
+        // sleeping apps" in Samsung's battery settings. The standard
+        // REQUEST_IGNORE_BATTERY_OPTIMIZATIONS dialog either says "Battery
+        // optimization not supported" or has no effect on Samsung devices.
+        var showSamsungDialog by remember { mutableStateOf(false) }
+        LaunchedEffect(sessionActive) {
+            if (DozeExemptionPolicy.isSamsungDevice() &&
+                !DozeExemption.wasSamsungAsked(context) &&
+                sessionActive
+            ) {
+                showSamsungDialog = true
+            }
+        }
+        if (showSamsungDialog) {
+            AlertDialog(
+                onDismissRequest = {
+                    showSamsungDialog = false
+                    DozeExemption.markSamsungAsked(context)
+                },
+                title = { Text("Keep sharing alive") },
+                text = {
+                    Text(
+                        "Samsung's battery optimization may stop sharing when the " +
+                        "screen turns off. To prevent this:\n\n" +
+                        "1. Tap Open Settings below\n" +
+                        "2. Tap Battery > Background usage limits\n" +
+                        "3. Tap Never sleeping apps\n" +
+                        "4. Add PeerNet to the list"
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showSamsungDialog = false
+                        DozeExemption.markSamsungAsked(context)
+                        DozeExemption.requestSamsungExemption(context)
+                        com.peernet.wifiextender.diag.Diagnostics.note(
+                            "power", "SAMSUNG_BATTERY_EXEMPTION_OPENED"
+                        )
+                    }) {
+                        Text("Open Settings")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showSamsungDialog = false
+                        DozeExemption.markSamsungAsked(context)
+                    }) {
+                        Text("Skip")
+                    }
+                }
+            )
+        }
+
+        // Standard Android Doze exemption (non-Samsung devices).
         LaunchedEffect(sessionActive) {
             if (!DozeExemptionPolicy.shouldPrompt(
                     sessionActive = sessionActive,

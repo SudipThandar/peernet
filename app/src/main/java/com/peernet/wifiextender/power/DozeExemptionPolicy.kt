@@ -3,6 +3,7 @@ package com.peernet.wifiextender.power
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 
@@ -15,6 +16,16 @@ import android.provider.Settings
  * stop the system from suspending the app itself. `PowerManager` wake locks are
  * ruled out by design here, so a user-granted Doze exemption is the only
  * remaining lever.
+ *
+ * ## Samsung
+ *
+ * Samsung has its own battery optimization layer on top of Android's Doze:
+ * "Put unused apps to sleep" and "Deep sleeping apps". These kill foreground
+ * services when the screen turns off, regardless of `REQUEST_IGNORE_BATTERY_
+ * OPTIMIZATIONS`. There is no programmatic API to exempt from Samsung's layer;
+ * the user must manually add PeerNet to "Never sleeping apps" in Samsung's
+ * battery settings. [isSamsungKilled] detects the Samsung-specific death, and
+ * [requestSamsungExemption] opens Samsung's battery settings directly.
  */
 object DozeExemptionPolicy {
 
@@ -34,6 +45,17 @@ object DozeExemptionPolicy {
         alreadyExempt: Boolean,
         alreadyAsked: Boolean
     ): Boolean = sessionActive && !alreadyExempt && !alreadyAsked
+
+    /**
+     * Whether this device is a Samsung that needs the separate exemption flow.
+     *
+     * Samsung's proprietary battery optimization kills foreground services
+     * regardless of Android's standard Doze exemption. The standard dialog is
+     * not enough: it only handles Android Doze, and Samsung shows "Battery
+     * optimization not supported for this app" or simply ignores the request.
+     */
+    fun isSamsungDevice(): Boolean =
+        Build.MANUFACTURER.equals("samsung", ignoreCase = true)
 }
 
 /**
@@ -44,6 +66,7 @@ object DozeExemption {
 
     private const val PREFS = "peernet_power"
     private const val KEY_ASKED = "doze_exemption_asked"
+    private const val KEY_SAMSUNG_ASKED = "samsung_exemption_asked"
 
     fun isExempt(context: Context): Boolean {
         val pm = context.getSystemService(PowerManager::class.java) ?: return false
@@ -74,6 +97,32 @@ object DozeExemption {
         markAsked(context)
         val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
             .setData(Uri.parse("package:${context.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return runCatching { context.startActivity(intent); true }.getOrDefault(false)
+    }
+
+    /** Whether Samsung-specific exemption was already prompted. */
+    fun wasSamsungAsked(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SAMSUNG_ASKED, false)
+
+    fun markSamsungAsked(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_SAMSUNG_ASKED, true)
+            .apply()
+    }
+
+    /**
+     * Opens Samsung's battery settings where the user can add PeerNet to
+     * "Never sleeping apps". Samsung has no programmatic API for this.
+     *
+     * The action string is Samsung-specific and may not exist on all builds.
+     * Returns false if it could not be shown; callers treat this as degraded.
+     */
+    fun requestSamsungExemption(context: Context): Boolean {
+        markSamsungAsked(context)
+        val intent = Intent("android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS")
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return runCatching { context.startActivity(intent); true }.getOrDefault(false)
     }
