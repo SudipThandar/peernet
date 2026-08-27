@@ -38,6 +38,17 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.SignalWifiOff
+import androidx.compose.material.icons.filled.Tune
 import com.peernet.wifiextender.host.HostCredentials
 import com.peernet.wifiextender.host.RoleConflictPolicy
 import com.peernet.wifiextender.host.ShareAction
@@ -351,7 +362,7 @@ fun HomeScreen(
         val statusText = when {
             host.hostState == HostState.ERROR -> "Error"
             host.hostState == HostState.READY -> "Sharing internet"
-            host.hostState == HostState.CREATING_GROUP -> "Creating network…"
+            host.hostState == HostState.CREATING_GROUP -> "Creating network..."
             linkedHost != null -> "Connected to ${linkedHost.name}"
             else -> "Ready"
         }
@@ -360,21 +371,36 @@ fun HomeScreen(
             host.hostState == HostState.READY || linkedHost != null -> Color(0xFF2E7D32)
             else -> Color.Gray
         }
+        val statusIcon = when {
+            host.hostState == HostState.ERROR -> Icons.Filled.Warning
+            host.hostState == HostState.READY -> Icons.Filled.CheckCircle
+            host.hostState == HostState.CREATING_GROUP -> Icons.Filled.Tune
+            linkedHost != null -> Icons.Filled.PhoneAndroid
+            else -> Icons.Filled.SignalWifiOff
+        }
 
-        Text(statusText, style = MaterialTheme.typography.headlineMedium, color = statusColor)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = statusIcon,
+                contentDescription = null,
+                tint = statusColor,
+                modifier = Modifier.padding(end = 8.dp)
+            )
+            Text(statusText, style = MaterialTheme.typography.headlineMedium, color = statusColor)
+        }
 
         Text(
             text = buildString {
                 append(if (home.internetAvailable) "Internet: connected" else "Internet: not connected")
                 when (quicState) {
-                    1 -> append("  •  tunnel connecting…")
-                    2 -> append("  •  tunnel up")
-                    3 -> append("  •  tunnel reconnecting…")
+                    1 -> append("  -  tunnel connecting...")
+                    2 -> append("  -  tunnel up")
+                    3 -> append("  -  tunnel reconnecting...")
                 }
-                if (tunPackets > 0) append("  •  $engineStats")
+                if (tunPackets > 0) append("  -  $engineStats")
             },
             style = MaterialTheme.typography.bodyMedium,
-            color = Color.Gray
+            color = if (home.internetAvailable) Color.Gray else MaterialTheme.colorScheme.error
         )
 
         // Tunnel progress/failure in plain words — the only diagnostic a
@@ -505,6 +531,11 @@ fun HomeScreen(
                 ButtonDefaults.buttonColors()
             }
         ) {
+            Icon(
+                imageVector = if (isHosting) Icons.Filled.Stop else Icons.Filled.CloudUpload,
+                contentDescription = null,
+                modifier = Modifier.padding(end = 8.dp)
+            )
             Text(if (isHosting) "STOP SHARING" else "SHARE", style = MaterialTheme.typography.titleMedium)
         }
 
@@ -563,9 +594,18 @@ fun HomeScreen(
                 .height(56.dp),
             enabled = !client.searching
         ) {
+            Icon(
+                imageVector = when {
+                    client.searching -> Icons.Filled.Search
+                    linkedHost != null && !isHosting -> Icons.Filled.LinkOff
+                    else -> Icons.Filled.PhoneAndroid
+                },
+                contentDescription = null,
+                modifier = Modifier.padding(end = 8.dp)
+            )
             Text(
                 text = when {
-                    client.searching -> "SEARCHING…"
+                    client.searching -> "SEARCHING..."
                     linkedHost != null && !isHosting -> "DISCONNECT"
                     else -> "CONNECT"
                 },
@@ -619,6 +659,11 @@ fun HomeScreen(
                 )
             }
         }) {
+            Icon(
+                imageVector = Icons.Filled.BugReport,
+                contentDescription = null,
+                modifier = Modifier.padding(end = 6.dp)
+            )
             Text("SHARE DIAGNOSTICS", style = MaterialTheme.typography.labelSmall)
         }
 
