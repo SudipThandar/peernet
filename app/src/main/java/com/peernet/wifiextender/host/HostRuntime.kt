@@ -61,9 +61,9 @@ class HostRuntime @Inject constructor(
     @Volatile
     private var sharingActive = false
     /** When the current share began, for the auto-stop clock. 0 when not sharing. */
-    private var shareStartedAtMs = 0L
+    @Volatile private var shareStartedAtMs = 0L
     /** The limit being enforced for this share, resolved at start. */
-    private var shareDuration = ShareTimerPolicy.DEFAULT
+    @Volatile private var shareDuration = ShareTimerPolicy.DEFAULT
 
     /** Latches HOST_READY so it is reported on the edge, not on every emission. */
     @Volatile

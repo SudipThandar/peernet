@@ -113,7 +113,11 @@ class HostForegroundService : Service() {
         scope.launch {
             while (true) {
                 kotlinx.coroutines.delay(ALIVE_TICK_MS)
-                hostRuntime.reportAliveness("tick")
+                try {
+                    hostRuntime.reportAliveness("tick")
+                } catch (e: Exception) {
+                    Diagnostics.note("host", "ALIVE_TICK_FAILED ${e.message ?: e.javaClass.simpleName}")
+                }
             }
         }
     }

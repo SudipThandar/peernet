@@ -55,7 +55,11 @@ class PeerNetVpnService : VpnService() {
     /** Guards [teardown] so repeated calls are safe and do the work once. */
     private val tornDown = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default + kotlinx.coroutines.CoroutineExceptionHandler { _, t ->
+            Diagnostics.note("vpn", "COROUTINE_ERROR ${t.message ?: t.javaClass.simpleName}")
+        }
+    )
 
     override fun onBind(intent: Intent?) = super.onBind(intent)
 

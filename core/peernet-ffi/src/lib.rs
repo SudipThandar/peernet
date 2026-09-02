@@ -934,6 +934,32 @@ fn close_current_capture_fds() {
     }
 }
 
+/// Newtype wrapper that implements `AsRawFd` but does NOT close the fd on drop.
+///
+/// Used inside `AsyncFd` for the TUN read/write halves.  `close_capture_fds`
+/// owns the raw fd lifetime and closes all three fds (original + dup'd halves)
+/// via `libc::close`.  Without this wrapper, the `File::drop` inside
+/// `AsyncFd` would call `close()` a second time — a double-close that
+/// silently corrupts any fd allocated in between.
+struct NoCloseFd(std::fs::File);
+impl std::os::fd::AsRawFd for NoCloseFd {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+impl std::ops::Deref for NoCloseFd {
+    type Target = std::fs::File;
+    fn deref(&self) -> &std::fs::File { &self.0 }
+}
+impl std::ops::DerefMut for NoCloseFd {
+    fn deref_mut(&mut self) -> &mut std::fs::File { &mut self.0 }
+}
+impl Drop for NoCloseFd {
+    fn drop(&mut self) {
+        std::mem::forget(&self.0);
+    }
+}
+
 async fn run_capture(file: OwnedFd, mtu: usize, cap_gen: u64) {
     use std::mem::ManuallyDrop;
     use std::os::fd::AsFd;
@@ -977,14 +1003,20 @@ async fn run_capture(file: OwnedFd, mtu: usize, cap_gen: u64) {
     let _ = set_nonblocking(read_half.as_fd().as_raw_fd());
     let _ = set_nonblocking(write_half.as_fd().as_raw_fd());
 
-    let reader_fd = match AsyncFd::new(read_half) {
+    // Wrap in ManuallyDrop so that when the AsyncFd is dropped (after
+    // close_capture_fds closes the raw fd), the File::drop does NOT call
+    // close() a second time.  Without this, close_capture_fds closes X/Y/Z
+    // via libc::close, and then the AsyncFd's inner File drop closes Y/Z
+    // again — a double-close that silently corrupts any fd allocated in
+    // between.
+    let reader_fd = match AsyncFd::new(NoCloseFd(read_half)) {
         Ok(a) => a,
         Err(_) => {
             close_capture_fds(cap_gen);
             return;
         }
     };
-    let writer_fd = match AsyncFd::new(write_half) {
+    let writer_fd = match AsyncFd::new(NoCloseFd(write_half)) {
         Ok(a) => a,
         Err(_) => {
             close_capture_fds(cap_gen);
