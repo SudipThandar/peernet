@@ -1,6 +1,6 @@
 # Session Handoff — PeerNet WiFi Extender
 
-Handoff written 2026-08-23 @ commit `be04a87` (`main`, CI green, pushed to `origin/main`).
+Handoff updated 2026-09-02 @ commit `ba7e9f3` (`main`, CI green run #154, pushed to `origin/main`).
 Feed this file to a new agent session to resume work.
 
 ---
@@ -2033,3 +2033,156 @@ correct and permanent. Ignore it.
 
 Tests 4, 5 and 7 are the ones that matter. Test 4 is the direct check on RC-1 and
 RC-2 together, and test 7 is the only way to settle the host death.
+---
+
+## 29. Stabilization pass — full audit and five crash/corruption fixes (run #154, a7e9f3)
+
+A full read of every Kotlin service, ViewModel, Wi-Fi Direct manager, Rust FFI, and build
+config file. Three agent-audited layers in parallel: service lifecycle (PeerNetVpnService,
+HostForegroundService, UnderlyingNetworkPolicy, TunnelSupervisorPolicy,
+VpnNotificationActionReceiver), host/client/wifi (HostRuntime, HostSessionPolicy,
+ShareTimerPolicy, LinkServer, WifiDirectManager, GroupLifecyclePolicy, GroupCredentialsPolicy,
+ClientViewModel, ClientLinkManager, LinkPolicy, AutoConnectPolicy, HostViewModel, HomeScreen,
+NativeCore), and Rust FFI + build config (lib.rs, Cargo.toml, proguard-rules.pro,
+build.gradle.kts).
+
+### What was found and fixed
+
+**1. Rust TUN fd double-close (critical, lib.rs:937-1114)**
+
+close_capture_fds closed all three fds (original X + dup'd read Y and write Z) via raw
+libc::close(). Then the reader and writer tasks exited, their AsyncFd<File> dropped, and
+File::drop called close(Y) / close(Z) again. If another thread allocated a file between
+the first close and the second, the reused fd number was silently corrupted — wrong data read
+from an unrelated file descriptor, or an unrelated connection dropped.
+
+Fix: new NoCloseFd newtype wrapper that implements AsRawFd (delegating to inner File)
+and Deref<Target=File> + DerefMut (so .read() / .write() work through
+AsyncFd::writable_mut()), but its Drop impl calls std::mem::forget on the inner File
+to prevent the double-close. The raw fd lifetime is owned by close_capture_fds exclusively.
+Verified by cargo test --release (loopback gate) and all on-device test jobs.
+
+**2. HostForegroundService aliveTick crash (P0, HostForegroundService.kt:112-119)**
+
+liveTick() launched a coroutine with while (true) and no exception handling. If
+hostRuntime.reportAliveness() threw, the coroutine died silently, the proof-of-life
+mechanism was permanently lost, and on Android the unhandled exception propagated to the
+uncaught exception handler, crashing the process.
+
+Fix: 	ry/catch around the body, logging ALIVE_TICK_FAILED to Diagnostics.
+
+**3. PeerNetVpnService scope missing CoroutineExceptionHandler (P0, PeerNetVpnService.kt:58)**
+
+CoroutineScope(SupervisorJob() + Dispatchers.Default) had no exception handler. Any
+unhandled exception in watchLink, eestablishQuic, or the replacement watchdog crashed
+the process.
+
+Fix: added CoroutineExceptionHandler that logs COROUTINE_ERROR to Diagnostics.
+
+**4. reestablishQuic race (P1, PeerNetVpnService.kt:187-207)**
+
+Two concurrent network changes (e.g. onAvailable then onLinkPropertiesChanged both
+passing shouldAdopt) could both launch eestablishQuic. Both call stopTunnel() then
+startTunnel(), and the second stopTunnel kills the tunnel the first coroutine just started.
+
+Fix: AtomicBoolean reestablishing guard. Second concurrent call logs
+QUIC_REESTABLISH_SKIPPED (already in progress) and returns.
+
+**5. HostRuntime shareStartedAtMs/shareDuration not volatile (P1, HostRuntime.kt:63-66)**
+
+shareStartedAtMs and shareDuration are written on Dispatchers.Default (in
+startSharing) and read in the 2-second supervision tick loop, but were plain ar without
+@Volatile. A cross-thread stale read could cause the auto-stop clock to use the wrong
+deadline.
+
+Fix: added @Volatile to both fields.
+
+### What was audited and left alone (with rationale)
+
+**PeerNetVpnService race: link cleared between generation check and startTunCapture** —
+Theoretical P0 but the window is between two consecutive lines under the same 	ornDown
+guard. Fixing requires a significant refactor of the bring-up path. Left for a dedicated
+device-visibility session.
+
+**HostRuntime wifiLock acquire/release race** — The @Volatile on wifiLock combined with
+the single-threaded supervision tick makes this extremely unlikely. The worst case is a
+leaked WifiLock, not a crash or internet loss.
+
+**ClientViewModel double autoLink CAS pass** — Two concurrent utoLink() invocations can
+both pass usy.compareAndSet(false, true). In practice, utoLink is called from a single
+state.collect on Dispatchers.Default, so concurrent calls require two rapid state
+emissions. The usy flag is checked again inside connectNow, providing a second barrier.
+
+**LinkServer thread proliferation** — Each incoming connection spawns a new Thread. Under
+a port scan this creates unbounded threads. Each is short-lived (writes one response and
+closes). Not a real risk in practice since the port is only exposed to the local Wi-Fi Direct
+network.
+
+**UDP flow table sweep allocating under mutex** — A 2048-element vec allocation under the
+lock. The sweep only runs when the table exceeds MAX_UDP_FLOWS (2048), so it's rare. A
+latency spike, not a crash or memory leak.
+
+**TCP termination threads never joined** — Three std::thread::spawn calls with no
+JoinHandle retained. These threads exit when their channel senders/receivers hang up,
+which happens when 	cp_teardown() drops the TCP_PKT_TX slot. The threads are daemon and
+short-lived relative to the session. Unjoining is a resource concern, not a crash risk.
+
+### Release build status
+
+- Release APK is **signed with the debug keystore** (signingConfig =
+  signingConfigs.getByName("debug")). This makes it installable for testing. It is NOT a
+  Play Store-production-signed artifact. A real upload key and Play App Signing are required
+  before publishing.
+- R8 minification + resource shrinking are active in CI. The release APK is ~6 MB (72%
+  smaller than the ~22 MB debug APK).
+- ersionCode is still 1.
+- proguard-rules.pro keeps com.peernet.wifiextender.core.** (JNI surface).
+
+### Test results (run #154, a7e9f3)
+
+| Gate | Result |
+|---|---|
+| cargo test --release (Rust loopback) | **passed** |
+| 	estDebugUnitTest (Kotlin unit tests) | **passed** |
+| lintDebug (platform contracts) | **passed** |
+| ssembleDebug | **passed** |
+| ssembleRelease (R8) | **passed** |
+| On-device tests (API 29) | **passed** |
+| On-device tests (API 34) | **passed** |
+
+### APK artifacts
+
+| Artifact | Size | Signing |
+|---|---|---|
+| peernet-debug-apk | 21.8 MB | Debug keystore, installable |
+| peernet-release-apk | 6.2 MB | Debug keystore, R8-minified, installable |
+
+Download: https://github.com/SudipThandar/peernet/actions/runs/33653984289
+
+### Remaining known limitations
+
+1. **Host stops by itself after 5-10 minutes** — still open. Leading hypothesis: STA/GO
+   channel concurrency. Decisive test: host from M11 on mobile data with Wi-Fi fully off.
+2. **RC-3: recovery lives in viewModelScope** — deliberately deferred. Too risky without
+   device visibility; the obvious naive version is continuous background polling, which is
+   explicitly forbidden.
+3. **Host UDP NAT keyed on client source port only, global, no idle sweep, evicts at 512**
+   — not fixed. Can cause issues with heavy ICE fan-out.
+4. **smoltcp built without IPv6/ICMP/reassembly, no socket timeouts** — not fixed. TCP
+   terminated flows leak ~128 KiB each with no idle-out.
+5. **Share timer not persisted** — killing the host process loses the deadline.
+6. **Play Store blocked on**: release signing config (upload key), Play Billing, AdMob + UMP
+   consent, privacy policy + listing, specialUse FGS justification.
+
+### Design rules that must not break
+
+1. No PowerManager wake locks. Never keep the screen on.
+2. No local builds. CI-only.
+3. No Robolectric. Pure policy objects for testability.
+4. No raising retry counts/timeouts as a fix.
+5. No faking VPN/UI state.
+6. No SharedPreferences clearing as a fix.
+7. No replacing QUIC/UDP/TUN/Wi-Fi Direct/auto-connect/LinkServer/encryption/packet format.
+8. TUN MTU stays 1280.
+9. QUIC idle timeout stays at 90 s.
+10. Never trust gh run watch --exit-status. Poll manually.
