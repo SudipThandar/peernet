@@ -121,7 +121,6 @@ class MeshRelay @Inject constructor(
                 val config = WifiP2pConfig.Builder()
                     .setNetworkName(name)
                     .setPassphrase(pass)
-                    .setGroupOwnerBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
                     .build()
                 m.createGroup(ch, config, listener)
             } else {
