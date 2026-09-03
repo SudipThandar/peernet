@@ -188,6 +188,14 @@ class HostForegroundService : Service() {
                     // shares - "tapping SHARE does nothing". The runtime checks
                     // the user's hosting intent and only agrees when hosting has
                     // really ended; until then this service keeps running.
+                    //
+                    // During auto-recovery (Samsung group drop), the supervision
+                    // tick is re-creating the group. Do not give up while that
+                    // is in progress — it takes a few seconds.
+                    if (hostRuntime.recoveringGroup) {
+                        Diagnostics.note("host", "HOST_GROUP_RECOVERING — deferring decision")
+                        return@collect
+                    }
                     val ended = runCatching {
                         hostRuntime.noteHostingEnded("group ended", session)
                     }.getOrDefault(false)

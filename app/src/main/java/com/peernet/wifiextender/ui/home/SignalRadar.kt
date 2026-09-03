@@ -3,6 +3,7 @@ package com.peernet.wifiextender.ui.home
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -18,106 +19,103 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import kotlin.math.cos
-import kotlin.math.sin
+import androidx.compose.ui.unit.sp
 
 @Composable
 fun SignalRadar(
     signalStrength: Float,
     signalLabel: String,
+    packetsPerSec: Long = 0,
+    bytesPerSec: Long = 0,
     modifier: Modifier = Modifier
 ) {
-    val infiniteTransition = rememberInfiniteTransition()
-    val sweepAngle by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1500, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        )
+    val animatedStrength by animateFloatAsState(
+        targetValue = signalStrength.coerceIn(0f, 1f),
+        animationSpec = tween(durationMillis = 300, easing = LinearEasing),
+        label = "signal"
     )
 
-    val primaryColor = MaterialTheme.colorScheme.primary
-    val ringColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+    val ringColor = when {
+        animatedStrength > 0.7f -> Color(0xFF1E8E3E)
+        animatedStrength > 0.4f -> Color(0xFFF9AB00)
+        else -> Color(0xFFD93025)
+    }
+
+    val trackColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
 
     Column(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Canvas(modifier = Modifier.size(200.dp)) {
+        Canvas(modifier = Modifier.size(180.dp)) {
+            val strokeWidth = 10.dp.toPx()
+            val padding = strokeWidth / 2 + 4.dp.toPx()
+            val arcSize = Size(size.width - strokeWidth - 8.dp.toPx(), size.height - strokeWidth - 8.dp.toPx())
+            val topLeft = Offset(padding, padding)
+
+            // Background track
+            drawArc(
+                color = trackColor,
+                startAngle = 135f,
+                sweepAngle = 270f,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+            )
+
+            // Filled arc based on signal strength
+            drawArc(
+                color = ringColor,
+                startAngle = 135f,
+                sweepAngle = 270f * animatedStrength,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+            )
+
+            // Center dot pulsing when active
             val center = Offset(size.width / 2f, size.height / 2f)
-            val radius = size.width / 2f - 4.dp.toPx()
-
-            for (i in 1..4) {
-                drawCircle(
-                    color = ringColor,
-                    radius = radius * i / 4f,
-                    center = center,
-                    style = Stroke(width = 1.dp.toPx())
-                )
-            }
-
-            drawLine(
-                ringColor,
-                Offset(center.x, center.y - radius),
-                Offset(center.x, center.y + radius),
-                1.dp.toPx()
-            )
-            drawLine(
-                ringColor,
-                Offset(center.x - radius, center.y),
-                Offset(center.x + radius, center.y),
-                1.dp.toPx()
-            )
-
-            rotate(sweepAngle, center) {
-                drawArc(
-                    color = primaryColor.copy(alpha = 0.2f),
-                    startAngle = -30f,
-                    sweepAngle = 30f,
-                    useCenter = true,
-                    topLeft = Offset.Zero,
-                    size = size
-                )
-                drawLine(
-                    color = primaryColor,
-                    start = center,
-                    end = Offset(center.x + radius, center.y),
-                    strokeWidth = 2.dp.toPx()
-                )
-            }
-
-            if (signalStrength > 0f) {
-                val blipDistance = radius * (0.25f + 0.75f * (1f - signalStrength.coerceIn(0f, 1f)))
-                val blipAngleRad = Math.toRadians(45.0)
-                val blipPos = Offset(
-                    center.x + blipDistance * cos(blipAngleRad).toFloat(),
-                    center.y - blipDistance * sin(blipAngleRad).toFloat()
-                )
-                val blipColor = when {
-                    signalStrength > 0.7f -> Color(0xFF1E8E3E)
-                    signalStrength > 0.4f -> Color(0xFFF9AB00)
-                    else -> Color(0xFFD93025)
-                }
-                drawCircle(color = blipColor.copy(alpha = 0.3f), radius = 16.dp.toPx(), center = blipPos)
-                drawCircle(color = blipColor, radius = 6.dp.toPx(), center = blipPos)
+            if (animatedStrength > 0f) {
+                val pulseRadius = 6.dp.toPx() + animatedStrength * 4.dp.toPx()
+                drawCircle(color = ringColor.copy(alpha = 0.15f), radius = pulseRadius + 8.dp.toPx(), center = center)
+                drawCircle(color = ringColor, radius = pulseRadius, center = center)
+            } else {
+                drawCircle(color = trackColor, radius = 6.dp.toPx(), center = center)
             }
         }
 
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(4.dp))
+
+        // Throughput display
+        val throughputText = when {
+            bytesPerSec > 1_048_576 -> "%.1f MB/s".format(bytesPerSec / 1_048_576.0)
+            bytesPerSec > 1024 -> "%.0f KB/s".format(bytesPerSec / 1024.0)
+            bytesPerSec > 0 -> "${bytesPerSec} B/s"
+            packetsPerSec > 0 -> "${packetsPerSec} pkt/s"
+            else -> "No traffic"
+        }
+        Text(
+            throughputText,
+            style = MaterialTheme.typography.titleMedium,
+            color = ringColor,
+            fontWeight = FontWeight.Bold,
+            fontSize = 16.sp
+        )
+
+        Spacer(Modifier.height(2.dp))
+
         Text(
             signalLabel,
-            style = MaterialTheme.typography.bodyMedium,
-            color = when {
-                signalStrength > 0.7f -> Color(0xFF1E8E3E)
-                signalStrength > 0.4f -> Color(0xFFF9AB00)
-                else -> MaterialTheme.colorScheme.onSurfaceVariant
-            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontWeight = FontWeight.Medium
         )
     }

@@ -130,6 +130,8 @@ fun HomeScreen(
 
     var tunPackets by remember { mutableStateOf(0L) }
     var prevTunPackets by remember { mutableStateOf(0L) }
+    var tunBytes by remember { mutableStateOf(0L) }
+    var prevTunBytes by remember { mutableStateOf(0L) }
     var quicState by remember { mutableStateOf(0) }
     val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
     val tunnelActive by clientViewModel.tunnelActive.collectAsStateWithLifecycle()
@@ -183,6 +185,8 @@ fun HomeScreen(
             val newPackets = clientViewModel.packetCount()
             if (newPackets > tunPackets) tunPackets = newPackets
             quicState = clientViewModel.tunnelState()
+            val inbound = clientViewModel.inboundCount()
+            if (inbound > tunBytes) tunBytes = inbound
             val sending = clientViewModel.outboundCount() > 0
             val receiving = clientViewModel.inboundCount() > 0
             if (quicState == STATE_CONNECTED && tunPackets > 0 && !clientViewModel.captureAlive()) {
@@ -195,7 +199,7 @@ fun HomeScreen(
             } else {
                 silentSince = 0L
             }
-            kotlinx.coroutines.delay(1000)
+            kotlinx.coroutines.delay(500)
         }
     }
 
@@ -462,7 +466,11 @@ fun HomeScreen(
             if (isClientConnected) {
                 val tunnelUp = quicState == STATE_CONNECTED
                 val packetRate = (tunPackets - prevTunPackets).coerceAtLeast(0)
-                if (tunnelUp) prevTunPackets = tunPackets
+                val byteRate = (tunBytes - prevTunBytes).coerceAtLeast(0)
+                if (tunnelUp) {
+                    prevTunPackets = tunPackets
+                    prevTunBytes = tunBytes
+                }
                 val signalStrength = when {
                     !tunnelUp -> 0.15f
                     packetRate > 20 -> 0.95f
@@ -473,9 +481,9 @@ fun HomeScreen(
                 }
                 val signalLabel = when {
                     !tunnelUp -> "Connecting\u2026"
-                    signalStrength > 0.7f -> "Strong signal"
-                    signalStrength > 0.4f -> "Medium signal"
-                    else -> "Weak signal \u2014 move host closer"
+                    signalStrength > 0.7f -> "Strong connection"
+                    signalStrength > 0.4f -> "Active"
+                    else -> "Weak \u2014 move closer to host"
                 }
 
                 Card(
@@ -488,7 +496,12 @@ fun HomeScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        SignalRadar(signalStrength = signalStrength, signalLabel = signalLabel)
+                        SignalRadar(
+                            signalStrength = signalStrength,
+                            signalLabel = signalLabel,
+                            packetsPerSec = packetRate,
+                            bytesPerSec = byteRate
+                        )
                     }
                 }
 
@@ -533,7 +546,7 @@ fun HomeScreen(
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+            modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
         ) {
             fun requestShare() {
                 if (missingPerms.isNotEmpty()) {

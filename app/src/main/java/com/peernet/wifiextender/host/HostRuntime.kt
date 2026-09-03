@@ -60,6 +60,14 @@ class HostRuntime @Inject constructor(
      */
     @Volatile
     private var sharingActive = false
+
+    /**
+     * True while the supervision tick is re-creating a silently dropped group.
+     * Prevents the foreground service from giving up during the recovery window.
+     */
+    @Volatile
+    var recoveringGroup = false
+        private set
     /** When the current share began, for the auto-stop clock. 0 when not sharing. */
     @Volatile private var shareStartedAtMs = 0L
     /** The limit being enforced for this share, resolved at start. */
@@ -238,18 +246,21 @@ class HostRuntime @Inject constructor(
                     wifiDirect.refreshGroupInfo()
                     delay(500) // Allow the callback to update state
                     if (!wifiDirect.state.value.hosting && !wifiDirect.state.value.creating) {
-                        // Group is truly gone but sharing is still intended.
-                        // Attempt auto-recovery by re-creating the group.
-                        Diagnostics.note(
-                            "host",
-                            "GROUP_SILENTLY_DROPPED — attempting auto-recovery"
-                        )
-                        reportedReady = false
-                        wifiDirect.startHosting(
-                            ssid = com.peernet.wifiextender.wifi.GroupCredentialsPolicy
-                                .networkName(HostIdentity.id(context)),
-                            passphrase = HostCredentials.passphrase(context)
-                        )
+                    // Group is truly gone but sharing is still intended.
+                    // Attempt auto-recovery by re-creating the group.
+                    Diagnostics.note(
+                        "host",
+                        "GROUP_SILENTLY_DROPPED — attempting auto-recovery"
+                    )
+                    recoveringGroup = true
+                    reportedReady = false
+                    wifiDirect.startHosting(
+                        ssid = com.peernet.wifiextender.wifi.GroupCredentialsPolicy
+                            .networkName(HostIdentity.id(context)),
+                        passphrase = HostCredentials.passphrase(context)
+                    )
+                    delay(3_000) // Give the group time to form before clearing recovery flag
+                    recoveringGroup = false
                     }
                     continue
                 }
