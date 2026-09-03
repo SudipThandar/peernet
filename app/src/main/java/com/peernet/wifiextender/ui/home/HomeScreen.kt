@@ -1,5 +1,6 @@
 package com.peernet.wifiextender.ui.home
 
+import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -35,8 +37,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.material.icons.Icons
@@ -49,6 +53,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.SignalWifiOff
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Videocam
 import com.peernet.wifiextender.host.HostCredentials
 import com.peernet.wifiextender.host.RoleConflictPolicy
 import com.peernet.wifiextender.host.ShareAction
@@ -62,15 +67,6 @@ import kotlinx.coroutines.launch
 import com.peernet.wifiextender.ui.host.HostState
 import com.peernet.wifiextender.util.Permissions
 
-/**
- * Two buttons. That's the whole app:
- *  SHARE   – share this phone's internet (host)
- *  CONNECT – link to a host whose Wi-Fi Direct network you joined (client)
- *
- * Flow: first time, join the DIRECT-xx network in phone settings with its
- * password. On later shares the network is remembered by the OS and the app
- * detects + links automatically; CONNECT stays as a manual fallback.
- */
 @Composable
 fun HomeScreen(
     modifier: Modifier = Modifier,
@@ -83,23 +79,15 @@ fun HomeScreen(
     val client by clientViewModel.uiState.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
+    val activity = context as? Activity
     var missingPerms by remember { mutableStateOf(Permissions.missing(context)) }
-    // Distinguishes "user tapped SHARE" from the startup prompt so granting
-    // permissions at first launch never silently starts hosting.
     var pendingStartSharing by remember { mutableStateOf(false) }
-    // Set when SHARE is tapped while this phone is receiving as a client. A phone
-    // gets one P2P group, so hosting would destroy the client session; the user is
-    // asked instead of having the internet vanish underneath them.
     var shareRoleConflict by remember { mutableStateOf(false) }
-    // Explains a duration tap that could not be honoured.
-    var premiumNotice by remember { mutableStateOf<String?>(null) }
+    var showAdDialog by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
-        // Re-read instead of trusting the result map: it only contains what was
-        // asked for, and only *required* permissions may gate sharing (a denied
-        // notification permission must never disable the app).
         missingPerms = Permissions.missing(context)
         if (missingPerms.isEmpty() && pendingStartSharing) {
             pendingStartSharing = false
@@ -111,8 +99,7 @@ fun HomeScreen(
         homeViewModel.startObserving()
         hostViewModel.onScreenShown()
         missingPerms = Permissions.missing(context)
-        // Ask for location/nearby-devices up front: first-run users grant
-        // once here instead of being interrupted mid-SHARE or mid-CONNECT.
+        homeViewModel.loadAd()
         val firstRunAsk = Permissions.missingAny(context)
         if (firstRunAsk.isNotEmpty()) {
             permissionLauncher.launch(firstRunAsk.toTypedArray())
@@ -121,24 +108,11 @@ fun HomeScreen(
 
     val scope = rememberCoroutineScope()
 
-    // ---- VPN consent + TUN start once a host link exists (Milestone 6/7) ----
     var tunPackets by remember { mutableStateOf(0L) }
     var quicState by remember { mutableStateOf(0) }
-    var engineStats by remember { mutableStateOf("") }
-    // Read once per composition entry, then cleared: the message survives the
-    // process death that produced it, which is the whole point.
-    var lastCrash by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(Unit) {
-        lastCrash = com.peernet.wifiextender.PeerNetApp.lastCrash(context)
-        if (lastCrash != null) {
-            com.peernet.wifiextender.PeerNetApp.clearLastCrash(context)
-        }
-    }
     val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
     val tunnelActive by clientViewModel.tunnelActive.collectAsStateWithLifecycle()
 
-    // Null means "showing the live value"; non-null means the user is editing.
-    // Seeding the field directly from state instead would fight every keystroke.
     var passwordDraft by remember { mutableStateOf<String?>(null) }
     var passwordError by remember { mutableStateOf<String?>(null) }
     var passwordNotice by remember { mutableStateOf<String?>(null) }
@@ -148,38 +122,19 @@ fun HomeScreen(
         android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java).apply {
             val h = client.connectedHost
             if (h?.address != null) {
-                putExtra(
-                    com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_HOST_ADDR,
-                    "${h.address}:${h.tunnelPort}"
-                )
-                putExtra(
-                    com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_HOST_FP,
-                    h.fingerprint ?: ""
-                )
+                putExtra(com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_HOST_ADDR, "${h.address}:${h.tunnelPort}")
+                putExtra(com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_HOST_FP, h.fingerprint ?: "")
             }
-            // Pin QUIC sockets to the link's network (P2P Wi-Fi is usually
-            // "no internet" and would otherwise lose the default route to
-            // cellular, where the host is unreachable).
             clientViewModel.linkedNetwork()?.let {
-                putExtra(
-                    com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_NETWORK,
-                    it
-                )
+                putExtra(com.peernet.wifiextender.service.PeerNetVpnService.EXTRA_NETWORK, it)
             }
         }
-    /**
-     * Android 12+ throws ForegroundServiceStartNotAllowedException when a
-     * foreground service is started while the app is not visible, and the link
-     * event that triggers this can arrive from a background coroutine. A crash
-     * there looks exactly like "the app is broken", so it is reported instead.
-     */
+
     fun startVpnService() {
         try {
             context.startForegroundService(vpnIntent())
         } catch (t: Throwable) {
-            clientViewModel.reportTunnelStatus(
-                "Could not start the tunnel while the app was in the background — open PeerNet and reconnect."
-            )
+            clientViewModel.reportTunnelStatus("Could not start tunnel. Open PeerNet and reconnect.")
         }
     }
 
@@ -189,65 +144,30 @@ fun HomeScreen(
         if (result.resultCode == android.app.Activity.RESULT_OK) {
             startVpnService()
         } else {
-            // Silent denial used to look identical to a broken tunnel.
-            clientViewModel.reportTunnelStatus(
-                "VPN permission denied — internet cannot be routed. Disconnect and connect again to allow it."
-            )
+            clientViewModel.reportTunnelStatus("VPN permission denied. Disconnect and reconnect.")
         }
     }
 
     fun stopVpn() {
-        context.stopService(
-            android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java)
-        )
+        context.stopService(android.content.Intent(context, com.peernet.wifiextender.service.PeerNetVpnService::class.java))
     }
 
     LaunchedEffect(client.connectedHost?.hostId) {
-        // Starting the tunnel needs an Activity (VPN consent is a dialog), so
-        // the UI still triggers it. Stopping it must NOT live here: this effect
-        // and `collectAsStateWithLifecycle` both stop when the Activity stops,
-        // so with the screen off nothing observed the link clearing and the TUN,
-        // the tunnel and the Android VPN key all outlived the session.
-        // `PeerNetVpnService` now watches `ClientLinkManager.linkedHost` itself.
         if (client.connectedHost == null) return@LaunchedEffect
         val prepare = android.net.VpnService.prepare(context)
-        if (prepare != null) {
-            vpnLauncher.launch(prepare)
-        } else {
-            startVpnService()
-        }
-        // Surface capture + tunnel proof in the status line.
+        if (prepare != null) vpnLauncher.launch(prepare) else startVpnService()
         var silentSince = 0L
         while (true) {
             tunPackets = clientViewModel.packetCount()
             quicState = clientViewModel.tunnelState()
-            engineStats = clientViewModel.engineStats()
-
-            // "Connected but nothing loads" is otherwise invisible: the tunnel
-            // reports healthy while the host relays nothing back. Sending with
-            // zero bytes returned for several seconds is that failure.
             val sending = clientViewModel.outboundCount() > 0
             val receiving = clientViewModel.inboundCount() > 0
-            val undelivered = clientViewModel.undeliveredCount() > 0
-
-            // A dead capture loop only shows up as frozen counters, which reads
-            // as "the phone sent nothing" — name it instead.
             if (quicState == STATE_CONNECTED && tunPackets > 0 && !clientViewModel.captureAlive()) {
-                clientViewModel.reportTunnelStatus(
-                    "Packet capture stopped — reconnect to restart the tunnel."
-                )
+                clientViewModel.reportTunnelStatus("Capture stopped. Reconnect.")
             } else if (quicState == STATE_CONNECTED && sending && !receiving) {
                 if (silentSince == 0L) silentSince = System.currentTimeMillis()
                 if (System.currentTimeMillis() - silentSince > SILENT_TUNNEL_MS) {
-                    clientViewModel.reportTunnelStatus(
-                        if (undelivered) {
-                            "Replies are arriving but cannot be delivered to this phone — " +
-                                "reconnect to rebuild the tunnel."
-                        } else {
-                            "Tunnel is up but the host is not sending anything back — " +
-                                "check that the host phone still has working internet."
-                        }
-                    )
+                    clientViewModel.reportTunnelStatus("Tunnel up but no data returning. Check host internet.")
                 }
             } else {
                 silentSince = 0L
@@ -256,120 +176,101 @@ fun HomeScreen(
         }
     }
 
+    val sessionActive = host.hostState == HostState.READY || quicState == STATE_CONNECTED
+
+    // Samsung battery optimization dialog
+    var showSamsungDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(sessionActive) {
+        if (DozeExemptionPolicy.isSamsungDevice() && !DozeExemption.wasSamsungAsked(context) && sessionActive) {
+            showSamsungDialog = true
+        }
+    }
+    if (showSamsungDialog) {
+        AlertDialog(
+            onDismissRequest = { showSamsungDialog = false; DozeExemption.markSamsungAsked(context) },
+            title = { Text("Keep sharing alive") },
+            text = {
+                Text("Samsung may stop sharing when the screen turns off.\n\nOpen Settings > Battery > Background usage limits > Never sleeping apps > Add PeerNet.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSamsungDialog = false
+                    DozeExemption.markSamsungAsked(context)
+                    DozeExemption.requestSamsungExemption(context)
+                }) { Text("Open Settings") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSamsungDialog = false; DozeExemption.markSamsungAsked(context) }) { Text("Skip") }
+            }
+        )
+    }
+
+    // Standard Doze exemption
+    LaunchedEffect(sessionActive) {
+        if (!DozeExemptionPolicy.shouldPrompt(sessionActive, DozeExemption.isExempt(context), DozeExemption.wasAsked(context))) return@LaunchedEffect
+        DozeExemption.requestExemption(context)
+    }
+
+    // Ad reward dialog
+    if (showAdDialog) {
+        AlertDialog(
+            onDismissRequest = { showAdDialog = false },
+            title = { Text("Unlock Unlimited") },
+            text = { Text("Watch a short ad to share with no time limit.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showAdDialog = false
+                    if (activity != null && homeViewModel.isAdReady()) {
+                        homeViewModel.showAd(activity) {
+                            hostViewModel.setShareDuration(ShareDuration.UNLIMITED)
+                        }
+                    } else {
+                        homeViewModel.loadAd()
+                        hostViewModel.setShareDuration(ShareDuration.UNLIMITED)
+                    }
+                }) { Text("Watch Ad") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAdDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(24.dp),
+        modifier = modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(40.dp))
+
+        // ---- App title ----
+        Text(
+            "PeerNet",
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground
+        )
+
+        Spacer(Modifier.height(8.dp))
 
         // ---- Status ----
         val linkedHost = client.connectedHost
         val isHosting = host.hostState == HostState.READY || host.hostState == HostState.CREATING_GROUP
 
-        // ---- one-time "allow background running" prompt ----
-        //
-        // Doze is the last unaddressed cause of the screen-off stall: both phones
-        // now hold a Wi-Fi lock, but that keeps the radio alive, not the app.
-        // `PowerManager` wake locks are ruled out by design, so a user-granted
-        // exemption is the only lever left.
-        //
-        // The trigger is deliberately "a session is genuinely up" - host READY, or
-        // the client's tunnel actually connected - rather than the button tap:
-        //  - at tap time the client still has the VPN consent dialog pending, and
-        //    a second system dialog would cover it;
-        //  - starting an activity moves the app off-screen, and on Android 12+ a
-        //    foreground service cannot be started from the background. Waiting
-        //    until the service is already running avoids that entirely.
-        val sessionActive = host.hostState == HostState.READY || quicState == STATE_CONNECTED
-
-        // Samsung's proprietary battery optimization ("Put unused apps to
-        // sleep") kills the foreground service when the screen turns off,
-        // regardless of Android's standard Doze exemption. Samsung has no
-        // programmatic API; the user must manually add PeerNet to "Never
-        // sleeping apps" in Samsung's battery settings. The standard
-        // REQUEST_IGNORE_BATTERY_OPTIMIZATIONS dialog either says "Battery
-        // optimization not supported" or has no effect on Samsung devices.
-        var showSamsungDialog by remember { mutableStateOf(false) }
-        LaunchedEffect(sessionActive) {
-            if (DozeExemptionPolicy.isSamsungDevice() &&
-                !DozeExemption.wasSamsungAsked(context) &&
-                sessionActive
-            ) {
-                showSamsungDialog = true
-            }
-        }
-        if (showSamsungDialog) {
-            AlertDialog(
-                onDismissRequest = {
-                    showSamsungDialog = false
-                    DozeExemption.markSamsungAsked(context)
-                },
-                title = { Text("Keep sharing alive") },
-                text = {
-                    Text(
-                        "Samsung's battery optimization may stop sharing when the " +
-                        "screen turns off. To prevent this:\n\n" +
-                        "1. Tap Open Settings below\n" +
-                        "2. Tap Battery > Background usage limits\n" +
-                        "3. Tap Never sleeping apps\n" +
-                        "4. Add PeerNet to the list"
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        showSamsungDialog = false
-                        DozeExemption.markSamsungAsked(context)
-                        DozeExemption.requestSamsungExemption(context)
-                        com.peernet.wifiextender.diag.Diagnostics.note(
-                            "power", "SAMSUNG_BATTERY_EXEMPTION_OPENED"
-                        )
-                    }) {
-                        Text("Open Settings")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = {
-                        showSamsungDialog = false
-                        DozeExemption.markSamsungAsked(context)
-                    }) {
-                        Text("Skip")
-                    }
-                }
-            )
-        }
-
-        // Standard Android Doze exemption (non-Samsung devices).
-        LaunchedEffect(sessionActive) {
-            if (!DozeExemptionPolicy.shouldPrompt(
-                    sessionActive = sessionActive,
-                    alreadyExempt = DozeExemption.isExempt(context),
-                    alreadyAsked = DozeExemption.wasAsked(context)
-                )
-            ) {
-                return@LaunchedEffect
-            }
-            val shown = DozeExemption.requestExemption(context)
-            com.peernet.wifiextender.diag.Diagnostics.note(
-                "power",
-                if (shown) "DOZE_EXEMPTION_PROMPTED" else
-                    "DOZE_EXEMPTION_PROMPT_UNAVAILABLE - no activity for this action on this build"
-            )
-        }
-
         val statusText = when {
             host.hostState == HostState.ERROR -> "Error"
-            host.hostState == HostState.READY -> "Sharing internet"
-            host.hostState == HostState.CREATING_GROUP -> "Creating network..."
-            linkedHost != null -> "Connected to ${linkedHost.name}"
+            host.hostState == HostState.READY -> "Sharing"
+            host.hostState == HostState.CREATING_GROUP -> "Starting..."
+            client.searching -> "Searching..."
+            linkedHost != null -> "Connected"
             else -> "Ready"
         }
         val statusColor = when {
-            host.hostState == HostState.ERROR -> MaterialTheme.colorScheme.error
-            host.hostState == HostState.READY || linkedHost != null -> Color(0xFF2E7D32)
-            else -> Color.Gray
+            host.hostState == HostState.ERROR -> Color(0xFFD93025)
+            host.hostState == HostState.READY -> Color(0xFF1E8E3E)
+            host.hostState == HostState.CREATING_GROUP -> Color(0xFFF9AB00)
+            linkedHost != null -> Color(0xFF1E8E3E)
+            else -> Color(0xFF9AA0A6)
         }
         val statusIcon = when {
             host.hostState == HostState.ERROR -> Icons.Filled.Warning
@@ -379,136 +280,65 @@ fun HomeScreen(
             else -> Icons.Filled.SignalWifiOff
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                imageVector = statusIcon,
-                contentDescription = null,
-                tint = statusColor,
-                modifier = Modifier.padding(end = 8.dp)
-            )
-            Text(statusText, style = MaterialTheme.typography.headlineMedium, color = statusColor)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(statusIcon, contentDescription = null, tint = statusColor, modifier = Modifier.size(20.dp))
+            Text(statusText, style = MaterialTheme.typography.titleLarge, color = statusColor, fontWeight = FontWeight.Medium)
         }
 
-        Text(
-            text = buildString {
-                append(if (home.internetAvailable) "Internet: connected" else "Internet: not connected")
-                when (quicState) {
-                    1 -> append("  -  tunnel connecting...")
-                    2 -> append("  -  tunnel up")
-                    3 -> append("  -  tunnel reconnecting...")
-                }
-                if (tunPackets > 0) append("  -  $engineStats")
-            },
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (home.internetAvailable) Color.Gray else MaterialTheme.colorScheme.error
-        )
-
-        // Tunnel progress/failure in plain words — the only diagnostic a
-        // user without adb can act on.
-        if (tunnelStatus.isNotBlank()) {
-            Text(
-                text = tunnelStatus,
-                style = MaterialTheme.typography.bodySmall,
-                color = if (quicState == 2) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
-            )
+        // ---- Tunnel status (errors only) ----
+        if (tunnelStatus.isNotBlank() && quicState != STATE_CONNECTED) {
+            Text(tunnelStatus, style = MaterialTheme.typography.bodySmall, color = Color(0xFFD93025))
         }
 
-        // A crash is otherwise invisible without adb: the app just reappears
-        // and the tunnel counters restart. Show what killed it, once.
-        if (lastCrash != null) {
-            Text(
-                text = "Recovered from a crash: $lastCrash",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error
-            )
-        }
+        Spacer(Modifier.height(16.dp))
 
-        home.engineVersion?.let {
-            Text(
-                text = it,
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFF9E9E9E)
-            )
-        }
-
-        Spacer(Modifier.height(32.dp))
-
-        // ---- SHARE DURATION ----
-        // Offered before sharing only: a running share keeps the limit it started
-        // with, because silently shortening one would look like the host dying.
+        // ---- Duration picker (before sharing only) ----
         if (!isHosting) {
-            Text(
-                text = "Share for",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                ShareDuration.values().forEach { option ->
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                ShareDuration.entries.forEach { option ->
                     val selected = option == host.shareDuration
+                    val isUnlimited = option == ShareDuration.UNLIMITED && !host.premium
                     TextButton(
                         onClick = {
-                            if (ShareTimerPolicy.isSelectable(option, host.premium)) {
-                                premiumNotice = null
+                            if (isUnlimited) {
+                                showAdDialog = true
+                            } else if (ShareTimerPolicy.isSelectable(option, host.premium)) {
                                 hostViewModel.setShareDuration(option)
-                            } else {
-                                // Honest about why the tap did nothing, instead of a
-                                // disabled control with no explanation.
-                                premiumNotice =
-                                    "Unlimited sharing will be a paid option. " +
-                                    "It is not available yet."
                             }
                         }
                     ) {
-                        Text(
-                            text = option.label,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = if (selected) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            if (isUnlimited) {
+                                Icon(Icons.Filled.Videocam, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color(0xFFF9AB00))
                             }
-                        )
+                            Text(
+                                text = option.label,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = when {
+                                    selected -> MaterialTheme.colorScheme.primary
+                                    isUnlimited -> Color(0xFFF9AB00)
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
                     }
                 }
             }
-            premiumNotice?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Spacer(Modifier.height(8.dp))
         } else {
-            // Named explicitly so a timer stop is never mistaken for a fault.
-            // A local 1-second tick keeps the countdown smooth: the supervision
-            // tick that updates host.shareRemainingMs runs every 2 s, which
-            // makes the display jump by 2 each time it recomposes.
+            // Running timer
             var tick by remember { mutableStateOf(0L) }
-            LaunchedEffect(Unit) {
-                while (true) {
-                    kotlinx.coroutines.delay(1_000L)
-                    tick++
-                }
-            }
+            LaunchedEffect(Unit) { while (true) { kotlinx.coroutines.delay(1_000L); tick++ } }
             @Suppress("UNUSED_EXPRESSION")
-            tick // force recomposition every second
-            Text(
-                text = ShareTimerPolicy.formatRemaining(host.shareRemainingMs)
-                    ?.let { "Stops in $it" }
-                    ?: "No time limit",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(8.dp))
+            tick
+            val remaining = ShareTimerPolicy.formatRemaining(host.shareRemainingMs)
+            if (remaining != null) {
+                Text(remaining, style = MaterialTheme.typography.titleMedium, color = Color(0xFF5F6368), fontWeight = FontWeight.Light)
+            }
         }
 
-        // ---- SHARE ----
-        // Shared by the direct tap and by the role-conflict confirmation, so both
-        // routes honour the permission gate identically.
+        Spacer(Modifier.weight(1f))
+
+        // ---- SHARE button ----
         fun requestShare() {
             if (missingPerms.isNotEmpty()) {
                 pendingStartSharing = true
@@ -523,76 +353,56 @@ fun HomeScreen(
                 if (isHosting) {
                     hostViewModel.stopSharing()
                 } else {
-                    when (
-                        RoleConflictPolicy.evaluateShareRequest(
-                            clientLinkActive = linkedHost != null,
-                            tunnelActive = tunnelActive
-                        )
-                    ) {
+                    when (RoleConflictPolicy.evaluateShareRequest(clientLinkActive = linkedHost != null, tunnelActive = tunnelActive)) {
                         ShareAction.CONFIRM_REPLACING_CLIENT_LINK -> shareRoleConflict = true
                         ShareAction.PROCEED -> requestShare()
                     }
                 }
             },
-            modifier = Modifier
-                .fillMaxWidth(0.85f)
-                .height(56.dp),
-            colors = if (isHosting) {
-                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-            } else {
-                ButtonDefaults.buttonColors()
-            }
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isHosting) Color(0xFFD93025) else Color(0xFF1A73E8)
+            )
         ) {
             Icon(
-                imageVector = if (isHosting) Icons.Filled.Stop else Icons.Filled.CloudUpload,
+                if (isHosting) Icons.Filled.Stop else Icons.Filled.CloudUpload,
                 contentDescription = null,
-                modifier = Modifier.padding(end = 8.dp)
+                modifier = Modifier.padding(end = 8.dp).size(20.dp)
             )
-            Text(if (isHosting) "STOP SHARING" else "SHARE", style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (isHosting) "Stop Sharing" else "Share",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
         }
 
         if (shareRoleConflict) {
             AlertDialog(
                 onDismissRequest = { shareRoleConflict = false },
-                title = { Text("Stop receiving first?") },
-                text = {
-                    Text(
-                        "This phone is getting its internet from " +
-                            "${linkedHost?.name ?: "another phone"}. It can host or " +
-                            "receive, but not both at once, so sharing will end that " +
-                            "connection and you will lose internet on this phone."
-                    )
-                },
+                title = { Text("Switch roles?") },
+                text = { Text("This will disconnect from the current host and start sharing instead.") },
                 confirmButton = {
                     TextButton(onClick = {
                         shareRoleConflict = false
-                        // Ends the client session deliberately before hosting. The
-                        // group must be left in an orderly way - previously Android
-                        // destroyed it underneath us with no teardown at all.
                         scope.launch {
                             stopVpn()
                             clientViewModel.disconnect()
                             delay(2_500)
                             requestShare()
                         }
-                    }) { Text("STOP AND SHARE") }
+                    }) { Text("Switch") }
                 },
                 dismissButton = {
-                    TextButton(onClick = { shareRoleConflict = false }) { Text("CANCEL") }
+                    TextButton(onClick = { shareRoleConflict = false }) { Text("Cancel") }
                 }
             )
         }
 
-        // ---- CONNECT / DISCONNECT ----
+        // ---- CONNECT button ----
         OutlinedButton(
             onClick = {
                 when {
-                    // Client disconnect
-                    linkedHost != null && !isHosting -> {
-                        stopVpn()
-                        clientViewModel.disconnect()
-                    }
-                    // Host tapping CONNECT: stop sharing first, then search as client
+                    linkedHost != null && !isHosting -> { stopVpn(); clientViewModel.disconnect() }
                     isHosting -> scope.launch {
                         hostViewModel.stopSharing()
                         delay(2_500)
@@ -601,178 +411,109 @@ fun HomeScreen(
                     else -> clientViewModel.connectNow()
                 }
             },
-            modifier = Modifier
-                .fillMaxWidth(0.85f)
-                .height(56.dp),
+            modifier = Modifier.fillMaxWidth().height(56.dp),
             enabled = !client.searching
         ) {
             Icon(
-                imageVector = when {
+                when {
                     client.searching -> Icons.Filled.Search
                     linkedHost != null && !isHosting -> Icons.Filled.LinkOff
                     else -> Icons.Filled.PhoneAndroid
                 },
                 contentDescription = null,
-                modifier = Modifier.padding(end = 8.dp)
+                modifier = Modifier.padding(end = 8.dp).size(20.dp)
             )
             Text(
-                text = when {
-                    client.searching -> "SEARCHING..."
-                    linkedHost != null && !isHosting -> "DISCONNECT"
-                    else -> "CONNECT"
+                when {
+                    client.searching -> "Searching..."
+                    linkedHost != null && !isHosting -> "Disconnect"
+                    else -> "Connect"
                 },
-                style = MaterialTheme.typography.titleMedium
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
             )
         }
 
-        // ---- Sharing details (password needed for manual join) ----
+        // ---- Share details card (host only) ----
         host.error?.let {
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
-                Text(it, modifier = Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onErrorContainer)
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFDECEA)), modifier = Modifier.fillMaxWidth()) {
+                Text(it, modifier = Modifier.padding(12.dp), color = Color(0xFFD93025), style = MaterialTheme.typography.bodySmall)
             }
         }
 
-        // ---- Sharing details (password needed for manual join) ----
         if (host.hostState == HostState.READY) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFF8F9FA)),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     InfoRow("Network", host.ssid ?: "—")
 
-                    // ---- password, editable in place ----
-                    //
-                    // The value shown is the group's ACTUAL passphrase, not the
-                    // stored preference: on a build that refused our custom
-                    // config they differ, and showing the stored one would have
-                    // the user typing a password that cannot work.
                     val effective = host.passphrase
-                    if (effective.isNullOrEmpty()) {
-                        InfoRow("Password", "unavailable — see Wi-Fi settings")
-                    } else {
+                    if (!effective.isNullOrEmpty()) {
                         val shown = passwordDraft ?: effective
                         val changed = shown != effective
-                        // Validated on every keystroke, not only on Done, so the
-                        // reason a short password will not save is on screen
-                        // *while* it is too short instead of after the attempt.
-                        val liveRejection =
-                            if (changed) GroupCredentialsPolicy.rejection(shown) else null
+                        val liveRejection = if (changed) GroupCredentialsPolicy.rejection(shown) else null
                         val canSave = changed && liveRejection == null
                         OutlinedTextField(
                             value = shown,
-                            onValueChange = {
-                                passwordDraft = it
-                                passwordError = null
-                                passwordNotice = null
-                            },
+                            onValueChange = { passwordDraft = it; passwordError = null; passwordNotice = null },
                             label = { Text("Password") },
                             singleLine = true,
                             isError = liveRejection != null || passwordError != null,
                             supportingText = {
                                 val error = passwordError ?: liveRejection
                                 val msg = error ?: passwordNotice
-                                if (msg != null) {
-                                    Text(
-                                        msg,
-                                        color = if (error != null) {
-                                            MaterialTheme.colorScheme.error
-                                        } else {
-                                            Color(0xFF2E7D32)
-                                        }
-                                    )
-                                } else if (canSave) {
-                                    Text("Press Done to save this password")
-                                } else {
-                                    Text(
-                                        "At least ${GroupCredentialsPolicy.MIN_LENGTH} characters. " +
-                                            "Type a new password and press Done to change it."
-                                    )
-                                }
+                                if (msg != null) Text(msg, color = if (error != null) MaterialTheme.colorScheme.error else Color(0xFF1E8E3E))
+                                else if (canSave) Text("Done to save")
+                                else Text("Min ${GroupCredentialsPolicy.MIN_LENGTH} chars")
                             },
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                            // Saved on Done rather than behind its own button:
-                            // persisting every keystroke would store half-typed
-                            // passwords, and a separate button is not wanted here.
-                            keyboardActions = KeyboardActions(
-                                onDone = {
-                                    when {
-                                        // Nothing typed: keep the keyboard closed
-                                        // and say nothing. Reporting "saved" for a
-                                        // no-op is how the old version claimed to
-                                        // have changed a password it had not.
-                                        !changed -> {
-                                            passwordError = null
-                                            passwordNotice = null
-                                            keyboard?.hide()
-                                        }
-                                        // Too short / only spaces / unusable: the
-                                        // stored password is left exactly as it
-                                        // was, and the keyboard stays up so the
-                                        // user can finish typing.
-                                        liveRejection != null -> {
-                                            passwordError = liveRejection
-                                            passwordNotice = null
-                                        }
-                                        else -> {
-                                            val rejected =
-                                                HostCredentials.setPassphrase(context, shown)
-                                            passwordError = rejected
-                                            passwordNotice = if (rejected == null) {
-                                                "Saved. Tap STOP SHARING then SHARE to apply it, " +
-                                                    "then reconnect the other phone with the " +
-                                                    "new password."
-                                            } else {
-                                                null
-                                            }
-                                            if (rejected == null) keyboard?.hide()
-                                        }
+                            keyboardActions = KeyboardActions(onDone = {
+                                when {
+                                    !changed -> { passwordError = null; passwordNotice = null; keyboard?.hide() }
+                                    liveRejection != null -> { passwordError = liveRejection; passwordNotice = null }
+                                    else -> {
+                                        val rejected = HostCredentials.setPassphrase(context, shown)
+                                        passwordError = rejected
+                                        passwordNotice = if (rejected == null) "Saved. Restart sharing to apply." else null
+                                        if (rejected == null) keyboard?.hide()
                                     }
                                 }
-                            ),
+                            }),
                             modifier = Modifier.fillMaxWidth()
                         )
+                    } else {
+                        InfoRow("Password", "See Wi-Fi settings")
                     }
 
-                    InfoRow("Address", host.groupOwnerAddress ?: "acquiring…")
-                    InfoRow(
-                        "Clients probed",
-                        "${host.probesAnswered}" +
-                            if (host.probesAnswered == 0) " — no client has reached this phone yet" else ""
-                    )
-                    if (!host.linkServerListening) {
-                        // Clients look for this responder to learn the pin; a
-                        // dead one means they never link, with no other symptom.
+                    InfoRow("Address", host.groupOwnerAddress ?: "—")
+                    InfoRow("Clients", "${host.probesAnswered}")
+
+                    if (!host.linkServerListening || !host.engineReady) {
                         Text(
-                            "Clients cannot reach this phone: ${host.linkServerFailure ?: "link responder down"}.\n" +
-                                "Tap STOP SHARING then SHARE again.",
+                            if (!host.engineReady) "Engine: ${host.engineFailure ?: "not running"}"
+                            else "Link server: ${host.linkServerFailure ?: "down"}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-                    if (!host.engineReady) {
-                        // Without the engine there is no pin and no relay, so
-                        // a client would join the network and get nothing.
-                        Text(
-                            "Tunnel engine not running — clients cannot get internet.\n" +
-                                "Reason: ${host.engineFailure ?: "unknown"}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
+                            color = Color(0xFFD93025)
                         )
                     }
                 }
             }
         }
+
+        Spacer(Modifier.height(16.dp))
     }
 }
 
-/** Tunnel state reported by the engine: 2 = connected. */
 private const val STATE_CONNECTED = 2
-
-/** How long a connected-but-silent tunnel is tolerated before it is called out. */
 private const val SILENT_TUNNEL_MS = 10_000L
 
 @Composable
 private fun InfoRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, color = Color.Gray)
-        Text(value, style = MaterialTheme.typography.bodyLarge)
+        Text(label, color = Color(0xFF5F6368), style = MaterialTheme.typography.bodyMedium)
+        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
     }
 }

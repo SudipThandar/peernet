@@ -102,6 +102,8 @@ dependencies {
     implementation(libs.androidx.hilt.navigation.compose)
 
     implementation(libs.timber)
+    implementation(libs.play.services.ads)
+    implementation(libs.play.services.ads.identifier)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

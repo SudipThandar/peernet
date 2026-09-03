@@ -22,15 +22,25 @@ enum class ShareDuration(val minutes: Int?) {
 }
 
 /**
- * Whether the user has paid.
+ * Whether the user has earned premium (unlimited sharing).
  *
- * Deliberately a single hard-coded `false` for now. Play Billing is not wired yet,
- * and this is the one place that changes when it is - so no other code has to
- * learn about entitlements, and the unlimited option cannot accidentally become
- * free through a forgotten check elsewhere.
+ * Premium is granted by watching a rewarded ad. Stored in SharedPreferences
+ * so it persists across shares within the same install session.
+ * The value is re-checked on every `isPremium` call, so it can be revoked
+ * at any time (e.g. for expiry in the future).
  */
 object Entitlements {
-    fun isPremium(@Suppress("UNUSED_PARAMETER") context: Context): Boolean = false
+    private const val PREFS = "peernet_entitlements"
+    private const val KEY_PREMIUM = "premium"
+
+    fun isPremium(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_PREMIUM, false)
+
+    fun setPremium(context: Context, value: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_PREMIUM, value).apply()
+    }
 }
 
 /**

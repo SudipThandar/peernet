@@ -1,11 +1,14 @@
 package com.peernet.wifiextender.ui.home
 
+import android.app.Activity
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.peernet.wifiextender.ads.AdManager
 import com.peernet.wifiextender.client.ClientLinkManager
+import com.peernet.wifiextender.host.ShareDuration
 import com.peernet.wifiextender.core.RustCoreBridge
 import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -32,13 +35,22 @@ class HomeViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val wifiDirect: WifiDirectManager,
     private val linkManager: ClientLinkManager,
-    private val rustCore: RustCoreBridge
+    private val rustCore: RustCoreBridge,
+    val adManager: AdManager
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
 
     private var pollJob: Job? = null
+
+    fun loadAd() { adManager.loadAd() }
+
+    fun showAd(activity: Activity, onRewarded: () -> Unit) {
+        adManager.showAd(activity, onRewarded)
+    }
+
+    fun isAdReady(): Boolean = adManager.isReady
 
     /** Live status while the Home screen is visible. */
     fun startObserving() {
