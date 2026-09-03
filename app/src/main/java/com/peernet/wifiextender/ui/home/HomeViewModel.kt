@@ -42,6 +42,9 @@ class HomeViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
 
+    private val _meshEnabled = MutableStateFlow(false)
+    val meshEnabled: StateFlow<Boolean> = _meshEnabled.asStateFlow()
+
     private var pollJob: Job? = null
 
     fun loadAd(onLoaded: (() -> Unit)? = null) { adManager.loadAd(onLoaded) }
@@ -52,7 +55,12 @@ class HomeViewModel @Inject constructor(
 
     fun isAdReady(): Boolean = adManager.isReady
 
-    /** Live status while the Home screen is visible. */
+    fun loadInterstitial(onLoaded: (() -> Unit)? = null) { adManager.loadInterstitial(onLoaded) }
+
+    fun showInterstitial(activity: Activity): Boolean = adManager.showInterstitial(activity)
+
+    fun toggleMesh() { _meshEnabled.value = !_meshEnabled.value }
+
     fun startObserving() {
         if (pollJob != null) return
         pollJob = viewModelScope.launch {
@@ -86,7 +94,7 @@ class HomeViewModel @Inject constructor(
 
         _uiState.value = HomeUiState(
             mode = when {
-                s.creating -> "Creating network…"
+                s.creating -> "Creating network\u2026"
                 hosting -> "Sharing"
                 linkedHost != null -> "Connected to host"
                 else -> "Idle"
