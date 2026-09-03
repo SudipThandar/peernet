@@ -133,6 +133,7 @@ class MeshRelay @Inject constructor(
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun fetchGroupInfo(m: WifiP2pManager, ch: WifiP2pManager.Channel) {
         try {
             m.requestGroupInfo(ch) { group ->
