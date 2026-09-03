@@ -1,6 +1,7 @@
 package com.peernet.wifiextender.mesh
 
 import android.content.Context
+import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
@@ -97,12 +98,24 @@ class MeshRelay @Inject constructor(
                         runCatching { reservation.softApConfiguration }.getOrNull()
                     } else null
                     val wifiConfig = reservation.wifiConfiguration
-                    _ssid.value = runCatching { apConfig?.ssid }
-                        .getOrNull()
+                    _ssid.value = runCatching {
+                        apConfig?.let {
+                            it.javaClass.getMethod("getSsid").invoke(it) as? String
+                        }
+                    }.getOrNull()
                         ?: wifiConfig?.SSID?.removeSurrounding("\"")
-                    _password.value = runCatching { apConfig?.passphrase }
-                        .getOrNull()
-                        ?: wifiConfig?.passphrase
+                    _password.value = runCatching {
+                        apConfig?.let {
+                            val m = it.javaClass.getMethod("getPassphrase")
+                            m.invoke(it) as? String
+                        }
+                    }.getOrNull()
+                        ?: runCatching {
+                            @Suppress("DEPRECATION")
+                            WifiConfiguration::class.java
+                                .getMethod("getPassphrase")
+                                .invoke(wifiConfig) as? String
+                        }.getOrNull()
                     _isActive.value = true
                     Diagnostics.note(
                         "mesh",
