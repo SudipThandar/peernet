@@ -1,5 +1,6 @@
 package com.peernet.wifiextender.mesh
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
@@ -73,6 +74,7 @@ class MeshRelay @Inject constructor(
      * Call when the user enables mesh mode while connected to an upstream host.
      * Safe to call multiple times; subsequent calls are no-ops while active.
      */
+    @SuppressLint("MissingPermission")
     fun start() {
         if (_isActive.value) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
