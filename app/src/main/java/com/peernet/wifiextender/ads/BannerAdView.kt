@@ -20,8 +20,8 @@ fun BannerAdView(modifier: Modifier = Modifier) {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 )
-                adSize = AdSize.getCurrentOrientationAnchoredAdaptiveBannerAdSize(ctx, AdSize.FULL_WIDTH)
-                adUnitId = AdManager.BANNER_UNIT_ID
+                setAdSize(AdSize.getCurrentOrientationAnchoredAdaptiveBannerAdSize(ctx, AdSize.FULL_WIDTH))
+                setAdUnitId(AdManager.BANNER_UNIT_ID)
                 loadAd(AdRequest.Builder().build())
             }
         },
