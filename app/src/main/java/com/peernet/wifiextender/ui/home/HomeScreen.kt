@@ -129,6 +129,7 @@ fun HomeScreen(
     val scope = rememberCoroutineScope()
 
     var tunPackets by remember { mutableStateOf(0L) }
+    var prevTunPackets by remember { mutableStateOf(0L) }
     var quicState by remember { mutableStateOf(0) }
     val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
     val tunnelActive by clientViewModel.tunnelActive.collectAsStateWithLifecycle()
@@ -179,7 +180,8 @@ fun HomeScreen(
         if (prepare != null) vpnLauncher.launch(prepare) else startVpnService()
         var silentSince = 0L
         while (true) {
-            tunPackets = clientViewModel.packetCount()
+            val newPackets = clientViewModel.packetCount()
+            if (newPackets > tunPackets) tunPackets = newPackets
             quicState = clientViewModel.tunnelState()
             val sending = clientViewModel.outboundCount() > 0
             val receiving = clientViewModel.inboundCount() > 0
@@ -201,10 +203,7 @@ fun HomeScreen(
 
     var showSamsungDialog by remember { mutableStateOf(false) }
     LaunchedEffect(sessionActive) {
-        if (DozeExemptionPolicy.isSamsungDevice() && sessionActive && !DozeExemption.isExempt(context)) {
-            // Show the Samsung dialog each time a session starts if the user has
-            // not yet granted the exemption. Previous behavior only asked once
-            // ever, so a user who skipped it was never asked again.
+        if (DozeExemptionPolicy.isSamsungDevice() && sessionActive && !DozeExemption.isExempt(context) && !DozeExemption.wasSamsungAsked(context)) {
             showSamsungDialog = true
         }
     }
@@ -328,7 +327,11 @@ fun HomeScreen(
             }
 
             if (!isHosting) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     ShareDuration.entries.forEach { option ->
                         val selected = option == host.shareDuration
                         val isUnlimited = option == ShareDuration.UNLIMITED && !host.premium
@@ -371,15 +374,15 @@ fun HomeScreen(
             }
 
             host.error?.let {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFDECEA)), modifier = Modifier.fillMaxWidth()) {
-                    Text(it, modifier = Modifier.padding(10.dp), color = Color(0xFFD93025), style = MaterialTheme.typography.bodySmall)
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer), modifier = Modifier.fillMaxWidth()) {
+                    Text(it, modifier = Modifier.padding(10.dp), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
             }
 
             if (host.hostState == HostState.READY) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F3F4)),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                     elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                 ) {
                     Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -418,6 +421,8 @@ fun HomeScreen(
                                 colors = OutlinedTextFieldDefaults.colors(
                                     focusedTextColor = Color(0xFF1F1F1F),
                                     unfocusedTextColor = Color(0xFF1F1F1F),
+                                    focusedPlaceholderColor = Color(0xFF1F1F1F),
+                                    unfocusedPlaceholderColor = Color(0xFF1F1F1F),
                                     cursorColor = MaterialTheme.colorScheme.primary
                                 ),
                                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
@@ -456,11 +461,15 @@ fun HomeScreen(
 
             if (isClientConnected) {
                 val tunnelUp = quicState == STATE_CONNECTED
+                val packetRate = (tunPackets - prevTunPackets).coerceAtLeast(0)
+                if (tunnelUp) prevTunPackets = tunPackets
                 val signalStrength = when {
                     !tunnelUp -> 0.15f
-                    tunPackets > 100 -> 0.9f
-                    tunPackets > 10 -> 0.6f
-                    else -> 0.35f
+                    packetRate > 20 -> 0.95f
+                    packetRate > 10 -> 0.8f
+                    packetRate > 5 -> 0.6f
+                    packetRate > 0 -> 0.4f
+                    else -> 0.25f
                 }
                 val signalLabel = when {
                     !tunnelUp -> "Connecting\u2026"
@@ -471,7 +480,7 @@ fun HomeScreen(
 
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F3F4)),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                     elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                 ) {
                     Column(
@@ -485,7 +494,7 @@ fun HomeScreen(
 
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F3F4)),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                     elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                 ) {
                     Row(
@@ -502,12 +511,12 @@ fun HomeScreen(
                                 Text(
                                     when {
                                         meshErr != null -> "Error: ${meshErr}"
-                                        meshEnabled && meshSsid != null -> "Hotspot: $meshSsid"
-                                        meshEnabled -> "Starting hotspot\u2026"
+                                        meshEnabled && meshSsid != null -> "P2P Group: $meshSsid"
+                                        meshEnabled -> "Creating P2P group\u2026"
                                         else -> "Off"
                                     },
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = if (meshErr != null) Color(0xFFD93025) else Color(0xFF5F6368)
+                                    color = if (meshErr != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -631,7 +640,7 @@ private const val SILENT_TUNNEL_MS = 10_000L
 @Composable
 private fun InfoRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label, color = Color(0xFF5F6368), style = MaterialTheme.typography.bodySmall)
-        Text(value, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = Color(0xFF1F1F1F))
+        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        Text(value, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
     }
 }

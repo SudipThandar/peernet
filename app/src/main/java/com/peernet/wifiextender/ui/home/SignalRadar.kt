@@ -37,19 +37,19 @@ fun SignalRadar(
         initialValue = 0f,
         targetValue = 360f,
         animationSpec = infiniteRepeatable(
-            animation = tween(3000, easing = LinearEasing),
+            animation = tween(1500, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         )
     )
 
     val primaryColor = MaterialTheme.colorScheme.primary
-    val ringColor = Color.LightGray.copy(alpha = 0.4f)
+    val ringColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
 
     Column(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Canvas(modifier = Modifier.size(150.dp)) {
+        Canvas(modifier = Modifier.size(200.dp)) {
             val center = Offset(size.width / 2f, size.height / 2f)
             val radius = size.width / 2f - 4.dp.toPx()
 
@@ -77,7 +77,7 @@ fun SignalRadar(
 
             rotate(sweepAngle, center) {
                 drawArc(
-                    color = primaryColor.copy(alpha = 0.15f),
+                    color = primaryColor.copy(alpha = 0.2f),
                     startAngle = -30f,
                     sweepAngle = 30f,
                     useCenter = true,
@@ -93,7 +93,7 @@ fun SignalRadar(
             }
 
             if (signalStrength > 0f) {
-                val blipDistance = radius * (0.3f + 0.7f * (1f - signalStrength.coerceIn(0f, 1f)))
+                val blipDistance = radius * (0.25f + 0.75f * (1f - signalStrength.coerceIn(0f, 1f)))
                 val blipAngleRad = Math.toRadians(45.0)
                 val blipPos = Offset(
                     center.x + blipDistance * cos(blipAngleRad).toFloat(),
@@ -104,19 +104,19 @@ fun SignalRadar(
                     signalStrength > 0.4f -> Color(0xFFF9AB00)
                     else -> Color(0xFFD93025)
                 }
-                drawCircle(color = blipColor.copy(alpha = 0.25f), radius = 14.dp.toPx(), center = blipPos)
-                drawCircle(color = blipColor, radius = 5.dp.toPx(), center = blipPos)
+                drawCircle(color = blipColor.copy(alpha = 0.3f), radius = 16.dp.toPx(), center = blipPos)
+                drawCircle(color = blipColor, radius = 6.dp.toPx(), center = blipPos)
             }
         }
 
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(8.dp))
         Text(
             signalLabel,
-            style = MaterialTheme.typography.bodySmall,
+            style = MaterialTheme.typography.bodyMedium,
             color = when {
                 signalStrength > 0.7f -> Color(0xFF1E8E3E)
                 signalStrength > 0.4f -> Color(0xFFF9AB00)
-                else -> Color(0xFF5F6368)
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
             },
             fontWeight = FontWeight.Medium
         )

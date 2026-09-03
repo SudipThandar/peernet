@@ -11,9 +11,10 @@
     <color name="md_theme_onSecondary">#FFFFFF</color>
     <color name="md_theme_surface">#FAFAFA</color>
     <color name="md_theme_onSurface">#1F1F1F</color>
-    <color name="md_theme_surfaceVariant">#E8EAED</color>
+    <color name="md_theme_surfaceVariant">#F1F3F4</color>
     <color name="md_theme_onSurfaceVariant">#5F6368</color>
     <color name="md_theme_error">#D93025</color>
+    <color name="md_theme_errorContainer">#FDECEA</color>
     <color name="md_theme_onError">#FFFFFF</color>
     <color name="md_theme_background">#FAFAFA</color>
     <color name="md_theme_onBackground">#1F1F1F</color>
