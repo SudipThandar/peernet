@@ -201,26 +201,37 @@ fun HomeScreen(
 
     var showSamsungDialog by remember { mutableStateOf(false) }
     LaunchedEffect(sessionActive) {
-        if (DozeExemptionPolicy.isSamsungDevice() && !DozeExemption.wasSamsungAsked(context) && sessionActive) {
+        if (DozeExemptionPolicy.isSamsungDevice() && sessionActive && !DozeExemption.isExempt(context)) {
+            // Show the Samsung dialog each time a session starts if the user has
+            // not yet granted the exemption. Previous behavior only asked once
+            // ever, so a user who skipped it was never asked again.
             showSamsungDialog = true
         }
     }
     if (showSamsungDialog) {
         AlertDialog(
-            onDismissRequest = { showSamsungDialog = false; DozeExemption.markSamsungAsked(context) },
+            onDismissRequest = { showSamsungDialog = false },
             title = { Text("Keep sharing alive") },
             text = {
-                Text("Samsung may stop sharing when the screen turns off.\n\nOpen Settings > Battery > Background usage limits > Never sleeping apps > Add PeerNet.")
+                Text(
+                    "Samsung may stop sharing when the screen turns off.\n\n" +
+                        "Steps to fix:\n" +
+                        "1. Tap \"Open Settings\" below\n" +
+                        "2. Find PeerNet in the list\n" +
+                        "3. Set it to \"Don't optimize\"\n" +
+                        "4. Go back, then tap Battery > Background usage limits\n" +
+                        "5. Add PeerNet to \"Never sleeping apps\"\n\n" +
+                        "This keeps sharing running when the screen is off."
+                )
             },
             confirmButton = {
                 TextButton(onClick = {
                     showSamsungDialog = false
-                    DozeExemption.markSamsungAsked(context)
                     DozeExemption.requestSamsungExemption(context)
                 }) { Text("Open Settings") }
             },
             dismissButton = {
-                TextButton(onClick = { showSamsungDialog = false; DozeExemption.markSamsungAsked(context) }) { Text("Skip") }
+                TextButton(onClick = { showSamsungDialog = false }) { Text("Skip") }
             }
         )
     }
@@ -486,10 +497,17 @@ fun HomeScreen(
                             Icon(Icons.Filled.Hub, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                             Column {
                                 Text("Mesh Mode", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                val meshSsid by homeViewModel.meshSsid.collectAsStateWithLifecycle()
+                                val meshErr by homeViewModel.meshError.collectAsStateWithLifecycle()
                                 Text(
-                                    if (meshEnabled) "Relaying to nearby devices" else "Off",
+                                    when {
+                                        meshErr != null -> "Error: ${meshErr}"
+                                        meshEnabled && meshSsid != null -> "Hotspot: $meshSsid"
+                                        meshEnabled -> "Starting hotspot\u2026"
+                                        else -> "Off"
+                                    },
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFF5F6368)
+                                    color = if (meshErr != null) Color(0xFFD93025) else Color(0xFF5F6368)
                                 )
                             }
                         }

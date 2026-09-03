@@ -108,11 +108,21 @@ class HostForegroundService : Service() {
      * in the diagnostics buffer. A gap in these entries means the process was
      * frozen; entries that continue while the client loses internet point at the
      * radio instead, which is what the Wi-Fi lock addresses.
+     *
+     * On Samsung devices the cadence is shorter: Samsung's battery optimization
+     * can kill the foreground service within minutes of the screen turning off,
+     * and a 15-second gap is the longest we can afford before the user notices
+     * the share died.
      */
     private fun aliveTick() {
         scope.launch {
             while (true) {
-                kotlinx.coroutines.delay(ALIVE_TICK_MS)
+                val interval = if (com.peernet.wifiextender.power.DozeExemptionPolicy.isSamsungDevice()) {
+                    ALIVE_TICK_SAMSUNG_MS
+                } else {
+                    ALIVE_TICK_MS
+                }
+                kotlinx.coroutines.delay(interval)
                 try {
                     hostRuntime.reportAliveness("tick")
                 } catch (e: Exception) {
@@ -238,5 +248,8 @@ class HostForegroundService : Service() {
 
         /** Proof-of-life cadence; short enough to prove a 60s screen-off test. */
         private const val ALIVE_TICK_MS = 15_000L
+
+        /** Shorter cadence for Samsung devices that aggressively kill FGS. */
+        private const val ALIVE_TICK_SAMSUNG_MS = 8_000L
     }
 }

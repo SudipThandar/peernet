@@ -114,16 +114,19 @@ object DozeExemption {
     }
 
     /**
-     * Opens Samsung's battery settings where the user can add PeerNet to
-     * "Never sleeping apps". Samsung has no programmatic API for this.
+     * Opens Samsung's battery optimization page where the user can find PeerNet
+     * and set it to "Don't optimize". This is the standard Android battery
+     * optimization page, which Samsung also respects.
      *
      * The action string is Samsung-specific and may not exist on all builds.
      * Returns false if it could not be shown; callers treat this as degraded.
      */
     fun requestSamsungExemption(context: Context): Boolean {
         markSamsungAsked(context)
-        val intent = Intent("android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS")
+        // Try the standard Android battery optimization settings first, which
+        // works on Samsung too and lets the user select "Don't optimize".
+        val standardIntent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return runCatching { context.startActivity(intent); true }.getOrDefault(false)
+        return runCatching { context.startActivity(standardIntent); true }.getOrDefault(false)
     }
 }

@@ -10,6 +10,7 @@ import com.peernet.wifiextender.ads.AdManager
 import com.peernet.wifiextender.client.ClientLinkManager
 import com.peernet.wifiextender.host.ShareDuration
 import com.peernet.wifiextender.core.RustCoreBridge
+import com.peernet.wifiextender.mesh.MeshRelay
 import com.peernet.wifiextender.wifi.WifiDirectManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -36,7 +37,8 @@ class HomeViewModel @Inject constructor(
     private val wifiDirect: WifiDirectManager,
     private val linkManager: ClientLinkManager,
     private val rustCore: RustCoreBridge,
-    val adManager: AdManager
+    val adManager: AdManager,
+    private val meshRelay: MeshRelay
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -44,6 +46,9 @@ class HomeViewModel @Inject constructor(
 
     private val _meshEnabled = MutableStateFlow(false)
     val meshEnabled: StateFlow<Boolean> = _meshEnabled.asStateFlow()
+
+    val meshSsid: StateFlow<String?> = meshRelay.ssid
+    val meshError: StateFlow<String?> = meshRelay.error
 
     private var pollJob: Job? = null
 
@@ -59,7 +64,15 @@ class HomeViewModel @Inject constructor(
 
     fun showInterstitial(activity: Activity): Boolean = adManager.showInterstitial(activity)
 
-    fun toggleMesh() { _meshEnabled.value = !_meshEnabled.value }
+    fun toggleMesh() {
+        val newState = !_meshEnabled.value
+        _meshEnabled.value = newState
+        if (newState) {
+            meshRelay.start()
+        } else {
+            meshRelay.stop()
+        }
+    }
 
     fun startObserving() {
         if (pollJob != null) return

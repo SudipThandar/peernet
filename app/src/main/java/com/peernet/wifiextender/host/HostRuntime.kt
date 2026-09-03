@@ -231,7 +231,28 @@ class HostRuntime @Inject constructor(
             while (true) {
                 delay(SUPERVISE_MS)
                 if (!sharingActive) continue
-                if (!wifiDirect.state.value.hosting) continue
+                if (!wifiDirect.state.value.hosting) {
+                    // Group may have been silently dropped by the platform
+                    // (Samsung kills the group when the screen turns off).
+                    // Force a refresh to get an accurate reading.
+                    wifiDirect.refreshGroupInfo()
+                    delay(500) // Allow the callback to update state
+                    if (!wifiDirect.state.value.hosting && !wifiDirect.state.value.creating) {
+                        // Group is truly gone but sharing is still intended.
+                        // Attempt auto-recovery by re-creating the group.
+                        Diagnostics.note(
+                            "host",
+                            "GROUP_SILENTLY_DROPPED — attempting auto-recovery"
+                        )
+                        reportedReady = false
+                        wifiDirect.startHosting(
+                            ssid = com.peernet.wifiextender.wifi.GroupCredentialsPolicy
+                                .networkName(HostIdentity.id(context)),
+                            passphrase = HostCredentials.passphrase(context)
+                        )
+                    }
+                    continue
+                }
                 if (!linkServer.listening) {
                     Diagnostics.note(
                         "host",
