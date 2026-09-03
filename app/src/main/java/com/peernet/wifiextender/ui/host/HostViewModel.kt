@@ -115,6 +115,6 @@ class HostViewModel @Inject constructor(
     }
 
     private companion object {
-        const val HEALTH_POLL_MS = 2_000L
+        const val HEALTH_POLL_MS = 1_000L
     }
 }

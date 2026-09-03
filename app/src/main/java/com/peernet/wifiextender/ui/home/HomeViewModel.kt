@@ -44,7 +44,7 @@ class HomeViewModel @Inject constructor(
 
     private var pollJob: Job? = null
 
-    fun loadAd() { adManager.loadAd() }
+    fun loadAd(onLoaded: (() -> Unit)? = null) { adManager.loadAd(onLoaded) }
 
     fun showAd(activity: Activity, onRewarded: () -> Unit) {
         adManager.showAd(activity, onRewarded)

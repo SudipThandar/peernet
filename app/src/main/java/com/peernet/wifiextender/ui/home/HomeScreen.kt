@@ -219,14 +219,20 @@ fun HomeScreen(
             text = { Text("Watch a short ad to share with no time limit.") },
             confirmButton = {
                 TextButton(onClick = {
-                    showAdDialog = false
                     if (activity != null && homeViewModel.isAdReady()) {
+                        showAdDialog = false
                         homeViewModel.showAd(activity) {
                             hostViewModel.setShareDuration(ShareDuration.UNLIMITED)
                         }
                     } else {
-                        homeViewModel.loadAd()
-                        hostViewModel.setShareDuration(ShareDuration.UNLIMITED)
+                        homeViewModel.loadAd {
+                            showAdDialog = false
+                            if (activity != null && homeViewModel.isAdReady()) {
+                                homeViewModel.showAd(activity) {
+                                    hostViewModel.setShareDuration(ShareDuration.UNLIMITED)
+                                }
+                            }
+                        }
                     }
                 }) { Text("Watch Ad") }
             },
