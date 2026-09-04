@@ -130,8 +130,8 @@ fun HomeScreen(
 
     var tunPackets by remember { mutableStateOf(0L) }
     var prevTunPackets by remember { mutableStateOf(0L) }
-    var tunBytes by remember { mutableStateOf(0L) }
-    var prevTunBytes by remember { mutableStateOf(0L) }
+    var inboundBytes by remember { mutableStateOf(0L) }
+    var prevInboundBytes by remember { mutableStateOf(0L) }
     var quicState by remember { mutableStateOf(0) }
     val tunnelStatus by clientViewModel.tunnelStatus.collectAsStateWithLifecycle()
     val tunnelActive by clientViewModel.tunnelActive.collectAsStateWithLifecycle()
@@ -186,7 +186,7 @@ fun HomeScreen(
             if (newPackets > tunPackets) tunPackets = newPackets
             quicState = clientViewModel.tunnelState()
             val inbound = clientViewModel.inboundCount()
-            if (inbound > tunBytes) tunBytes = inbound
+            if (inbound > inboundBytes) inboundBytes = inbound
             val sending = clientViewModel.outboundCount() > 0
             val receiving = clientViewModel.inboundCount() > 0
             if (quicState == STATE_CONNECTED && tunPackets > 0 && !clientViewModel.captureAlive()) {
@@ -466,10 +466,10 @@ fun HomeScreen(
             if (isClientConnected) {
                 val tunnelUp = quicState == STATE_CONNECTED
                 val packetRate = (tunPackets - prevTunPackets).coerceAtLeast(0)
-                val byteRate = (tunBytes - prevTunBytes).coerceAtLeast(0)
+                val byteRate = (inboundBytes - prevInboundBytes).coerceAtLeast(0)
                 if (tunnelUp) {
                     prevTunPackets = tunPackets
-                    prevTunBytes = tunBytes
+                    prevInboundBytes = inboundBytes
                 }
                 val signalStrength = when {
                     !tunnelUp -> 0.15f
@@ -486,6 +486,20 @@ fun HomeScreen(
                     else -> "Weak \u2014 move closer to host"
                 }
 
+                val radarBlips = remember(packetRate, tunPackets) {
+                    val count = packetRate.coerceAtMost(12).toInt()
+                    if (count == 0) return@remember emptyList()
+                    (0 until count).map { i ->
+                        val hash = ((tunPackets * 31 + i * 7) % 1000).toFloat() / 1000f
+                        val hash2 = ((tunPackets * 17 + i * 13) % 1000).toFloat() / 1000f
+                        RadarBlip(
+                            angle = hash * 360f,
+                            distance = 0.2f + hash2 * 0.7f,
+                            strength = signalStrength
+                        )
+                    }
+                }
+
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -500,7 +514,8 @@ fun HomeScreen(
                             signalStrength = signalStrength,
                             signalLabel = signalLabel,
                             packetsPerSec = packetRate,
-                            bytesPerSec = byteRate
+                            bytesPerSec = byteRate,
+                            blips = radarBlips
                         )
                     }
                 }
