@@ -72,6 +72,12 @@ fun SignalRadar(
     val ringColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f)
     val gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.15f)
 
+    val dotColor = when {
+        animatedStrength > 0.7f -> strongColor
+        animatedStrength > 0.4f -> mediumColor
+        else -> weakColor
+    }
+
     Column(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally
@@ -167,11 +173,6 @@ fun SignalRadar(
             }
 
             // Center dot
-            val dotColor = when {
-                animatedStrength > 0.7f -> strongColor
-                animatedStrength > 0.4f -> mediumColor
-                else -> weakColor
-            }
             if (animatedStrength > 0f) {
                 drawCircle(color = dotColor.copy(alpha = 0.15f), radius = 10.dp.toPx(), center = center)
             }
