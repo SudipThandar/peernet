@@ -7,10 +7,8 @@ members = [
     "peernet-client",
     "peernet-tcp",
     "peernet-ffi",
+    "peernet-cli",
 ]
-
-# peernet-cli is Windows-only (uses wintun); built separately:
-#   cd core/peernet-cli && cargo build --release
 
 [workspace.package]
 version = "0.1.0"

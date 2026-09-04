@@ -1,9 +1,9 @@
 [package]
 name = "peernet-cli"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-description = "PeerNet Windows CLI client — connect to a PeerNet host and share its internet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PeerNet Windows CLI client"
 
 [[bin]]
 name = "peernet"
@@ -15,16 +15,18 @@ peernet-proto = { path = "../peernet-proto" }
 peernet-client = { path = "../peernet-client" }
 peernet-host = { path = "../peernet-host" }
 peernet-tcp = { path = "../peernet-tcp" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
-quinn = { version = "0.11", features = ["runtime-tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-sha2 = "0.10"
-bincode = "1.3"
+tokio = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+bincode = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
-wintun = "0.4"
 ctrlc = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wintun = "0.4"
 
 [profile.release]
 opt-level = "z"

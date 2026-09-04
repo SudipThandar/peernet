@@ -1,7 +1,0 @@
-# Override parent .cargo/config.toml Android linker flags.
-# peernet-cli builds for the host platform (Windows/Linux/macOS).
-[target.'cfg(windows)']
-rustflags = ["-C", "target-feature=+crt-static"]
-
-[target.'cfg(not(windows))']
-rustflags = []
