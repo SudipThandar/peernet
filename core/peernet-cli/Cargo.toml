@@ -13,7 +13,6 @@ path = "src/main.rs"
 peernet-core = { path = "../peernet-core" }
 peernet-proto = { path = "../peernet-proto" }
 peernet-client = { path = "../peernet-client" }
-peernet-host = { path = "../peernet-host" }
 peernet-tcp = { path = "../peernet-tcp" }
 tokio = { workspace = true }
 quinn = { workspace = true }
